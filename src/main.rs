@@ -957,7 +957,7 @@ impl App {
                 .changed();
             ui.label("Домен email:");
             changed |= ui.add(egui::TextEdit::singleline(&mut s.email_domain).desired_width(120.0)).changed();
-            ui.checkbox(&mut s.clean_metadata, "Убрать автора и компанию из свойств файла и примечаний");
+            ui.checkbox(&mut s.clean_metadata, "Убрать автора, компанию, имена пользователей и пути их папок из служебных полей файла");
             ui.checkbox(&mut s.recalc_on_open, "Пересчёт формул при открытии в Excel");
             changed |= ui
                 .checkbox(&mut s.inner_text, "Искать ФИО, организации, email, телефоны и внутри текста и формул")

@@ -638,7 +638,7 @@ fn write_book(
                 } else if Some(name.as_str()) == wb.sst_path.as_deref() {
                     rewrite_sst(&data, maps, &mut stats)?
                 } else if name == wb.workbook_path {
-                    rewrite_workbook(&data, settings.recalc_on_open, maps)?
+                    rewrite_workbook(&data, settings.recalc_on_open, settings.clean_metadata, maps)?
                 } else {
                     let mut pivot_out: Option<Vec<u8>> = None;
                     if let Some((is_rec, pc)) = pivot_map.get(name.as_str()) {
@@ -678,6 +678,26 @@ fn write_book(
                     }
                 };
                 res
+            };
+            // Пути профиля пользователя в служебных частях: связи (гиперссылки, внешние книги), книга,
+            // подключения, свойства файла (база гиперссылок). Тексты ячеек, примечаний и кэшей — данные,
+            // их меняют только правила.
+            let service = name.ends_with(".rels")
+                || name == wb.workbook_path
+                || name == "xl/connections.xml"
+                || name.starts_with("docProps/");
+            let new = if settings.clean_metadata && is_xml && service {
+                let cur = match &new {
+                    Some(b) => b.clone(),
+                    None => {
+                        let mut d = Vec::new();
+                        zip.by_index(i)?.read_to_end(&mut d)?;
+                        d
+                    }
+                };
+                String::from_utf8(cur).ok().and_then(|t| mask_user_paths(&t)).map(String::into_bytes).or(new)
+            } else {
+                new
             };
             match new {
                 Some(bytes) => {
@@ -1420,7 +1440,45 @@ fn rewrite_sst(xml: &[u8], maps: &GlobalMaps, stats: &mut Stats) -> Result<Optio
 
 /// Просит Excel пересчитать формулы при открытии (`calcPr fullCalcOnLoad="1"`) и заменяет
 /// реальные значения в определённых именах (`Ответственный = "Иванов Иван"`).
-fn rewrite_workbook(xml: &[u8], recalc: bool, maps: &GlobalMaps) -> Result<Option<Vec<u8>>> {
+/// Имя пользователя в пути профиля заменяется на «user»: `C:\Users\<имя>\…`, `file:///C:/Users/<имя>/…`,
+/// `D:\Documents and Settings\<имя>\…`, `/Users/<имя>/…` (macOS). Остальной путь не меняется.
+/// None — путей профиля нет.
+fn mask_user_paths(s: &str) -> Option<String> {
+    const HOMES: &[&str] = &["users", "documents and settings"];
+    let low = s.to_ascii_lowercase();
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let sep = b[i];
+        let home = (sep == b'\\' || sep == b'/')
+            .then(|| HOMES.iter().find(|h| low[i + 1..].starts_with(*h) && b.get(i + 1 + h.len()) == Some(&sep)))
+            .flatten();
+        let Some(home) = home else {
+            i += 1;
+            continue;
+        };
+        // Путь от корня диска (C:\Users) или, для macOS, от начала значения (/Users).
+        let before = &low[..i];
+        let rooted = (i >= 2 && b[i - 1] == b':' && b[i - 2].is_ascii_alphabetic())
+            || (sep == b'/' && (before.is_empty() || before.ends_with(['"', '\'', '>']) || before.ends_with("file://")));
+        let start = i + 2 + home.len();
+        let end = s[start..].find(['\\', '/', '"', '\'', '<']).map_or(s.len(), |e| start + e);
+        if rooted && end > start && &s[start..end] != "user" {
+            out.push_str(&s[last..start]);
+            out.push_str("user");
+            last = end;
+        }
+        i = start;
+    }
+    (last > 0).then(|| {
+        out.push_str(&s[last..]);
+        out
+    })
+}
+
+fn rewrite_workbook(xml: &[u8], recalc: bool, clean_meta: bool, maps: &GlobalMaps) -> Result<Option<Vec<u8>>> {
     // Элементы, перед которыми по схеме должен стоять calcPr, если его не было.
     const AFTER_CALC: &[&[u8]] = &[
         b"oleSize", b"customWorkbookViews", b"pivotCaches", b"smartTagPr", b"smartTagTypes",
@@ -1451,6 +1509,30 @@ fn rewrite_workbook(xml: &[u8], recalc: bool, maps: &GlobalMaps) -> Result<Optio
                 }
                 if ln == b"definedName" && matches!(ev, Event::Start(_)) {
                     in_name = true;
+                }
+                // Имя пользователя (защита от записи) и папка, где Excel сохранял файл: в ней бывает
+                // имя пользователя или заказчика. Элементы остаются — меняется только значение.
+                let meta: Option<(&[u8], &str)> = match ln.as_slice() {
+                    b"fileSharing" if clean_meta => Some((b"userName", "Автор")),
+                    b"absPath" if clean_meta => Some((b"url", r"C:\")),
+                    _ => None,
+                };
+                if let Some((key, val)) = meta.filter(|(k, _)| e.attributes().with_checks(false).flatten().any(|a| a.key.as_ref() == *k)) {
+                    let mut c = BytesStart::new(name_of(e));
+                    for a in e.attributes().with_checks(false).flatten() {
+                        if a.key.as_ref() == key {
+                            c.push_attribute((String::from_utf8_lossy(key).as_ref(), val));
+                        } else {
+                            c.push_attribute(a);
+                        }
+                    }
+                    let start = matches!(ev, Event::Start(_));
+                    w.write_event(if start { Event::Start(c) } else { Event::Empty(c) })?;
+                    changed = true;
+                    if start {
+                        depth += 1;
+                    }
+                    continue;
                 }
                 if recalc && depth == 1 && ln == b"calcPr" {
                     let mut c = copy_without(e, b"fullCalcOnLoad");
@@ -1539,7 +1621,10 @@ fn rewrite_generic(
                 });
                 for a in e.attributes().with_checks(false).flatten() {
                     let key = a.key.as_ref().to_vec();
-                    if persons && ln == b"person" && (key == b"displayName" || key == b"userId") {
+                    if clean_meta && (key == b"userName" || (ln == b"userInfo" && key == b"name")) {
+                        // Журнал изменений общей книги: кто вносил правки.
+                        new_attrs.push((key, Some("Автор".into())));
+                    } else if persons && ln == b"person" && (key == b"displayName" || key == b"userId") {
                         if key == b"displayName" {
                             person_n += 1;
                         }
@@ -2358,6 +2443,18 @@ mod tests {
         m.strings.insert("Иванов Иван Иванович".into(), "Петров Олег Сергеевич (ID 1)".into());
         m.build_inner();
         m
+    }
+
+    #[test]
+    fn user_paths_masked_only_in_profile_folders() {
+        assert_eq!(
+            mask_user_paths(r#"<a url="C:\Users\petrov.p\Docs\" b='/Users/anna/x' c="file:///D:/USERS/ivan/y" d="file:///Users/olga/z"/>"#).unwrap(),
+            r#"<a url="C:\Users\user\Docs\" b='/Users/user/x' c="file:///D:/USERS/user/y" d="file:///Users/user/z"/>"#
+        );
+        // Не профиль: папка с похожим началом, адрес сайта, сетевой путь, уже обезличенный путь.
+        for s in [r"C:\UsersData\petrov\x", r#"<a href="https://site.ru/users/ivan/"/>"#, r"\\srv\Users\ivan\x", r"C:\Users\user\x"] {
+            assert_eq!(mask_user_paths(s), None, "{s}");
+        }
     }
 
     #[test]

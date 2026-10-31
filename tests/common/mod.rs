@@ -34,6 +34,8 @@ pub struct Book {
     pub sheet_tail: HashMap<usize, String>,
     /// Книга с датами от 1904 года.
     pub date1904: bool,
+    /// Разметка в начале workbook.xml (до workbookPr): fileVersion, fileSharing, absPath.
+    pub workbook_head: String,
 }
 
 impl Book {
@@ -93,6 +95,7 @@ pub fn write_xlsx(path: &Path, book: &Book) {
     ct.push_str(r#"<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/></Types>"#);
     let rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/></Relationships>"#;
     let mut wb = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#);
+    wb.push_str(&book.workbook_head);
     if book.date1904 {
         wb.push_str(r#"<workbookPr date1904="1"/>"#);
     }
