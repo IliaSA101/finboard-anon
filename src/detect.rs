@@ -250,7 +250,7 @@ mod tests {
         let mut g = Grid::default();
         for &(r, c, t) in rows {
             let numeric = t.parse::<f64>().is_ok();
-            g.cells.insert((r, c), crate::xlsx::GridCell { text: t.to_string(), numeric, formula: false });
+            g.cells.insert((r, c), crate::xlsx::GridCell { text: t.to_string(), numeric, formula: false, date: None });
             g.max_row = g.max_row.max(r);
             g.max_col = g.max_col.max(c);
         }

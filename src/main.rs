@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, RichText, Sense, Stroke};
 
@@ -37,6 +37,9 @@ fn is_excel(p: &std::path::Path) -> bool {
 
 /// Текст ячейки для просмотра: числа без хвостов вроде 39.200000000000003.
 fn cell_display(c: &GridCell) -> String {
+    if let Some(d) = &c.date {
+        return d.clone();
+    }
     if c.numeric {
         if let Ok(v) = c.text.parse::<f64>() {
             return format!("{v}");
@@ -120,9 +123,18 @@ struct App {
     status_err: bool,
     log: Vec<String>,
     job: Option<Receiver<Msg>>,
-    /// Предпросмотр: по файлу — по правилу.
+    /// Предпросмотр: по файлу — по правилу, и правила, по которым он посчитан (на больших файлах
+    /// считается несколько секунд в фоне — пока правило не совпало, его старый предпросмотр не показывается).
     preview: Vec<Vec<RulePreview>>,
+    preview_rules: Vec<Vec<Rule>>,
     preview_dirty: bool,
+    preview_job: Option<Receiver<(Vec<Vec<Rule>>, Result<Vec<Vec<RulePreview>>, String>)>>,
+    /// Активная ячейка (колонка, строка) — двигается стрелками.
+    cursor: Option<(u32, u32)>,
+    /// Видимая часть таблицы в прошлом кадре — чтобы прокрутить к активной ячейке.
+    last_vp: Rect,
+    ensure_visible: bool,
+    grid_id: Option<egui::Id>,
 }
 
 impl App {
@@ -155,7 +167,13 @@ impl App {
             log: Vec::new(),
             job: None,
             preview: Vec::new(),
+            preview_rules: Vec::new(),
             preview_dirty: false,
+            preview_job: None,
+            cursor: None,
+            last_vp: Rect::NOTHING,
+            ensure_visible: false,
+            grid_id: None,
         };
         // finboard-anon.exe <файл.xlsx>… [профиль.json] — так же работает «Открыть с помощью».
         let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
@@ -261,6 +279,7 @@ impl App {
     fn select_doc(&mut self, i: usize) {
         self.cur = i;
         self.sel = None;
+        self.cursor = None;
         self.drag_anchor = None;
         let s = self.docs[i].cur_sheet;
         self.ensure_grid(s);
@@ -331,20 +350,53 @@ impl App {
     }
 
     /// Предпросмотр считается тем же кодом, что и обработка (`anon::preview_batch`): все файлы, тот же ключ.
-    fn compute_preview(&mut self) {
+    /// В фоне: файл в сотни тысяч строк читается секунды, окно не должно замирать на каждой правке.
+    fn start_preview(&mut self, ctx: &egui::Context) {
         self.preview_dirty = false;
         if self.docs.is_empty() {
             self.preview.clear();
+            self.preview_rules.clear();
             return;
         }
         let files: Vec<(PathBuf, Vec<Rule>)> = self.docs.iter().map(|d| (d.path.clone(), d.profile.rules.clone())).collect();
-        match preview_batch(&files, &self.settings, self.key_in.as_deref()) {
-            Ok(p) => self.preview = p,
-            Err(e) => {
-                self.preview.clear();
-                self.set_status(format!("Предпросмотр: {e:#}"), true);
+        let rules: Vec<Vec<Rule>> = files.iter().map(|(_, r)| r.clone()).collect();
+        let (settings, key) = (self.settings.clone(), self.key_in.clone());
+        let (tx, rx) = channel();
+        self.preview_job = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = preview_batch(&files, &settings, key.as_deref()).map_err(|e| format!("{e:#}"));
+            let _ = tx.send((rules, r));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_preview(&mut self) {
+        let Some(rx) = &self.preview_job else { return };
+        match rx.try_recv() {
+            Ok((rules, r)) => {
+                self.preview_job = None;
+                match r {
+                    Ok(p) => {
+                        self.preview = p;
+                        self.preview_rules = rules;
+                    }
+                    Err(e) => {
+                        self.preview.clear();
+                        self.preview_rules.clear();
+                        self.set_status(format!("Предпросмотр: {e}"), true);
+                    }
+                }
             }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.preview_job = None,
         }
+    }
+
+    /// Строка, после которой правило считается «до конца»: последняя строка листа в просмотре.
+    fn sheet_last_row(&self, sheet: &str) -> Option<u32> {
+        let d = self.doc()?;
+        d.grids.get(&d.wb.sheet_index(sheet)?).map(|g| g.max_row)
     }
 
     fn poll_job(&mut self) {
@@ -569,6 +621,7 @@ impl App {
         if let Some(i) = clicked {
             self.docs[self.cur].cur_sheet = i;
             self.sel = None;
+            self.cursor = None;
             self.ensure_grid(i);
         }
         ui.separator();
@@ -607,7 +660,10 @@ impl App {
             if ui.button("Добавить правило").clicked() {
                 match parse_range(&self.range_text) {
                     Some((c1, c2, r1, r2)) => {
-                        let to = if self.new_to_end { None } else { r2 };
+                        // Выделение до последней строки листа — правило «до конца»: в настоящем файле строк больше.
+                        let last = self.sheet_last_row(&sheet);
+                        let to_end = self.new_to_end || r2.zip(last).is_some_and(|(b, l)| b >= l);
+                        let to = if to_end { None } else { r2 };
                         let mut rules: Vec<Rule> = (c1..=c2).map(|c| Rule::new(&sheet, c, r1, to, self.new_kind)).collect();
                         let notes: Vec<String> = rules.iter_mut().filter_map(|r| self.fill_template(r)).collect();
                         let (added, replaced) = self.add_rules(rules, true);
@@ -616,6 +672,9 @@ impl App {
                             (0, r) => format!("Правило заменено новым диапазоном (было пересекающихся: {r})"),
                             (a, r) => format!("Добавлено правил: {a}, заменено: {r}"),
                         };
+                        if to_end && !self.new_to_end {
+                            msg = format!("{msg} — до конца листа (выделение дошло до последней строки)");
+                        }
                         if let Some(n) = notes.first() {
                             msg = format!("{msg}. {n}");
                         } else if self.new_kind == Kind::Text {
@@ -634,7 +693,8 @@ impl App {
                 info.push_str(&format!(". Выделено {0}{1}:{0}{2} — строк {3}", col_name(c), a, b, b - a + 1));
             }
             if g.truncated {
-                info.push_str(&format!(" (показаны первые {GRID_ROWS} строк; правила действуют на весь лист)"));
+                let all = g.dim_rows.map(|n| format!(" из {n}")).unwrap_or_default();
+                info.push_str(&format!(" (показаны первые {GRID_ROWS}{all}; правила «до конца» действуют на весь лист)"));
             }
             ui.label(RichText::new(info).weak());
         }
@@ -666,6 +726,65 @@ impl App {
         let shift = ui.input(|i| i.modifiers.shift);
         let press_origin = ui.input(|i| i.pointer.press_origin());
 
+        // Клавиатура как в Excel: стрелки, Shift — выделение вверх-вниз, Ctrl — к краю данных,
+        // PageUp/PageDown, Home, Ctrl+Home/End. Не мешаем вводу в полях.
+        let grid_focused = self.grid_id.is_some_and(|id| ui.memory(|m| m.has_focus(id)));
+        let free = ui.memory(|m| m.focused().is_none());
+        if (grid_focused || free) && !ui.ctx().wants_keyboard_input() && ncols > 0 && nrows > 0 {
+            let keys: Vec<(egui::Key, egui::Modifiers)> = ui.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            let (max_c, max_r) = (ncols as u32 - 1, nrows);
+            let page = ((self.last_vp.height() - HEAD_H) / ROW_H).max(1.0) as u32;
+            let mut cur = self.cursor.or(sel.map(|(c, a, _)| (c, a))).unwrap_or((0, 1));
+            let mut moved = None;
+            for (key, m) in keys {
+                use egui::Key::*;
+                let dir = match key {
+                    ArrowUp => Some((0, -1)),
+                    ArrowDown => Some((0, 1)),
+                    ArrowLeft => Some((-1, 0)),
+                    ArrowRight => Some((1, 0)),
+                    _ => None,
+                };
+                let next = match (key, dir) {
+                    (_, Some(d)) if m.command => Some(grid.jump(cur, d, max_c, max_r)),
+                    (_, Some((dc, dr))) => Some((
+                        (cur.0 as i64 + dc).clamp(0, max_c as i64) as u32,
+                        (cur.1 as i64 + dr).clamp(1, max_r as i64) as u32,
+                    )),
+                    (PageDown, _) => Some((cur.0, (cur.1 + page).min(max_r))),
+                    (PageUp, _) => Some((cur.0, cur.1.saturating_sub(page).max(1))),
+                    (Home, _) if m.command => Some((0, 1)),
+                    (Home, _) => Some((0, cur.1)),
+                    (End, _) if m.command => Some((max_c, max_r)),
+                    _ => None,
+                };
+                if let Some(n) = next {
+                    cur = n;
+                    moved = Some((cur, m.shift));
+                }
+            }
+            if let Some(((c, r), extend)) = moved {
+                self.cursor = Some((c, r));
+                match self.drag_anchor {
+                    Some((ac, a)) if extend && ac == c => self.sel = Some((c, a.min(r), a.max(r))),
+                    _ => {
+                        self.drag_anchor = Some((c, r));
+                        self.sel = Some((c, r, r));
+                    }
+                }
+                self.ensure_visible = true;
+            }
+        }
+        let sel = self.sel;
+
         let mut area = egui::ScrollArea::both()
             .id_salt(("grid", self.cur, cur_sheet))
             .auto_shrink([false, false])
@@ -673,12 +792,46 @@ impl App {
         if let Some((r, c)) = self.scroll_to.take() {
             let x = xs.get(c as usize).copied().unwrap_or(0.0);
             area = area.scroll_offset(vec2((x - 40.0).max(0.0), ((r as f32 - 4.0) * ROW_H).max(0.0)));
+        } else if std::mem::take(&mut self.ensure_visible) {
+            // Активная ячейка за краем видимой части — прокрутить ровно настолько, чтобы она показалась.
+            if let (Some((c, r)), true) = (self.cursor, self.last_vp.is_positive() && ncols > 0) {
+                let vp = self.last_vp;
+                let c = (c as usize).min(ncols - 1);
+                let mut off = vp.min;
+                if xs[c] < vp.min.x {
+                    off.x = xs[c];
+                } else if ROWNUM_W + xs[c + 1] > vp.max.x {
+                    off.x = (ROWNUM_W + xs[c + 1] - vp.width()).min(xs[c]);
+                }
+                let (y0, y1) = ((r - 1) as f32 * ROW_H, HEAD_H + r as f32 * ROW_H);
+                if y0 < vp.min.y {
+                    off.y = y0;
+                } else if y1 > vp.max.y {
+                    off.y = y1 - vp.height();
+                }
+                if off != vp.min {
+                    area = area.scroll_offset(off.to_vec2());
+                }
+            }
         }
         let mut clicked = Hit::None;
+        let mut double = Hit::None;
         let mut drag_start = Hit::None;
         let mut drag_to = Hit::None;
+        let mut seen_vp = Rect::NOTHING;
+        let mut grid_id = None;
+        let cursor = self.cursor;
         area.show_viewport(ui, |ui, vp| {
+            seen_vp = vp;
             let (rect, resp) = ui.allocate_exact_size(vec2(ROWNUM_W + acc, HEAD_H + nrows as f32 * ROW_H), Sense::click_and_drag());
+            grid_id = Some(resp.id);
+            if resp.clicked() || resp.drag_started() {
+                resp.request_focus();
+            }
+            // Стрелки остаются таблице, а не переводят фокус на соседние кнопки.
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(resp.id, egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, ..Default::default() })
+            });
             let o = rect.min;
             let vis = Rect::from_min_size(o + vp.min.to_vec2(), vp.size());
             let painter = ui.painter().clone();
@@ -702,6 +855,9 @@ impl App {
                         painter.rect_filled(cr, 0.0, sel_fill);
                     } else if rules.iter().any(|x| x.covers(row, col)) {
                         painter.rect_filled(cr, 0.0, rule_fill);
+                    }
+                    if cursor == Some((col, row)) {
+                        painter.rect_stroke(cr.shrink(1.0), 0.0, Stroke::new(2.0_f32, Color32::from_rgb(30, 120, 60)));
                     }
                     if let Some(cell) = grid.get(row, col) {
                         let color = if cell.formula { visuals.weak_text_color() } else { visuals.text_color() };
@@ -780,6 +936,11 @@ impl App {
                     clicked = hit(p);
                 }
             }
+            if resp.double_clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    double = hit(p);
+                }
+            }
             if let Some(p) = resp.hover_pos() {
                 match hit(p) {
                     Hit::Cell(r, c) => {
@@ -790,24 +951,31 @@ impl App {
                         if let Some(x) = rules.iter().find(|x| x.covers(r, c)) {
                             tip.push_str(&format!("\nПравило {} — {}", x.range_text(), x.kind.title()));
                         }
+                        tip.push_str("\nДвойной щелчок — колонка отсюда до конца листа");
                         resp.on_hover_text_at_pointer(tip);
                     }
                     Hit::Column(_) => {
-                        resp.on_hover_text_at_pointer("Щелчок — выделить всю колонку");
+                        resp.on_hover_text_at_pointer("Щелчок — вся колонка под шапкой, до конца листа");
                     }
                     Hit::None => {}
                 }
             }
         });
 
+        self.last_vp = seen_vp;
+        self.grid_id = grid_id;
         let old = self.sel;
+        // Колонка целиком (щелчок по букве) или двойной щелчок по ячейке — от неё (по шапке — от строки
+        // под шапкой) до конца листа: в настоящем файле строк больше, чем видно.
+        let whole = match (clicked, double) {
+            (_, Hit::Cell(r, c)) => Some((c, Some(r))),
+            (_, Hit::Column(c)) | (Hit::Column(c), _) => Some((c, None)),
+            _ => None,
+        };
         match clicked {
-            Hit::Column(c) => {
-                self.sel = Some((c, 1, nrows.max(1)));
-                self.drag_anchor = Some((c, 1));
-                self.new_to_end = true;
-            }
+            _ if whole.is_some() => {}
             Hit::Cell(r, c) => {
+                self.cursor = Some((c, r));
                 self.sel = match self.drag_anchor {
                     Some((ac, a)) if shift && ac == c => Some((c, a.min(r), a.max(r))),
                     _ => {
@@ -816,13 +984,22 @@ impl App {
                     }
                 };
             }
-            Hit::None => {}
+            _ => {}
+        }
+        if let Some((c, from)) = whole {
+            let a = grid.column_start(from);
+            self.sel = Some((c, a, nrows.max(a)));
+            self.drag_anchor = Some((c, a));
+            self.cursor = Some((c, a));
+            self.new_to_end = true;
         }
         if let Hit::Cell(r, c) = drag_start {
             self.drag_anchor = Some((c, r));
+            self.cursor = Some((c, r));
             self.sel = Some((c, r, r));
         }
         if let (Hit::Cell(r, _), Some((c, a))) = (drag_to, self.drag_anchor) {
+            self.cursor = Some((c, r));
             self.sel = Some((c, a.min(r), a.max(r)));
         }
         if self.sel != old {
@@ -854,6 +1031,9 @@ impl App {
             .filter_map(|(i, s)| doc.grids.get(&i).map(|g| (s.name.clone(), g.max_row)))
             .collect();
         let cur_sel = self.sel.map(|s| (self.sheet_name(doc.cur_sheet), s));
+        let sel_last = cur_sel.as_ref().and_then(|(sh, _)| max_rows.get(sh).copied());
+        let preview_rules = self.preview_rules.get(self.cur);
+        let counting = self.preview_job.is_some();
         let no_preview = Vec::new();
         let preview = self.preview.get(self.cur).unwrap_or(&no_preview);
         let mut take = None;
@@ -865,12 +1045,20 @@ impl App {
                 ui.label("Правил нет. Выделите диапазон в таблице и нажмите «Добавить правило» или используйте автоподбор.");
             }
             for (i, r) in doc.profile.rules.iter_mut().enumerate() {
+                // Предпросмотр, посчитанный для этого же правила (правку ещё считают — не показываем старое).
+                let pv = preview.get(i).filter(|_| preview_rules.and_then(|v| v.get(i)) == Some(&*r));
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.strong(format!("{}!{}", r.sheet, r.range_text()));
-                        if let Some(p) = preview.get(i) {
-                            ui.label(RichText::new(format!("≈ {} ячеек", p.cells)).weak());
+                        match pv {
+                            Some(p) => {
+                                ui.label(RichText::new(format!("≈ {} ячеек", p.cells)).weak());
+                            }
+                            None if counting => {
+                                ui.spinner();
+                            }
+                            None => {}
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Удалить").clicked() {
@@ -931,9 +1119,20 @@ impl App {
                                 .changed();
                         }
                     });
-                    if let Some(p) = preview.get(i) {
+                    if let Some(p) = pv {
                         for (o, f) in &p.samples {
                             ui.label(RichText::new(format!("{o}  →  {f}")).small());
+                        }
+                        if p.below > 0 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Ниже строки {} в колонке ещё заполненных ячеек: {} — они не попадут под правило. Если таблица длиннее, отметьте «до конца»",
+                                    r.row_to.unwrap_or(0),
+                                    p.below
+                                ))
+                                .small()
+                                .color(Color32::from_rgb(220, 80, 60)),
+                            );
                         }
                     }
                     ui.label(RichText::new(format!("Пример: {}", r.kind.hint())).small().weak().italics());
@@ -949,7 +1148,7 @@ impl App {
             r.sheet = sheet;
             r.col = c;
             r.row_from = a;
-            r.row_to = if self.new_to_end { None } else { Some(b) };
+            r.row_to = if self.new_to_end || sel_last.is_some_and(|l| b >= l) { None } else { Some(b) };
             // Новый диапазон — может быть, другая колонка: подпись берётся из её заголовка.
             if r.kind == Kind::Text {
                 r.label.clear();
@@ -1078,8 +1277,10 @@ impl eframe::App for App {
         egui::SidePanel::right("rules").resizable(true).min_width(500.0).default_width(580.0).show(ctx, |ui| self.rules_panel(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.grid_panel(ui));
         // Не пересчитываем, пока кнопка мыши зажата (тянут поле со строками) — файлы читаются целиком.
-        if self.preview_dirty && !ctx.input(|i| i.pointer.any_down()) {
-            self.compute_preview();
+        // Правка во время подсчёта — пересчёт сразу после него.
+        self.poll_preview();
+        if self.preview_dirty && self.preview_job.is_none() && !ctx.input(|i| i.pointer.any_down()) {
+            self.start_preview(ctx);
         }
     }
 }

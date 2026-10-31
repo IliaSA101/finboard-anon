@@ -77,6 +77,33 @@ fn digits_of(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_digit()).collect()
 }
 
+/// Короткий код вроде «Дог1», «Налог10», «Счет 7»: до 4 цифр — не номер счёта, а условное обозначение.
+/// Номер ID на месте его цифр совпадал бы с самим кодом («Дог1» → «Дог1») или с соседним («Дог2» → «Дог1»).
+fn short_code(d: &str) -> bool {
+    (1..=4).contains(&d.len())
+}
+
+/// Цифры первой группы заменяются новыми, цифры остальных групп убираются: «Дог1» → «Дог900001».
+fn replace_digit_run(orig: &str, new_digits: &str) -> String {
+    let mut out = String::with_capacity(orig.len() + new_digits.len());
+    let (mut done, mut in_run) = (false, false);
+    for c in orig.chars() {
+        if c.is_ascii_digit() {
+            if !done && !in_run {
+                out.push_str(new_digits);
+            }
+            in_run = true;
+        } else {
+            if in_run {
+                done = true;
+            }
+            in_run = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn title_case(s: &str) -> String {
     let lower = s.to_lowercase();
     let mut out = String::new();
@@ -1185,6 +1212,17 @@ impl Faker {
         if d.is_empty() {
             return self.mask(orig);
         }
+        if short_code(&d) {
+            // Шесть цифр на «9»: фейк длиннее любого короткого кода и не совпадёт ни с одним настоящим.
+            // ID — по всему коду: «Дог1» и «Счет1» — разные вещи.
+            let tail = if with_id {
+                let id = self.id_for("code", &norm_text(orig));
+                if id < 100_000 { format!("9{id:05}") } else { format!("9{id}") }
+            } else {
+                format!("9{}", Rng::new(&[&self.s.salt, "code", &norm_text(orig)]).digits(5, false))
+            };
+            return replace_digit_run(orig, &tail);
+        }
         let keep = if d.len() >= 12 { 4 } else { 0 };
         let rest = d.len() - keep;
         let mut r = Rng::new(&[&self.s.salt, "account", &d]);
@@ -1348,8 +1386,17 @@ impl Faker {
                 continue;
             }
             if let Some((kind, _, label)) = parse_kind_key(&e.kind_key) {
+                let number = matches!(kind, Kind::Inn | Kind::Snils | Kind::Passport | Kind::Account);
+                let short = number && short_code(&digits_of(&e.real));
+                // Ключ версий до 0.3: короткий код получал ID на место своих цифр («Дог1» → «Дог1») —
+                // такую запись не восстанавливаем, код получит новый фейк.
+                if short && digits_of(&e.fake).len() == digits_of(&e.real).len() {
+                    continue;
+                }
                 if let (Some(ns), Some(id)) = (kind.id_ns(&label), e.id) {
+                    let ns = if short { "code".to_string() } else { ns };
                     let norm = match kind {
+                        _ if short => norm_text(&e.real),
                         Kind::Phone => phone_key(&e.real),
                         Kind::Inn | Kind::Snils | Kind::Passport | Kind::Account => digits_of(&e.real),
                         Kind::Company => company_key(&e.real),
@@ -1592,6 +1639,27 @@ mod tests {
     fn date_shift() {
         assert_eq!(shift_text_date("31.12.1990", 1).unwrap(), "01.01.1991");
         assert_eq!(shift_text_date("1990-03-01", -1).unwrap(), "1990-02-28");
+    }
+
+    #[test]
+    fn short_code_never_maps_to_itself() {
+        let mut f = faker();
+        for w in [true, false] {
+            let mut r = rule(Kind::Account);
+            r.with_id = w;
+            let reals = ["Дог1", "Дог2", "Дог3", "Счет1", "Налог10", "Налог1", "1", "А-12/3"];
+            let fakes: Vec<String> = reals.iter().map(|x| f.fake(&r, x, false)).collect();
+            for (x, y) in reals.iter().zip(&fakes) {
+                assert!(!reals.contains(&y.as_str()), "{x} → {y}: фейк совпал с настоящим кодом");
+                assert_eq!(digits_of(y).len(), 6, "{x} → {y}");
+            }
+            let uniq: std::collections::HashSet<&String> = fakes.iter().collect();
+            assert_eq!(uniq.len(), fakes.len(), "разные коды — разные фейки: {fakes:?}");
+            assert!(fakes[0].starts_with("Дог9") && fakes[7].starts_with("А-9") && fakes[7].ends_with('/'), "{fakes:?}");
+        }
+        let mut r = rule(Kind::Account);
+        r.with_id = true;
+        assert_eq!(f.fake(&r, "Счет 5", false), "Счет 900009", "ID по всему коду, следующий после восьми");
     }
 
     #[test]

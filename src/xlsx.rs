@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -31,6 +31,15 @@ pub fn read_part(zip: &mut Zip, name: &str) -> Result<Option<Vec<u8>>> {
             f.read_to_end(&mut v)?;
             Ok(Some(v))
         }
+        Err(ZipError::FileNotFound) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Часть архива потоком: лист в сотни мегабайт не читается в память целиком.
+pub fn part_reader<'a>(zip: &'a mut Zip, name: &str) -> Result<Option<BufReader<zip::read::ZipFile<'a, BufReader<File>>>>> {
+    match zip.by_name(name) {
+        Ok(f) => Ok(Some(BufReader::with_capacity(1 << 16, f))),
         Err(ZipError::FileNotFound) => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -188,6 +197,8 @@ pub struct Workbook {
     pub sst: Vec<String>,
     /// Даты считаются от 01.01.1904 (книги со старых Mac), а не от 30.12.1899.
     pub date1904: bool,
+    /// По номеру стиля ячейки (атрибут s): формат даты (и есть ли в нём время). Только для просмотра.
+    pub date_styles: Vec<Option<bool>>,
 }
 
 impl Workbook {
@@ -245,12 +256,100 @@ impl Workbook {
             },
             None => Vec::new(),
         };
-        Ok(Workbook { workbook_path, sheets, sst_path, sst, date1904 })
+        let date_styles = match rels.iter().find(|r| r.kind.ends_with("/styles")) {
+            Some(r) => read_part(zip, &r.target)?.map(|x| parse_date_styles(&x)).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        Ok(Workbook { workbook_path, sheets, sst_path, sst, date1904, date_styles })
     }
 
     pub fn sheet_index(&self, name: &str) -> Option<usize> {
         self.sheets.iter().position(|s| s.name == name)
     }
+}
+
+/// Формат числа — дата? `Some(true)` — дата со временем, `Some(false)` — только дата, `None` — не дата.
+/// Встроенные форматы 14–22, 45–47 и свои: есть d/m/y/h/s вне кавычек и [цвета].
+pub fn date_format(id: u32, code: Option<&str>) -> Option<bool> {
+    match id {
+        14..=17 => return Some(false),
+        18..=22 | 45..=47 => return Some(true),
+        _ => {}
+    }
+    let code = code?;
+    let (mut date, mut time) = (false, false);
+    let (mut quoted, mut bracket, mut escaped) = (false, false, false);
+    for ch in code.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '[' if !quoted => bracket = true,
+            ']' if !quoted => bracket = false,
+            ';' if !quoted && !bracket => break,
+            _ if quoted || bracket => {}
+            'd' | 'D' | 'y' | 'Y' | 'm' | 'M' => date = true,
+            'h' | 'H' | 's' | 'S' => time = true,
+            _ => {}
+        }
+    }
+    // «m» без дня и года — это минуты (ч:мм).
+    if date || time {
+        Some(time)
+    } else {
+        None
+    }
+}
+
+/// Стили ячеек (cellXfs) из styles.xml → формат даты для каждого номера стиля.
+pub fn parse_date_styles(xml: &[u8]) -> Vec<Option<bool>> {
+    let mut codes: HashMap<u32, String> = HashMap::new();
+    let mut out = Vec::new();
+    let mut rd = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    let mut in_xfs = false;
+    loop {
+        match rd.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match e.local_name().as_ref() {
+                b"numFmt" => {
+                    if let (Some(id), Some(code)) = (attr(&e, b"numFmtId").and_then(|v| v.parse().ok()), attr(&e, b"formatCode")) {
+                        codes.insert(id, code);
+                    }
+                }
+                b"cellXfs" => in_xfs = true,
+                b"xf" if in_xfs => {
+                    let id: u32 = attr(&e, b"numFmtId").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    out.push(date_format(id, codes.get(&id).map(String::as_str)));
+                }
+                _ => {}
+            },
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"cellXfs" => in_xfs = false,
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
+}
+
+/// Число-дата Excel как в русском Excel: 01.01.2019 или 01.01.2019 13:05.
+pub fn date_text(serial: f64, d1904: bool, with_time: bool) -> Option<String> {
+    let min = if d1904 { 0.0 } else { 1.0 };
+    if !(min..2_958_466.0).contains(&serial) {
+        return None;
+    }
+    let base = if d1904 { crate::fake::days_from_civil(1904, 1, 1) } else { crate::fake::days_from_civil(1899, 12, 30) };
+    let total = (serial * 86400.0).round() as i64;
+    let (y, m, d) = crate::fake::civil_from_days(base + total.div_euclid(86400));
+    let secs = total.rem_euclid(86400);
+    let mut s = format!("{d:02}.{m:02}.{y:04}");
+    if with_time {
+        s.push_str(&format!(" {:02}:{:02}", secs / 3600, secs / 60 % 60));
+    }
+    Some(s)
 }
 
 /// Умная таблица: лист, колонки и строки данных (без шапки и строки итогов), имена колонок.
@@ -399,6 +498,8 @@ pub struct CellVal {
     pub formula: bool,
     /// Ошибка (#Н/Д) или логическое значение — не данные человека.
     pub special: bool,
+    /// Номер стиля ячейки (атрибут s).
+    pub style: u32,
 }
 
 /// Значение ячейки по её типу и содержимому <v>/<is>.
@@ -417,14 +518,62 @@ pub fn resolve_value(t: &str, v: &str, is_text: &str, sst: &[String]) -> Option<
     }
 }
 
+/// Сырой атрибут без копирования и раскодирования (r, t, s ячейки — только латиница и цифры).
+pub fn raw_attr<'a>(e: &'a BytesStart, key: &[u8]) -> Option<std::borrow::Cow<'a, [u8]>> {
+    e.attributes().with_checks(false).flatten().find(|a| a.key.as_ref() == key).map(|a| a.value)
+}
+
+/// Число из байтов ASCII.
+pub fn parse_u32(b: &[u8]) -> Option<u32> {
+    if b.is_empty() || b.len() > 9 {
+        return None;
+    }
+    b.iter().try_fold(0u32, |n, &c| c.is_ascii_digit().then(|| n * 10 + (c - b'0') as u32))
+}
+
+/// «AB12» (и «$AB$12») из байтов: (колонка с 0, строка с 1) — без выделения памяти.
+pub fn parse_ref_bytes(b: &[u8]) -> Option<(u32, u32)> {
+    let mut col: u32 = 0;
+    let mut letters = 0;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'$' => {}
+            c if c.is_ascii_alphabetic() => {
+                letters += 1;
+                col = col * 26 + (c.to_ascii_uppercase() - b'A') as u32 + 1;
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    if letters == 0 || letters > 3 {
+        return None;
+    }
+    let rest = b[i..].strip_prefix(b"$").unwrap_or(&b[i..]);
+    Some((col - 1, parse_u32(rest)?))
+}
+
 /// Обходит непустые ячейки листа. Колбэк возвращает false, чтобы остановиться.
-pub fn scan_cells(xml: &[u8], sst: &[String], mut f: impl FnMut(u32, u32, CellVal) -> bool) -> Result<()> {
+pub fn scan_cells(xml: impl BufRead, sst: &[String], f: impl FnMut(u32, u32, CellVal) -> bool) -> Result<()> {
+    scan_cells_where(xml, sst, |_, _| true, f)
+}
+
+/// То же, но значения читаются только у нужных ячеек (`want(строка, колонка)`): на больших листах
+/// под правилами — малая часть колонок.
+pub fn scan_cells_where(
+    xml: impl BufRead,
+    sst: &[String],
+    mut want: impl FnMut(u32, u32) -> bool,
+    mut f: impl FnMut(u32, u32, CellVal) -> bool,
+) -> Result<()> {
     let mut rd = Reader::from_reader(xml);
     let mut buf = Vec::new();
     let mut row: u32 = 0;
     let mut col: i64 = -1;
     let (mut c_row, mut c_col) = (0u32, 0u32);
     let mut t = String::new();
+    let mut style = 0u32;
     let mut v = String::new();
     let mut is_text = String::new();
     let (mut in_c, mut in_v, mut in_is, mut in_t, mut has_f, mut rph) = (false, false, false, false, false, 0u32);
@@ -434,16 +583,20 @@ pub fn scan_cells(xml: &[u8], sst: &[String], mut f: impl FnMut(u32, u32, CellVa
         match ev {
             Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
                 b"row" => {
-                    row = attr(&e, b"r").and_then(|s| s.parse().ok()).unwrap_or(row + 1);
+                    row = raw_attr(&e, b"r").and_then(|s| parse_u32(&s)).unwrap_or(row + 1);
                     col = -1;
                 }
                 b"c" => {
-                    let (cc, rr) = attr(&e, b"r").and_then(|s| parse_ref(&s)).unwrap_or(((col + 1) as u32, row));
+                    let (cc, rr) = raw_attr(&e, b"r").and_then(|s| parse_ref_bytes(&s)).unwrap_or(((col + 1) as u32, row));
                     col = cc as i64;
-                    if !empty {
+                    if !empty && want(rr, cc) {
                         in_c = true;
                         (c_row, c_col) = (rr, cc);
-                        t = attr(&e, b"t").unwrap_or_default();
+                        t.clear();
+                        if let Some(x) = raw_attr(&e, b"t") {
+                            t.push_str(&String::from_utf8_lossy(&x));
+                        }
+                        style = raw_attr(&e, b"s").and_then(|x| parse_u32(&x)).unwrap_or(0);
                         v.clear();
                         is_text.clear();
                         has_f = false;
@@ -464,7 +617,7 @@ pub fn scan_cells(xml: &[u8], sst: &[String], mut f: impl FnMut(u32, u32, CellVa
                 b"c" if in_c => {
                     in_c = false;
                     if let Some((text, numeric)) = resolve_value(&t, &v, &is_text, sst) {
-                        if !f(c_row, c_col, CellVal { text, numeric, formula: has_f, special: t == "b" || t == "e" }) {
+                        if !f(c_row, c_col, CellVal { text, numeric, formula: has_f, special: t == "b" || t == "e", style }) {
                             return Ok(());
                         }
                     }
@@ -500,6 +653,8 @@ pub struct GridCell {
     pub text: String,
     pub numeric: bool,
     pub formula: bool,
+    /// Число в формате даты — для показа: «01.01.2019».
+    pub date: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -510,27 +665,90 @@ pub struct Grid {
     pub max_col: u32,
     /// Лист длиннее лимита просмотра.
     pub truncated: bool,
+    /// Последняя строка листа по его размеру (<dimension>) — когда показана только часть строк.
+    pub dim_rows: Option<u32>,
 }
 
 impl Grid {
     pub fn get(&self, row: u32, col: u32) -> Option<&GridCell> {
         self.cells.get(&(row, col))
     }
+
+    fn filled(&self, row: u32, col: u32) -> bool {
+        self.get(row, col).is_some_and(|x| !x.text.trim().is_empty())
+    }
+
+    /// Строка шапки таблицы: среди первых 50 строк — та, где больше всего текстовых ячеек (не меньше двух).
+    pub fn header_row(&self) -> Option<u32> {
+        let mut best: Option<(u32, usize)> = None;
+        for r in 1..=self.max_row.min(50) {
+            let n = (0..=self.max_col)
+                .filter(|&c| self.get(r, c).is_some_and(|x| !x.numeric && x.date.is_none() && !x.text.trim().is_empty()))
+                .count();
+            if n >= 2 && best.is_none_or(|(_, b)| n > b) {
+                best = Some((r, n));
+            }
+        }
+        best.map(|(r, _)| r)
+    }
+
+    /// Начало колонки целиком: строка под шапкой; `from` ниже шапки — она сама.
+    pub fn column_start(&self, from: Option<u32>) -> u32 {
+        let data = self.header_row().map_or(1, |h| (h + 1).min(self.max_row.max(1)));
+        from.map_or(data, |r| r.max(data))
+    }
+
+    /// Ctrl+стрелка как в Excel: к краю заполненного блока, из пустоты — к следующей заполненной ячейке
+    /// (или к краю листа). Позиция — (колонка, строка), шаг — (по колонкам, по строкам).
+    pub fn jump(&self, (c, r): (u32, u32), (dc, dr): (i64, i64), max_c: u32, max_r: u32) -> (u32, u32) {
+        let step = |(c, r): (u32, u32)| -> Option<(u32, u32)> {
+            let (nc, nr) = (c as i64 + dc, r as i64 + dr);
+            (nc >= 0 && nc <= max_c as i64 && nr >= 1 && nr <= max_r as i64).then_some((nc as u32, nr as u32))
+        };
+        let Some(mut n) = step((c, r)) else { return (c, r) };
+        if self.filled(r, c) && self.filled(n.1, n.0) {
+            while let Some(m) = step(n).filter(|m| self.filled(m.1, m.0)) {
+                n = m;
+            }
+        } else {
+            while !self.filled(n.1, n.0) {
+                match step(n) {
+                    Some(m) => n = m,
+                    None => break,
+                }
+            }
+        }
+        n
+    }
 }
 
 pub fn load_grid(path: &Path, wb: &Workbook, sheet: usize, max_rows: u32) -> Result<Grid> {
     let mut zip = open_zip(path)?;
     let info = wb.sheets.get(sheet).context("нет такого листа")?;
-    let xml = read_part(&mut zip, &info.path)?.with_context(|| format!("нет части {}", info.path))?;
     let mut g = Grid::default();
-    scan_cells(&xml, &wb.sst, |r, c, v| {
+    // Размер листа записан в его начале: <dimension ref="A1:CV500001"/>.
+    if let Some(mut rd) = part_reader(&mut zip, &info.path)? {
+        let mut head = vec![0u8; 4096];
+        let n = rd.read(&mut head)?;
+        let head = String::from_utf8_lossy(&head[..n]);
+        if let Some(i) = head.find("<dimension ref=\"") {
+            let r = &head[i + 16..];
+            g.dim_rows = r.split('"').next().and_then(parse_range).map(|(_, _, a, b)| b.unwrap_or(a));
+        }
+    }
+    let xml = part_reader(&mut zip, &info.path)?.with_context(|| format!("нет части {}", info.path))?;
+    scan_cells(xml, &wb.sst, |r, c, v| {
         if r > max_rows {
             g.truncated = true;
             return false;
         }
         g.max_row = g.max_row.max(r);
         g.max_col = g.max_col.max(c);
-        g.cells.insert((r, c), GridCell { text: v.text, numeric: v.numeric, formula: v.formula });
+        let date = match wb.date_styles.get(v.style as usize) {
+            Some(Some(time)) if v.numeric => v.text.trim().parse().ok().and_then(|x| date_text(x, wb.date1904, *time)),
+            _ => None,
+        };
+        g.cells.insert((r, c), GridCell { text: v.text, numeric: v.numeric, formula: v.formula, date });
         true
     })?;
     Ok(g)
@@ -550,5 +768,75 @@ mod tests {
         assert_eq!(parse_range("C:C"), Some((2, 2, 1, None)));
         assert_eq!(resolve_target("xl", "../customXml/item1.xml"), "customXml/item1.xml");
         assert_eq!(resolve_target("xl", "worksheets/sheet1.xml"), "xl/worksheets/sheet1.xml");
+    }
+
+    #[test]
+    fn refs_from_bytes() {
+        for r in ["A1", "AB12", "$C$5", "XFD1048576", "z9"] {
+            assert_eq!(parse_ref_bytes(r.as_bytes()), parse_ref(r), "{r}");
+        }
+        for r in ["", "1", "A", "ABCD1", "A1x", "A-1"] {
+            assert_eq!(parse_ref_bytes(r.as_bytes()), None, "{r}");
+        }
+        assert_eq!(parse_u32(b"123"), Some(123));
+        assert_eq!(parse_u32(b"12a"), None);
+    }
+
+    fn grid(rows: &[&[&str]]) -> Grid {
+        let mut g = Grid::default();
+        for (r, row) in rows.iter().enumerate() {
+            for (c, t) in row.iter().enumerate().filter(|(_, t)| !t.is_empty()) {
+                let numeric = t.parse::<f64>().is_ok();
+                g.cells.insert((r as u32 + 1, c as u32), GridCell { text: t.to_string(), numeric, formula: false, date: None });
+                g.max_row = g.max_row.max(r as u32 + 1);
+                g.max_col = g.max_col.max(c as u32);
+            }
+        }
+        g
+    }
+
+    #[test]
+    fn whole_column_starts_under_header() {
+        // Название отчёта сверху, шапка в 3-й строке — колонка начинается с 4-й.
+        let g = grid(&[&["Отчёт за март", "", ""], &["", "", ""], &["ФИО", "Сумма", "Дата"], &["Иванов", "5", "1"], &["Петров", "7", "2"]]);
+        assert_eq!(g.header_row(), Some(3));
+        assert_eq!(g.column_start(None), 4);
+        assert_eq!(g.column_start(Some(1)), 4, "двойной щелчок по названию или шапке — от строки под шапкой");
+        assert_eq!(g.column_start(Some(5)), 5, "по ячейке данных — от неё");
+        let flat = grid(&[&["1", "2"], &["3", "4"]]);
+        assert_eq!((flat.header_row(), flat.column_start(None)), (None, 1), "без шапки — с первой строки");
+    }
+
+    #[test]
+    fn ctrl_arrows_like_excel() {
+        let g = grid(&[&["a", "", "c"], &["a", "", ""], &["a", "", ""], &["", "", ""], &["", "", ""], &["a", "", "c"]]);
+        let (mc, mr) = (2, 6);
+        assert_eq!(g.jump((0, 1), (0, 1), mc, mr), (0, 3), "к концу заполненного блока");
+        assert_eq!(g.jump((0, 3), (0, 1), mc, mr), (0, 6), "из конца блока — к следующей заполненной");
+        assert_eq!(g.jump((0, 6), (0, 1), mc, mr), (0, 6), "у края листа — на месте");
+        assert_eq!(g.jump((0, 6), (0, -1), mc, mr), (0, 3), "вверх");
+        assert_eq!(g.jump((0, 1), (1, 0), mc, mr), (2, 1), "вправо через пустую — к заполненной");
+        assert_eq!(g.jump((1, 2), (0, 1), mc, mr), (1, 6), "пустая колонка — до края");
+    }
+
+    #[test]
+    fn date_formats() {
+        assert_eq!(date_format(14, None), Some(false));
+        assert_eq!(date_format(22, None), Some(true));
+        assert_eq!(date_format(0, None), None);
+        assert_eq!(date_format(4, None), None);
+        assert_eq!(date_format(164, Some("dd/mm/yyyy;@")), Some(false));
+        assert_eq!(date_format(165, Some("[$-F800]dddd\\,\\ mmmm\\ dd\\,\\ yyyy")), Some(false));
+        assert_eq!(date_format(166, Some("dd.mm.yy h:mm")), Some(true));
+        assert_eq!(date_format(167, Some("#,##0.00\" дней\"")), None);
+        assert_eq!(date_format(168, Some("[Red]#,##0;[Blue]-#,##0")), None);
+        assert_eq!(date_format(169, Some("0.00 \\d")), None);
+        assert_eq!(date_text(43466.0, false, false).as_deref(), Some("01.01.2019"));
+        assert_eq!(date_text(43466.5, false, true).as_deref(), Some("01.01.2019 12:00"));
+        assert_eq!(date_text(0.0, true, false).as_deref(), Some("01.01.1904"));
+        let xml = br#"<styleSheet><numFmts count="1"><numFmt numFmtId="164" formatCode="DD.MM.YYYY"/></numFmts>
+            <cellStyleXfs><xf numFmtId="14"/></cellStyleXfs>
+            <cellXfs count="4"><xf numFmtId="0"/><xf numFmtId="164"/><xf numFmtId="4"/><xf numFmtId="22"/></cellXfs></styleSheet>"#;
+        assert_eq!(parse_date_styles(xml), vec![None, Some(false), None, Some(true)]);
     }
 }

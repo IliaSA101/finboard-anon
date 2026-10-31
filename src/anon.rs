@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use aho_corasick::{AhoCorasick, MatchKind};
@@ -16,7 +16,7 @@ use zip::{CompressionMethod, ZipWriter};
 
 use crate::fake::Faker;
 use crate::profile::{parse_kind_key, Kind, Outside, Profile, Rule, Settings};
-use crate::xlsx::{attr, open_zip, parse_range, pivot_caches, read_part, resolve_value, scan_cells, PivotCache, Workbook, Zip};
+use crate::xlsx::{attr, open_zip, parse_range, part_reader, pivot_caches, resolve_value, scan_cells_where, PivotCache, Workbook, Zip};
 use crate::keyfile;
 
 pub struct Job {
@@ -653,6 +653,28 @@ fn write_book(
             let is_xml = name.ends_with(".xml") || name.ends_with(".rels");
             let sheet_rels = name.starts_with("xl/worksheets/_rels/") && name.ends_with(".rels");
             let other_rels = name.contains("/_rels/") || name.starts_with("_rels/");
+            if let Some(&si) = sheet_by_path.get(name.as_str()) {
+                // Лист — потоком прямо в результат. Быстрое сжатие, как у самого Excel: листы в сотни
+                // мегабайт сжимаются в разы быстрее, файл больше на 10–20 %.
+                let srules = sheet_rules.get(&si).unwrap_or(&empty);
+                zw.start_file(name.clone(), opts.compression_level(Some(1)).large_file(true))?;
+                let changed = rewrite_sheet(
+                    BufReader::with_capacity(1 << 16, zip.by_index(i)?),
+                    &mut zw,
+                    &wb.sst,
+                    srules,
+                    tainted.get(&si).unwrap_or(&no_taint),
+                    settings.outside == Outside::Keep,
+                    faker,
+                    maps,
+                    &mut stats,
+                )
+                .with_context(|| format!("лист «{}»", wb.sheets[si].name))?;
+                if changed {
+                    report.parts_changed += 1;
+                }
+                continue;
+            }
             let new: Option<Vec<u8>> = if !is_xml || (other_rels && !sheet_rels) {
                 None
             } else {
@@ -665,11 +687,6 @@ fn write_book(
                 }
                 let res = if sheet_rels {
                     rewrite_hyperlink_rels(&data, maps, &mut stats)?
-                } else if let Some(&si) = sheet_by_path.get(name.as_str()) {
-                    let srules = sheet_rules.get(&si).unwrap_or(&empty);
-                    rewrite_sheet(&data, &wb.sst, srules, tainted.get(&si).unwrap_or(&no_taint), settings.outside == Outside::Keep, faker, maps, &mut stats)
-                        .with_context(|| format!("лист «{}»", wb.sheets[si].name))
-                        .map_err(|e| e)?
                 } else if Some(name.as_str()) == wb.sst_path.as_deref() {
                     rewrite_sst(&data, maps, &mut stats)?
                 } else if name == wb.workbook_path {
@@ -809,25 +826,40 @@ pub struct FilePlan {
     /// Первые разные значения каждого правила — для предпросмотра. Отдельно от `items`:
     /// там значение достаётся первому правилу, а у второго правила с теми же людьми примеров бы не было.
     pub rule_samples: Vec<Vec<String>>,
+    /// Заполненные ячейки той же колонки ниже конца правила (не под другим правилом): таблица длиннее правила.
+    pub rule_below: Vec<usize>,
     pub warnings: Vec<String>,
 }
 
 fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule]) -> Result<FilePlan> {
-    let (sheet_rules, warnings) = rules_by_sheet(wb, rules);
+    let (sheet_rules, mut warnings) = rules_by_sheet(wb, rules);
     let mut items: Vec<(usize, String, bool)> = Vec::new();
     let mut rule_cells = vec![0usize; rules.len()];
+    let mut rule_below = vec![0usize; rules.len()];
     let mut rule_samples: Vec<Vec<String>> = vec![Vec::new(); rules.len()];
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+    // По типу замены — уже встреченные значения.
+    let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
     for (si, info) in wb.sheets.iter().enumerate() {
         let Some(srules) = sheet_rules.get(&si) else { continue };
-        let xml = read_part(zip, &info.path)?.with_context(|| format!("нет части {}", info.path))?;
-        scan_cells(&xml, &wb.sst, |row, col, v| {
+        let xml = part_reader(zip, &info.path)?.with_context(|| format!("нет части {}", info.path))?;
+        let keys: Vec<String> = srules.iter().map(|(_, r)| r.kind_key()).collect();
+        let below = |r: &Rule, row: u32, col: u32| r.kind != Kind::Keep && col == r.col && r.row_to.is_some_and(|to| row > to);
+        let want = |row: u32, col: u32| srules.iter().any(|(_, r)| r.covers(row, col) || below(r, row, col));
+        scan_cells_where(xml, &wb.sst, want, |row, col, v| {
             // Кэш формулы под правилом (ФИО из другой книги, ВПР) — те же персональные данные.
             // Ошибки, логические значения, заголовки и «Итого» — нет.
             if v.special || crate::detect::is_label(&v.text) {
                 return true;
             }
-            if let Some((ri, r)) = srules.iter().find(|(_, r)| r.covers(row, col)) {
+            let Some((k, (ri, r))) = srules.iter().enumerate().find(|(_, (_, r))| r.covers(row, col)) else {
+                if !v.formula {
+                    for (ri, _) in srules.iter().filter(|(_, r)| below(r, row, col)) {
+                        rule_below[*ri] += 1;
+                    }
+                }
+                return true;
+            };
+            {
                 // Заголовок, ставший подписью «Шаблона», не заменяется.
                 if r.is_template_header(&v.text) {
                     return true;
@@ -840,14 +872,25 @@ fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule]) -> Result<FilePlan> {
                 if samples.len() < 3 && !samples.contains(&v.text) {
                     samples.push(v.text.clone());
                 }
-                if seen.insert((r.kind_key(), v.text.clone())) {
+                if !seen.get(&keys[k]).is_some_and(|s| s.contains(&v.text)) {
+                    seen.entry(keys[k].clone()).or_default().insert(v.text.clone());
                     items.push((*ri, v.text, v.numeric));
                 }
             }
             true
         })?;
     }
-    Ok(FilePlan { items, rule_cells, rule_samples, warnings })
+    for (ri, &n) in rule_below.iter().enumerate().filter(|(_, n)| **n > 0) {
+        let r = &rules[ri];
+        warnings.push(format!(
+            "Правило {}!{} кончается на строке {}, а ниже в колонке {} ещё заполненных ячеек: {n} — они не обезличены по этому правилу. Если таблица длиннее — поставьте «до конца»",
+            r.sheet,
+            r.range_text(),
+            r.row_to.unwrap_or(0),
+            crate::xlsx::col_name(r.col)
+        ));
+    }
+    Ok(FilePlan { items, rule_cells, rule_samples, rule_below, warnings })
 }
 
 /// Значения всех файлов и один генератор на всех: строки всех книг заняты для фейков,
@@ -945,6 +988,8 @@ fn kind_conflicts(plans: &mut [FilePlan], rules: &[&[Rule]], faker: &Faker, file
 pub struct RulePreview {
     pub cells: usize,
     pub samples: Vec<(String, String)>,
+    /// Заполненных ячеек ниже конца правила (правило короче таблицы).
+    pub below: usize,
 }
 
 pub fn preview(input: &Path, profile: &Profile, key_in: Option<&Path>) -> Result<Vec<RulePreview>> {
@@ -970,8 +1015,10 @@ pub fn preview_batch(files: &[(PathBuf, Vec<Rule>)], settings: &Settings, key_in
                 .iter()
                 .zip(&p.rule_samples)
                 .zip(rules.iter())
-                .map(|((&cells, values), rule)| RulePreview {
+                .zip(&p.rule_below)
+                .map(|(((&cells, values), rule), &below)| RulePreview {
                     cells,
+                    below,
                     samples: values
                         .iter()
                         .filter_map(|v| faker.get(&rule.kind_key(), v).map(|f| (v.clone(), f.to_string())))
@@ -1024,7 +1071,7 @@ fn is_plain_number(s: &str) -> bool {
         && !(s.starts_with("-0") && s.len() > 2 && !s.starts_with("-0."))
 }
 
-fn write_text_elem(w: &mut Writer<Vec<u8>>, name: &str, text: &str) -> Result<()> {
+fn write_text_elem(w: &mut Writer<impl Write>, name: &str, text: &str) -> Result<()> {
     let mut t = BytesStart::new(name.to_string());
     if name.ends_with('t') {
         t.push_attribute(("xml:space", "preserve"));
@@ -1036,7 +1083,7 @@ fn write_text_elem(w: &mut Writer<Vec<u8>>, name: &str, text: &str) -> Result<()
 }
 
 /// Ячейка с новым значением: число, строка (inlineStr) или пустая.
-fn write_value_cell(w: &mut Writer<Vec<u8>>, start: &BytesStart, out: &str, numeric: bool) -> Result<()> {
+fn write_value_cell(w: &mut Writer<impl Write>, start: &BytesStart, out: &str, numeric: bool) -> Result<()> {
     let p = prefix_of(start);
     let mut c = copy_without(start, b"t");
     let name = name_of(start);
@@ -1057,8 +1104,11 @@ fn write_value_cell(w: &mut Writer<Vec<u8>>, start: &BytesStart, out: &str, nume
     Ok(())
 }
 
+/// Лист читается и пишется потоком (листы бывают в сотни мегабайт). Возвращает, было ли что-то заменено.
+#[allow(clippy::too_many_arguments)]
 fn rewrite_sheet(
-    xml: &[u8],
+    xml: impl BufRead,
+    out: impl Write,
     sst: &[String],
     rules: &[(usize, &Rule)],
     tainted: &HashMap<(u32, u32), u8>,
@@ -1066,9 +1116,10 @@ fn rewrite_sheet(
     faker: &Faker,
     maps: &GlobalMaps,
     stats: &mut Stats,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<bool> {
     let mut rd = Reader::from_reader(xml);
-    let mut w = Writer::new(Vec::with_capacity(xml.len() + 4096));
+    let mut w = Writer::new(BufWriter::with_capacity(1 << 16, out));
+    let keys: Vec<String> = rules.iter().map(|(_, r)| r.kind_key()).collect();
     let mut buf = Vec::new();
     let mut changed = false;
     let mut row: u32 = 0;
@@ -1081,7 +1132,7 @@ fn rewrite_sheet(
         if let Some((start, r, c)) = &cell {
             if let Event::End(e) = &ev {
                 if e.local_name().as_ref() == b"c" {
-                    let ch = process_cell(&mut w, start, *r, *c, &inner, sst, rules, tainted, keep_outside, faker, maps, stats)?;
+                    let ch = process_cell(&mut w, start, *r, *c, &inner, sst, rules, &keys, tainted, keep_outside, faker, maps, stats)?;
                     changed |= ch;
                     cell = None;
                     inner.clear();
@@ -1143,25 +1194,28 @@ fn rewrite_sheet(
         }
         w.write_event(ev)?;
     }
-    Ok(changed.then(|| w.into_inner()))
+    w.into_inner().flush()?;
+    Ok(changed)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn process_cell(
-    w: &mut Writer<Vec<u8>>,
+    w: &mut Writer<impl Write>,
     start: &BytesStart<'static>,
     row: u32,
     col: u32,
     inner: &[Event<'static>],
     sst: &[String],
     rules: &[(usize, &Rule)],
+    keys: &[String],
     tainted: &HashMap<(u32, u32), u8>,
     keep_outside: bool,
     faker: &Faker,
     maps: &GlobalMaps,
     stats: &mut Stats,
 ) -> Result<bool> {
-    let t = attr(start, b"t").unwrap_or_default();
+    let t_raw = crate::xlsx::raw_attr(start, b"t");
+    let t: &str = t_raw.as_deref().and_then(|b| std::str::from_utf8(b).ok()).unwrap_or("");
     let (mut has_f, mut v, mut is_text) = (false, String::new(), String::new());
     let (mut in_v, mut in_t, mut rph) = (false, false, 0u32);
     for ev in inner {
@@ -1191,14 +1245,15 @@ fn process_cell(
     }
 
     // Защищённая область («Не менять») и, если вне разметки ничего не трогать, ячейки без правил.
-    let covering = rules.iter().find(|(_, r)| r.covers(row, col));
+    let covering_i = rules.iter().position(|(_, r)| r.covers(row, col));
+    let covering = covering_i.map(|i| &rules[i]);
     if covering.map_or(keep_outside, |(_, r)| r.kind == Kind::Keep) {
         if let Some((ri, _)) = covering {
             stats.rule_cells[*ri] += 1;
         }
         // Общая строка заменится во всей таблице строк — ячейке нужен свой исходный текст.
         if !has_f && t == "s" {
-            if let Some((orig, _)) = resolve_value(&t, &v, &is_text, sst) {
+            if let Some((orig, _)) = resolve_value(t, &v, &is_text, sst) {
                 if maps.cell_text(&orig).is_some() {
                     write_value_cell(w, start, &orig, false)?;
                     return Ok(true);
@@ -1211,9 +1266,9 @@ fn process_cell(
 
     // Ячейка в диапазоне правила. У формулы (ФИО из другой книги, ВПР) меняется кэш, формула остаётся.
     if t != "b" && t != "e" {
-        if let Some((ri, rule)) = rules.iter().find(|(_, r)| r.covers(row, col)) {
-            if let Some((original, numeric)) = resolve_value(&t, &v, &is_text, sst) {
-                if let Some(out) = faker.get(&rule.kind_key(), &original) {
+        if let Some((ri, _)) = covering {
+            if let Some((original, numeric)) = resolve_value(t, &v, &is_text, sst) {
+                if let Some(out) = faker.get(&keys[covering_i.unwrap_or(0)], &original) {
                     if has_f {
                         write_formula_cell(w, start, inner, Some(Some(out.to_string())), !numeric, maps, stats)?;
                     } else {
@@ -1250,7 +1305,7 @@ fn process_cell(
         }
     }
 
-    let level = tainted.get(&(row, col)).copied().unwrap_or(0);
+    let level = if tainted.is_empty() { 0 } else { tainted.get(&(row, col)).copied().unwrap_or(0) };
 
     // Значение, разлитое формулой-массивом (UNIQUE, ФИЛЬТР): <v> без <f>.
     if !has_f && t == "str" {
@@ -1301,10 +1356,10 @@ fn process_cell(
     Ok(false)
 }
 
-fn write_unchanged(w: &mut Writer<Vec<u8>>, start: &BytesStart<'static>, inner: &[Event<'static>]) -> Result<()> {
-    w.write_event(Event::Start(start.clone()))?;
+fn write_unchanged(w: &mut Writer<impl Write>, start: &BytesStart<'static>, inner: &[Event<'static>]) -> Result<()> {
+    w.write_event(Event::Start(start.borrow()))?;
     for ev in inner {
-        w.write_event(ev.clone())?;
+        w.write_event(ev.borrow())?;
     }
     w.write_event(Event::End(BytesEnd::new(name_of(start))))?;
     Ok(())
@@ -1313,7 +1368,7 @@ fn write_unchanged(w: &mut Writer<Vec<u8>>, start: &BytesStart<'static>, inner: 
 /// Ячейка с формулой: строковые литералы в тексте формулы заменяются всегда; кэш результата —
 /// `None` оставить, `Some(Some(x))` заменить на x, `Some(None)` убрать (вместе с типом).
 fn write_formula_cell(
-    w: &mut Writer<Vec<u8>>,
+    w: &mut Writer<impl Write>,
     start: &BytesStart<'static>,
     inner: &[Event<'static>],
     new_v: Option<Option<String>>,
@@ -2185,10 +2240,19 @@ fn derived_formula_cells(zip: &mut Zip, wb: &Workbook, rules: &[Rule]) -> Result
     }
     let tables = crate::xlsx::sheet_tables(zip, wb)?;
     let mut forms: Vec<Formula> = Vec::new();
+    let f_tag = AhoCorasick::new(["<f>", "<f ", "<f/", ":f>", ":f ", ":f/"])?;
     for (si, info) in wb.sheets.iter().enumerate() {
-        let Some(xml) = read_part(zip, &info.path)? else { continue };
+        // Лист без формул (большая выгрузка) — без разбора XML: быстрый поиск тега.
+        let has_f = match part_reader(zip, &info.path)? {
+            Some(rd) => f_tag.stream_find_iter(rd).next().transpose()?.is_some(),
+            None => false,
+        };
+        if !has_f {
+            continue;
+        }
+        let Some(xml) = part_reader(zip, &info.path)? else { continue };
         let mut masters: HashMap<String, (u32, u32, String)> = HashMap::new();
-        for (row, col, text, shared, array_ref) in collect_formulas(&xml)? {
+        for (row, col, text, shared, array_ref) in collect_formulas(xml)? {
             let (text, dr, dc) = match &shared {
                 Some(id) if text.trim().is_empty() => match masters.get(id) {
                     Some((mr, mc, t)) => (t.clone(), row as i64 - *mr as i64, col as i64 - *mc as i64),
@@ -2327,7 +2391,7 @@ fn derived_formula_cells(zip: &mut Zip, wb: &Workbook, rules: &[Rule]) -> Result
 }
 
 /// Формулы листа: (строка, колонка, текст, номер общей формулы, диапазон формулы-массива).
-fn collect_formulas(xml: &[u8]) -> Result<Vec<(u32, u32, String, Option<String>, Option<String>)>> {
+fn collect_formulas(xml: impl BufRead) -> Result<Vec<(u32, u32, String, Option<String>, Option<String>)>> {
     let mut rd = Reader::from_reader(xml);
     let mut buf = Vec::new();
     let mut out = Vec::new();
@@ -2711,6 +2775,13 @@ pub fn scan_leaks_with(path: &Path, originals: &[String], fakes: &[&str], digits
     }
     // Самое длинное совпадение: «Фирма13» не должна спрятаться за «Фирма1», отброшенной по границе слова.
     let ac = AhoCorasick::builder().match_kind(MatchKind::LeftmostLongest).build(&pats)?;
+    // Абзацы (общие строки, строки в ячейке, примечания, надписи) — склеивать, только если они есть в куске:
+    // разбор XML ради них на листе в сотни мегабайт без таких строк — пустая трата.
+    let para = AhoCorasick::new([
+        "<si>", "<si ", ":si>", ":si ", "<is>", "<is ", ":is>", ":is ", "<text>", "<text ", ":text>", ":text ", "<p>", "<p ", ":p>", ":p ",
+    ])?;
+    // Короче самого короткого реального номера — не номер: не разбираем.
+    let min_digits = digits.iter().map(String::len).min().unwrap_or(0);
     let mut zip = open_zip(path)?;
     let mut leaks = Vec::new();
     for i in 0..zip.len() {
@@ -2719,46 +2790,73 @@ pub fn scan_leaks_with(path: &Path, originals: &[String], fakes: &[&str], digits
         if !(name.ends_with(".xml") || name.ends_with(".rels") || name.ends_with(".vml")) {
             continue;
         }
-        let mut data = Vec::new();
-        f.read_to_end(&mut data)?;
-        if let Some(be) = utf16_bom(&data) {
-            data = decode_utf16(&data[2..], be).map(String::into_bytes).unwrap_or(data);
-        }
         let mut count = 0;
         let mut samples: Vec<String> = Vec::new();
-        let note = |m: aho_corasick::Match, samples: &mut Vec<String>| {
-            let s = cands[owner[m.pattern().as_usize()]];
-            if samples.len() < 8 && !samples.contains(s) {
-                samples.push(s.clone());
-            }
-        };
-        for m in ac.find_iter(&data).filter(|m| word_bounded(&data, m.start(), m.end())) {
-            count += 1;
-            note(m, &mut samples);
-        }
-        // Текст, разрезанный на фрагменты форматирования, в сыром XML не виден — ищем и в склеенном.
-        let mut joined_hits = 0;
-        for text in paragraph_texts(&data) {
-            for m in ac.find_iter(&text).filter(|m| word_bounded(text.as_bytes(), m.start(), m.end())) {
-                joined_hits += 1;
+        let mut check = |data: &[u8]| {
+            let mut hits = 0;
+            let note = |m: aho_corasick::Match, samples: &mut Vec<String>| {
+                let s = cands[owner[m.pattern().as_usize()]];
+                if samples.len() < 8 && !samples.contains(s) {
+                    samples.push(s.clone());
+                }
+            };
+            for m in ac.find_iter(data).filter(|m| word_bounded(data, m.start(), m.end())) {
+                hits += 1;
                 note(m, &mut samples);
             }
-        }
-        count = count.max(joined_hits);
-        if !digits.is_empty() {
-            let text = String::from_utf8_lossy(&data);
-            for (a, b) in digit_runs(&text) {
-                let run = &text[a..b];
-                let d = digits_only(run);
-                let hit = |d: &str| digits.contains(d) || (d.len() == 11 && (d.starts_with('7') || d.starts_with('8')) && digits.contains(&d[1..]));
-                let found = if hit(&d) { Some(run.to_string()) } else { digit_groups(&text, a, b).into_iter().map(|(x, y)| &text[x..y]).find(|g| hit(g)).map(String::from) };
-                if let Some(sample) = found {
-                    count += 1;
-                    if samples.len() < 8 && !samples.contains(&sample) {
-                        samples.push(sample);
+            // Текст, разрезанный на фрагменты форматирования, в сыром XML не виден — ищем и в склеенном.
+            let mut joined_hits = 0;
+            let texts = if para.is_match(data) { paragraph_texts(data) } else { Vec::new() };
+            for text in texts {
+                for m in ac.find_iter(&text).filter(|m| word_bounded(text.as_bytes(), m.start(), m.end())) {
+                    joined_hits += 1;
+                    note(m, &mut samples);
+                }
+            }
+            hits = hits.max(joined_hits);
+            if !digits.is_empty() {
+                let text = String::from_utf8_lossy(data);
+                for (a, b) in digit_runs(&text).into_iter().filter(|(a, b)| b - a >= min_digits) {
+                    let run = &text[a..b];
+                    let d = digits_only(run);
+                    let hit = |d: &str| digits.contains(d) || (d.len() == 11 && (d.starts_with('7') || d.starts_with('8')) && digits.contains(&d[1..]));
+                    let found = if hit(&d) { Some(run.to_string()) } else { digit_groups(&text, a, b).into_iter().map(|(x, y)| &text[x..y]).find(|g| hit(g)).map(String::from) };
+                    if let Some(sample) = found {
+                        hits += 1;
+                        if samples.len() < 8 && !samples.contains(&sample) {
+                            samples.push(sample);
+                        }
                     }
                 }
             }
+            count += hits;
+        };
+        // Большой лист — кусками по границе строк </row>: значение не делится между строками листа.
+        const CHUNK: usize = 16 << 20;
+        let mut pending: Vec<u8> = Vec::new();
+        let mut block = vec![0u8; 1 << 20];
+        loop {
+            let n = f.read(&mut block)?;
+            pending.extend_from_slice(&block[..n]);
+            if n > 0 && pending.len() < CHUNK {
+                continue;
+            }
+            if n > 0 && utf16_bom(&pending).is_none() {
+                if let Some(p) = pending.windows(6).rposition(|w| w == b"</row>") {
+                    check(&pending[..p + 6]);
+                    pending.drain(..p + 6);
+                }
+                continue;
+            }
+            // Конец части (или UTF-16 — такие части маленькие): остаток целиком.
+            if n > 0 {
+                f.read_to_end(&mut pending)?;
+            }
+            if let Some(be) = utf16_bom(&pending) {
+                pending = decode_utf16(&pending[2..], be).map(String::into_bytes).unwrap_or(pending);
+            }
+            check(&pending);
+            break;
         }
         if count > 0 {
             leaks.push(Leak { part: name, count, samples });

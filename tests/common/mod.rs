@@ -36,6 +36,8 @@ pub struct Book {
     pub date1904: bool,
     /// Разметка в начале workbook.xml (до workbookPr): fileVersion, fileSharing, absPath.
     pub workbook_head: String,
+    /// Стили (xl/styles.xml целиком) — для форматов дат; пусто — без стилей.
+    pub styles: String,
 }
 
 impl Book {
@@ -107,7 +109,11 @@ pub fn write_xlsx(path: &Path, book: &Book) {
         wbr.push_str(&format!(r#"<Relationship Id="rId{k}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{k}.xml"/>"#));
     }
     wb.push_str(r#"</sheets><calcPr calcId="191029"/></workbook>"#);
-    wbr.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#, n + 1));
+    wbr.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>"#, n + 1));
+    if !book.styles.is_empty() {
+        wbr.push_str(&format!(r#"<Relationship Id="rId{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#, n + 2));
+    }
+    wbr.push_str("</Relationships>");
     let mut sx = format!(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{0}" uniqueCount="{0}">"#, sst.len());
     for t in &sst {
         sx.push_str(&format!(r#"<si><t xml:space="preserve">{}</t></si>"#, esc(t)));
@@ -131,6 +137,9 @@ pub fn write_xlsx(path: &Path, book: &Book) {
         put(&format!("xl/worksheets/sheet{}.xml", i + 1), x);
     }
     put("xl/sharedStrings.xml", &sx);
+    if !book.styles.is_empty() {
+        put("xl/styles.xml", &book.styles);
+    }
     for (name, data) in &book.extra {
         put(name, data);
     }
