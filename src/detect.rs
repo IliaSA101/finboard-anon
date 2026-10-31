@@ -131,6 +131,48 @@ fn subheader_row(grid: &Grid, row: u32, c1: u32, c2: u32) -> bool {
     (c1..=c2).any(|x| text_at(grid, row, x).is_some_and(|t| is_label(t) || kind_for_header(t).is_some()))
 }
 
+/// Подпись для правила «Шаблон» («Должность» → «Должность 1, 2…») и строка, с которой начинаются данные.
+/// Подпись — заголовок над диапазоном. Если над ним пусто, а первая ячейка похожа на заголовок
+/// (её захватили выделением), подписью становится она, а данные начинаются со следующей строки.
+pub fn template_label(grid: &Grid, col: u32, row_from: u32, row_to: Option<u32>) -> Option<(String, u32)> {
+    let clean = |t: &str| t.lines().next().unwrap_or("").trim().trim_end_matches(':').trim().to_string();
+    if row_from > 1 {
+        if let Some(above) = text_at(grid, row_from - 1, col) {
+            let l = clean(above);
+            return (!l.is_empty() && !is_total(&l)).then_some((l, row_from));
+        }
+        if grid.get(row_from - 1, col).is_some() {
+            return None;
+        }
+    }
+    let first = text_at(grid, row_from, col)?;
+    let last = row_to.unwrap_or(grid.max_row).min(grid.max_row);
+    let mut below = (row_from + 1..=last).filter_map(|r| grid.get(r, col)).map(|x| x.text.trim());
+    let l = clean(first);
+    let header = looks_like_header(grid, row_from, col, first)
+        && !l.is_empty()
+        && grid.get(row_from, col).is_some_and(|x| !x.formula)
+        && below.clone().next().is_some()
+        && !below.any(|t| t == first.trim());
+    header.then_some((l, row_from + 1))
+}
+
+/// Заполняет пустую подпись правила «Шаблон» по заголовку колонки. Возвращает сообщение для окна.
+pub fn fill_template(rule: &mut Rule, grid: &Grid) -> Option<String> {
+    if rule.kind != Kind::Text || !rule.label.trim().is_empty() {
+        return None;
+    }
+    let (label, from) = template_label(grid, rule.col, rule.row_from, rule.row_to)?;
+    let msg = if from > rule.row_from {
+        format!("«{label}» — заголовок: он не меняется и стал подписью, данные со строки {from}. Если это данные — поправьте «Строки с» и подпись")
+    } else {
+        format!("Подпись «{label}» взята из заголовка: значения станут «{label} 1», «{label} 2»…")
+    };
+    rule.label = label;
+    rule.row_from = from;
+    Some(msg)
+}
+
 /// Предлагает правила для листа. Для каждого заголовка с персональными данными берётся
 /// таблица под ним: строки, пока в колонках таблицы есть данные, до пустой строки,
 /// строки «Итого» или следующего заголовка. На одном листе может быть несколько таблиц.

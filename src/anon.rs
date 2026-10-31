@@ -15,7 +15,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use crate::fake::Faker;
-use crate::profile::{parse_kind_key, Kind, Profile, Rule, Settings};
+use crate::profile::{parse_kind_key, Kind, Outside, Profile, Rule, Settings};
 use crate::xlsx::{attr, open_zip, parse_range, pivot_caches, read_part, resolve_value, scan_cells, PivotCache, Workbook, Zip};
 use crate::keyfile;
 
@@ -117,7 +117,8 @@ impl Report {
         let mut l = vec![format!("Готово: {}", self.output.display())];
         for (i, r) in profile.rules.iter().enumerate() {
             let n = self.rule_cells.get(i).copied().unwrap_or(0);
-            l.push(format!("  {}!{} [{}]: заменено ячеек {}", r.sheet, r.range_text(), r.kind.title(), n));
+            let what = if r.kind == Kind::Keep { "оставлено как есть" } else { "заменено" };
+            l.push(format!("  {}!{} [{}]: {what} ячеек {}", r.sheet, r.range_text(), r.kind.title(), n));
         }
         l.push(format!(
             "Уникальных значений: {}; общих строк: {}; формул (текст/кэш/очищено кэшей): {}/{}/{}; прочих мест (сводные, диаграммы, примечания): {}",
@@ -149,10 +150,11 @@ pub struct GlobalMaps {
     strings: HashMap<String, String>,
     numbers: HashMap<String, String>,
     /// Поиск реальных значений внутри длинного текста («Ответственный: Иванов Иван Иванович»).
-    inner: Option<(AhoCorasick, Vec<String>)>,
+    /// Для каждого образца: замена и хвост (ID организации), который ставится после закрывающей кавычки.
+    inner: Option<(AhoCorasick, Vec<(String, String)>)>,
     /// Пары для поиска внутри текста помимо длинных значений: названия организаций («Ромашка»),
-    /// варианты ЗАГЛАВНЫМИ и строчными (банковские выписки).
-    extra_inner: Vec<(String, String)>,
+    /// варианты ЗАГЛАВНЫМИ и строчными (банковские выписки). Третье — хвост с ID.
+    extra_inner: Vec<(String, String, String)>,
     /// Цифры номеров (от 9) и телефонов (10 цифр номера): реальные → фейковые. Номер узнаётся в любом
     /// написании: «7707083893», «77 07 083893», «+7 (916) 123-45-67».
     digits: HashMap<String, String>,
@@ -236,6 +238,9 @@ fn inner_candidate(k: &str) -> bool {
     k.chars().count() >= 8 && (k.trim().contains(char::is_whitespace) || k.contains('@') || digits >= 7)
 }
 
+/// Закрывающие кавычки названия организации.
+const CLOSE_QUOTES: &str = "\"»”“'";
+
 impl GlobalMaps {
     /// Фейковые цифры для номера: ИНН/СНИЛС/паспорт/счёт по цифрам, телефон — по 10 цифрам номера.
     fn lookup_digits(&self, d: &str) -> Option<String> {
@@ -279,18 +284,21 @@ impl GlobalMaps {
 
     fn build_inner(&mut self) {
         self.inner_digits = true;
-        let mut pairs: Vec<(&String, &String)> = self.strings.iter().filter(|(k, v)| inner_candidate(k) && k != v).collect();
-        pairs.extend(self.extra_inner.iter().filter(|(k, v)| k != v).map(|(k, v)| (k, v)));
-        pairs.sort();
+        // Сначала названия организаций: у них ID ставится после кавычки, а не внутри неё.
+        let none = String::new();
+        let mut pairs: Vec<(&String, &String, &String)> =
+            self.extra_inner.iter().filter(|(k, v, _)| k != v).map(|(k, v, p)| (k, v, p)).collect();
+        pairs.extend(self.strings.iter().filter(|(k, v)| inner_candidate(k) && k != v).map(|(k, v)| (k, v, &none)));
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
         pairs.dedup_by(|a, b| a.0 == b.0);
         if pairs.is_empty() {
             return;
         }
         let ac = AhoCorasick::builder()
             .match_kind(MatchKind::LeftmostLongest)
-            .build(pairs.iter().map(|(k, _)| k.as_str()));
+            .build(pairs.iter().map(|(k, _, _)| k.as_str()));
         if let Ok(ac) = ac {
-            let outs = pairs.iter().map(|(_, v)| (*v).clone()).collect();
+            let outs = pairs.iter().map(|(_, v, p)| ((*v).clone(), (*p).clone())).collect();
             self.inner = Some((ac, outs));
         }
     }
@@ -324,9 +332,17 @@ impl GlobalMaps {
             if rest.starts_with('!') || rest.starts_with("'!") {
                 continue;
             }
+            let (fake, post) = &outs[m.pattern().as_usize()];
             out.push_str(&s[last..m.start()]);
-            out.push_str(&outs[m.pattern().as_usize()]);
+            out.push_str(fake);
             last = m.end();
+            if !post.is_empty() {
+                // «ООО «Ромашка»» → «ООО «Фирма» (ID 3)»: ID после закрывающих кавычек.
+                let quotes: usize = rest.chars().take_while(|c| CLOSE_QUOTES.contains(*c)).map(char::len_utf8).sum();
+                out.push_str(&rest[..quotes]);
+                out.push_str(post);
+                last += quotes;
+            }
         }
         if last == 0 {
             return None;
@@ -471,7 +487,7 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
             log(format!("Файл {} из {}: {}", fi + 1, batch.files.len(), file_name(&f.input)));
         }
         let (zip, wb) = &mut books[fi];
-        let (maps, scan_extra) = build_maps(&faker, &plans, &rules, wb.date1904, batch.settings.inner_text);
+        let (maps, scan_extra) = build_maps(&faker, &plans, &rules, wb.date1904, batch.settings.inner_search());
         let mut report = write_book(zip, wb, &f.rules, &faker, &maps, &batch.settings, &f.output, log)?;
         report.warnings.splice(0..0, plans[fi].warnings.iter().cloned());
         report.distinct_values = plans[fi].items.len();
@@ -488,7 +504,7 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
     // 5. Проверка: свои значения файла — все; значения других файлов и ключа — те, что ищутся и внутри текста.
     log("Проверка результата на остатки реальных значений…".into());
     let mut fakes: Vec<&str> = faker.entries.iter().map(|e| e.fake.as_str()).collect();
-    fakes.extend(faker.company_names().map(|(_, f)| f));
+    fakes.extend(faker.company_names().map(|(_, f, _)| f));
     // Номера по цифрам — в любом написании («77 07 083893»); фейковые цифры — не утечка.
     let fake_digits: HashSet<&str> = faker.digit_pairs().map(|(_, f)| f).chain(faker.phone_pairs().map(|(_, f)| f)).collect();
     let real_digits: HashSet<String> = faker
@@ -505,10 +521,17 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
         originals.extend(
             faker.entries.iter().map(|e| e.real.as_str()).filter(|r| !own[fi].contains(r) && inner_candidate(r)).map(String::from),
         );
-        originals.extend(faker.company_names().map(|(r, _)| r.to_string()));
+        originals.extend(faker.company_names().map(|(r, _, _)| r.to_string()));
         originals.sort();
         originals.dedup();
         reports[fi].leaks = scan_leaks_with(&f.output, &originals, &fakes, &real_digits)?;
+        let kept = batch.settings.outside != Outside::All || f.rules.iter().any(|r| r.kind == Kind::Keep);
+        if kept && !reports[fi].leaks.is_empty() {
+            reports[fi].warnings.push(
+                "Часть ячеек оставлена как есть по вашей настройке («Вне разметки» или «Не менять (защитить)») — проверка показывает и их. Убедитесь, что найденное — именно эти ячейки"
+                    .into(),
+            );
+        }
     }
     Ok(reports)
 }
@@ -551,18 +574,23 @@ fn build_maps(faker: &Faker, plans: &[FilePlan], rules: &[&[Rule]], date1904: bo
             }
         }
     }
-    for (real, fake) in faker.company_names() {
-        maps.strings.entry(real.to_string()).or_insert_with(|| fake.to_string());
-        maps.extra_inner.push((real.to_string(), fake.to_string()));
+    // Название организации в любом написании и внутри фразы — с тем же ID, что и в колонке.
+    for (real, fake, id) in faker.company_names() {
+        let (pre, post) = id.map(|id| faker.id_affixes(id)).unwrap_or_default();
+        maps.strings.entry(real.to_string()).or_insert_with(|| format!("{pre}{fake}{post}"));
+        maps.extra_inner.push((real.to_string(), format!("{pre}{fake}"), post));
     }
     // Тот же текст ЗАГЛАВНЫМИ или строчными («ООО "РОМАШКА"», «ИВАНОВ ИВАН ИВАНОВИЧ» в выписке банка).
-    let variants: Vec<(String, String)> = maps
-        .strings
+    // Варианты названий организаций — первыми: при совпадении ключей побеждает вариант с ID после кавычки.
+    let variants: Vec<(String, String, String)> = maps
+        .extra_inner
         .iter()
-        .filter(|(k, v)| inner_candidate(k) && k != v && k.chars().any(char::is_alphabetic))
-        .chain(maps.extra_inner.iter().map(|(k, v)| (k, v)))
-        .flat_map(|(k, v)| [(k.to_uppercase(), v.to_uppercase()), (k.to_lowercase(), v.to_lowercase())])
-        .filter(|(k, _)| !maps.strings.contains_key(k))
+        .map(|(k, v, p)| (k, v, p.as_str()))
+        .chain(
+            maps.strings.iter().filter(|(k, v)| inner_candidate(k) && k != v && k.chars().any(char::is_alphabetic)).map(|(k, v)| (k, v, "")),
+        )
+        .flat_map(|(k, v, p)| [(k.to_uppercase(), v.to_uppercase(), p.to_string()), (k.to_lowercase(), v.to_lowercase(), p.to_string())])
+        .filter(|(k, _, _)| !maps.strings.contains_key(k))
         .collect();
     maps.extra_inner.extend(variants);
     for (real, fake) in faker.digit_pairs() {
@@ -598,7 +626,9 @@ fn write_book(
 ) -> Result<Report> {
     let mut report = Report { output: output.to_path_buf(), ..Default::default() };
     let (sheet_rules, _) = rules_by_sheet(wb, rules);
-    let tainted = derived_formula_cells(zip, wb, rules)?;
+    // Защищённые области — не источник производных значений: их ячейки не меняются.
+    let active: Vec<Rule> = rules.iter().filter(|r| r.kind != Kind::Keep).cloned().collect();
+    let tainted = derived_formula_cells(zip, wb, &active)?;
     let no_taint = HashMap::new();
     // 3. Перезапись.
     log("Запись файла…".into());
@@ -628,11 +658,16 @@ fn write_book(
             } else {
                 let mut data = Vec::new();
                 zip.by_index(i)?.read_to_end(&mut data)?;
+                // OneDrive и SharePoint пишут customXml в UTF-16: обрабатываем как текст и сохраняем в той же кодировке.
+                let utf16 = utf16_bom(&data);
+                if let Some(be) = utf16 {
+                    data = decode_utf16(&data[2..], be).with_context(|| format!("{name}: неверный UTF-16"))?.into_bytes();
+                }
                 let res = if sheet_rels {
                     rewrite_hyperlink_rels(&data, maps, &mut stats)?
                 } else if let Some(&si) = sheet_by_path.get(name.as_str()) {
                     let srules = sheet_rules.get(&si).unwrap_or(&empty);
-                    rewrite_sheet(&data, &wb.sst, srules, tainted.get(&si).unwrap_or(&no_taint), faker, maps, &mut stats)
+                    rewrite_sheet(&data, &wb.sst, srules, tainted.get(&si).unwrap_or(&no_taint), settings.outside == Outside::Keep, faker, maps, &mut stats)
                         .with_context(|| format!("лист «{}»", wb.sheets[si].name))
                         .map_err(|e| e)?
                 } else if Some(name.as_str()) == wb.sst_path.as_deref() {
@@ -659,6 +694,9 @@ fn write_book(
                         &[(b"Company", ""), (b"Manager", "")]
                     } else if name.starts_with("xl/comments") {
                         &[(b"author", "Автор {n}")]
+                    } else if name.starts_with("customXml/") {
+                        // Кому открыт доступ в SharePoint: имена и номера пользователей.
+                        &[(b"DisplayName", "Автор {n}"), (b"AccountId", "0")]
                     } else {
                         &[]
                     };
@@ -677,7 +715,10 @@ fn write_book(
                         }
                     }
                 };
-                res
+                match (res, utf16) {
+                    (Some(r), Some(be)) => Some(encode_utf16(&String::from_utf8_lossy(&r), be)),
+                    (r, _) => r,
+                }
             };
             // Пути профиля пользователя в служебных частях: связи (гиперссылки, внешние книги), книга,
             // подключения, свойства файла (база гиперссылок). Тексты ячеек, примечаний и кэшей — данные,
@@ -787,7 +828,14 @@ fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule]) -> Result<FilePlan> {
                 return true;
             }
             if let Some((ri, r)) = srules.iter().find(|(_, r)| r.covers(row, col)) {
+                // Заголовок, ставший подписью «Шаблона», не заменяется.
+                if r.is_template_header(&v.text) {
+                    return true;
+                }
                 rule_cells[*ri] += 1;
+                if r.kind == Kind::Keep {
+                    return true;
+                }
                 let samples = &mut rule_samples[*ri];
                 if samples.len() < 3 && !samples.contains(&v.text) {
                     samples.push(v.text.clone());
@@ -1014,6 +1062,7 @@ fn rewrite_sheet(
     sst: &[String],
     rules: &[(usize, &Rule)],
     tainted: &HashMap<(u32, u32), u8>,
+    keep_outside: bool,
     faker: &Faker,
     maps: &GlobalMaps,
     stats: &mut Stats,
@@ -1032,7 +1081,7 @@ fn rewrite_sheet(
         if let Some((start, r, c)) = &cell {
             if let Event::End(e) = &ev {
                 if e.local_name().as_ref() == b"c" {
-                    let ch = process_cell(&mut w, start, *r, *c, &inner, sst, rules, tainted, faker, maps, stats)?;
+                    let ch = process_cell(&mut w, start, *r, *c, &inner, sst, rules, tainted, keep_outside, faker, maps, stats)?;
                     changed |= ch;
                     cell = None;
                     inner.clear();
@@ -1107,6 +1156,7 @@ fn process_cell(
     sst: &[String],
     rules: &[(usize, &Rule)],
     tainted: &HashMap<(u32, u32), u8>,
+    keep_outside: bool,
     faker: &Faker,
     maps: &GlobalMaps,
     stats: &mut Stats,
@@ -1138,6 +1188,25 @@ fn process_cell(
             }
             _ => {}
         }
+    }
+
+    // Защищённая область («Не менять») и, если вне разметки ничего не трогать, ячейки без правил.
+    let covering = rules.iter().find(|(_, r)| r.covers(row, col));
+    if covering.map_or(keep_outside, |(_, r)| r.kind == Kind::Keep) {
+        if let Some((ri, _)) = covering {
+            stats.rule_cells[*ri] += 1;
+        }
+        // Общая строка заменится во всей таблице строк — ячейке нужен свой исходный текст.
+        if !has_f && t == "s" {
+            if let Some((orig, _)) = resolve_value(&t, &v, &is_text, sst) {
+                if maps.cell_text(&orig).is_some() {
+                    write_value_cell(w, start, &orig, false)?;
+                    return Ok(true);
+                }
+            }
+        }
+        write_unchanged(w, start, inner)?;
+        return Ok(false);
     }
 
     // Ячейка в диапазоне правила. У формулы (ФИО из другой книги, ВПР) меняется кэш, формула остаётся.
@@ -1228,12 +1297,17 @@ fn process_cell(
         return write_formula_cell(w, start, inner, new_v, is_str, maps, stats);
     }
 
+    write_unchanged(w, start, inner)?;
+    Ok(false)
+}
+
+fn write_unchanged(w: &mut Writer<Vec<u8>>, start: &BytesStart<'static>, inner: &[Event<'static>]) -> Result<()> {
     w.write_event(Event::Start(start.clone()))?;
     for ev in inner {
         w.write_event(ev.clone())?;
     }
     w.write_event(Event::End(BytesEnd::new(name_of(start))))?;
-    Ok(false)
+    Ok(())
 }
 
 /// Ячейка с формулой: строковые литералы в тексте формулы заменяются всегда; кэш результата —
@@ -1579,6 +1653,44 @@ fn rewrite_workbook(xml: &[u8], recalc: bool, clean_meta: bool, maps: &GlobalMap
 
 /// Прочие части (сводные, диаграммы, примечания, рисунки, свойства файла):
 /// заменяются текстовые узлы и атрибуты `v`, целиком совпадающие с реальными значениями.
+/// Метка порядка байт UTF-16: Some(true) — big-endian, Some(false) — little-endian.
+fn utf16_bom(data: &[u8]) -> Option<bool> {
+    match data {
+        [0xFF, 0xFE, ..] => Some(false),
+        [0xFE, 0xFF, ..] => Some(true),
+        _ => None,
+    }
+}
+
+fn decode_utf16(data: &[u8], be: bool) -> Result<String> {
+    let units: Vec<u16> =
+        data.chunks_exact(2).map(|c| if be { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) }).collect();
+    Ok(String::from_utf16(&units)?)
+}
+
+/// Текст в UTF-16 с меткой порядка байт.
+fn encode_utf16(s: &str, be: bool) -> Vec<u8> {
+    let mut out = if be { vec![0xFE, 0xFF] } else { vec![0xFF, 0xFE] };
+    for u in s.encode_utf16() {
+        out.extend_from_slice(&if be { u.to_be_bytes() } else { u.to_le_bytes() });
+    }
+    out
+}
+
+/// Вхождение — отдельное слово: до и после него не буква и не цифра («Фирма1» внутри «Фирма13» — не утечка).
+fn word_bounded(data: &[u8], start: usize, end: usize) -> bool {
+    let alnum = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let Ok(m) = std::str::from_utf8(&data[start..end]) else { return true };
+    let prev = data[..start]
+        .iter()
+        .rposition(|b| b & 0xC0 != 0x80)
+        .and_then(|i| std::str::from_utf8(&data[i..start]).ok())
+        .and_then(|s| s.chars().next());
+    let rest = &data[end..];
+    let next = (1..=rest.len().min(4)).find_map(|k| std::str::from_utf8(&rest[..k]).ok()).and_then(|s| s.chars().next());
+    !(alnum(m.chars().next()) && alnum(prev)) && !(alnum(m.chars().next_back()) && alnum(next))
+}
+
 fn rewrite_generic(
     xml: &[u8],
     maps: &GlobalMaps,
@@ -2597,7 +2709,8 @@ pub fn scan_leaks_with(path: &Path, originals: &[String], fakes: &[&str], digits
     if pats.is_empty() && digits.is_empty() {
         return Ok(Vec::new());
     }
-    let ac = AhoCorasick::new(&pats)?;
+    // Самое длинное совпадение: «Фирма13» не должна спрятаться за «Фирма1», отброшенной по границе слова.
+    let ac = AhoCorasick::builder().match_kind(MatchKind::LeftmostLongest).build(&pats)?;
     let mut zip = open_zip(path)?;
     let mut leaks = Vec::new();
     for i in 0..zip.len() {
@@ -2608,6 +2721,9 @@ pub fn scan_leaks_with(path: &Path, originals: &[String], fakes: &[&str], digits
         }
         let mut data = Vec::new();
         f.read_to_end(&mut data)?;
+        if let Some(be) = utf16_bom(&data) {
+            data = decode_utf16(&data[2..], be).map(String::into_bytes).unwrap_or(data);
+        }
         let mut count = 0;
         let mut samples: Vec<String> = Vec::new();
         let note = |m: aho_corasick::Match, samples: &mut Vec<String>| {
@@ -2616,14 +2732,14 @@ pub fn scan_leaks_with(path: &Path, originals: &[String], fakes: &[&str], digits
                 samples.push(s.clone());
             }
         };
-        for m in ac.find_iter(&data) {
+        for m in ac.find_iter(&data).filter(|m| word_bounded(&data, m.start(), m.end())) {
             count += 1;
             note(m, &mut samples);
         }
         // Текст, разрезанный на фрагменты форматирования, в сыром XML не виден — ищем и в склеенном.
         let mut joined_hits = 0;
         for text in paragraph_texts(&data) {
-            for m in ac.find_iter(&text) {
+            for m in ac.find_iter(&text).filter(|m| word_bounded(text.as_bytes(), m.start(), m.end())) {
                 joined_hits += 1;
                 note(m, &mut samples);
             }

@@ -11,7 +11,7 @@ use finboard_anon::anon::{
     RulePreview,
 };
 use finboard_anon::detect;
-use finboard_anon::profile::{Kind, Profile, Rule, Settings};
+use finboard_anon::profile::{Kind, Outside, Profile, Rule, Settings};
 use finboard_anon::xlsx::{col_name, load_grid, parse_range, Grid, GridCell, Workbook};
 
 /// Сколько строк листа загружать для просмотра.
@@ -296,6 +296,13 @@ impl App {
         self.doc().and_then(|d| d.wb.sheets.get(idx)).map(|s| s.name.clone()).unwrap_or_default()
     }
 
+    /// Подпись шаблона из заголовка над диапазоном (или из шапки, попавшей в диапазон). Сообщение — для строки состояния.
+    fn fill_template(&mut self, rule: &mut Rule) -> Option<String> {
+        let idx = self.doc()?.wb.sheet_index(&rule.sheet)?;
+        self.ensure_grid(idx);
+        detect::fill_template(rule, self.docs.get(self.cur)?.grids.get(&idx)?)
+    }
+
     fn add_rules(&mut self, rules: Vec<Rule>, replace: bool) -> (usize, usize) {
         self.preview_dirty = true;
         match self.docs.get_mut(self.cur) {
@@ -512,25 +519,33 @@ impl App {
             ui.label("Файл не открыт");
             return;
         }
-        ui.heading(format!("Файлы ({})", self.docs.len()));
         let mut pick = None;
         let mut close = None;
-        egui::ScrollArea::vertical().id_salt("files").max_height(160.0).show(ui, |ui| {
-            for (i, d) in self.docs.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    if ui.small_button("✕").on_hover_text("Убрать файл из набора (сам файл не удаляется)").clicked() {
-                        close = Some(i);
-                    }
-                    let label = format!("{}  [{}]", file_name(&d.path), d.profile.rules.len());
-                    if ui.selectable_label(self.cur == i, label).on_hover_text(d.path.display().to_string()).clicked() {
-                        pick = Some(i);
+        // Высота списка файлов меняется перетаскиванием границы между «Файлами» и «Листами».
+        let max_files = (ui.available_height() - 160.0).max(80.0);
+        egui::TopBottomPanel::top("files_panel")
+            .resizable(true)
+            .default_height(180.0)
+            .height_range(70.0..=max_files)
+            .show_inside(ui, |ui| {
+                ui.heading(format!("Файлы ({})", self.docs.len()));
+                if self.docs.len() > 1 {
+                    ui.label(RichText::new("Один человек, организация, ИНН — один фейк во всех файлах набора").small().weak());
+                }
+                egui::ScrollArea::vertical().id_salt("files").auto_shrink([false, false]).show(ui, |ui| {
+                    for (i, d) in self.docs.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("✕").on_hover_text("Убрать файл из набора (сам файл не удаляется)").clicked() {
+                                close = Some(i);
+                            }
+                            let label = format!("{}  [{}]", file_name(&d.path), d.profile.rules.len());
+                            if ui.selectable_label(self.cur == i, label).on_hover_text(d.path.display().to_string()).clicked() {
+                                pick = Some(i);
+                            }
+                        });
                     }
                 });
-            }
-        });
-        if self.docs.len() > 1 {
-            ui.label(RichText::new("Один человек, организация, ИНН — один фейк во всех файлах набора").small().weak());
-        }
+            });
         if let Some(i) = close {
             self.close_doc(i);
             return;
@@ -538,7 +553,6 @@ impl App {
         if let Some(i) = pick {
             self.select_doc(i);
         }
-        ui.separator();
         ui.heading("Листы");
         let doc = &self.docs[self.cur];
         let names: Vec<String> = doc.wb.sheets.iter().map(|s| s.name.clone()).collect();
@@ -594,16 +608,20 @@ impl App {
                 match parse_range(&self.range_text) {
                     Some((c1, c2, r1, r2)) => {
                         let to = if self.new_to_end { None } else { r2 };
-                        let rules = (c1..=c2).map(|c| Rule::new(&sheet, c, r1, to, self.new_kind)).collect();
+                        let mut rules: Vec<Rule> = (c1..=c2).map(|c| Rule::new(&sheet, c, r1, to, self.new_kind)).collect();
+                        let notes: Vec<String> = rules.iter_mut().filter_map(|r| self.fill_template(r)).collect();
                         let (added, replaced) = self.add_rules(rules, true);
-                        self.set_status(
-                            match (added, replaced) {
-                                (a, 0) => format!("Добавлено правил: {a}"),
-                                (0, r) => format!("Правило заменено новым диапазоном (было пересекающихся: {r})"),
-                                (a, r) => format!("Добавлено правил: {a}, заменено: {r}"),
-                            },
-                            false,
-                        );
+                        let mut msg = match (added, replaced) {
+                            (a, 0) => format!("Добавлено правил: {a}"),
+                            (0, r) => format!("Правило заменено новым диапазоном (было пересекающихся: {r})"),
+                            (a, r) => format!("Добавлено правил: {a}, заменено: {r}"),
+                        };
+                        if let Some(n) = notes.first() {
+                            msg = format!("{msg}. {n}");
+                        } else if self.new_kind == Kind::Text {
+                            msg = format!("{msg}. Над диапазоном нет заголовка — впишите подпись в правиле справа (например «Налог»), иначе будет «Значение 1, 2…»");
+                        }
+                        self.set_status(msg, false);
                     }
                     None => self.set_status("Не понял диапазон. Пример: C5:C120 или C5:C", true),
                 }
@@ -839,6 +857,8 @@ impl App {
         let no_preview = Vec::new();
         let preview = self.preview.get(self.cur).unwrap_or(&no_preview);
         let mut take = None;
+        // Правило, которому нужно подобрать подпись шаблона (сменили тип или диапазон).
+        let mut refill = None;
         let doc = &mut self.docs[self.cur];
         egui::ScrollArea::vertical().id_salt(("rules", self.cur)).auto_shrink([false, false]).show(ui, |ui| {
             if doc.profile.rules.is_empty() {
@@ -896,6 +916,7 @@ impl App {
                                 if ui.selectable_value(&mut r.kind, k, k.title()).on_hover_text(k.hint()).changed() {
                                     r.with_id = k.default_with_id();
                                     changed = true;
+                                    refill = Some(i);
                                 }
                             }
                         });
@@ -904,7 +925,10 @@ impl App {
                         }
                         if r.kind == Kind::Text {
                             ui.label("подпись:");
-                            changed |= ui.add(egui::TextEdit::singleline(&mut r.label).desired_width(110.0).hint_text("Клиент")).changed();
+                            changed |= ui
+                                .add(egui::TextEdit::singleline(&mut r.label).desired_width(110.0).hint_text("из заголовка"))
+                                .on_hover_text("Значения станут «подпись 1», «подпись 2»… — например «Налог 1», «Должность 2». У каждой подписи своя нумерация. Пусто — «Значение»")
+                                .changed();
                         }
                     });
                     if let Some(p) = preview.get(i) {
@@ -926,7 +950,12 @@ impl App {
             r.col = c;
             r.row_from = a;
             r.row_to = if self.new_to_end { None } else { Some(b) };
+            // Новый диапазон — может быть, другая колонка: подпись берётся из её заголовка.
+            if r.kind == Kind::Text {
+                r.label.clear();
+            }
             changed = true;
+            refill = Some(i);
         }
         if let Some(i) = goto {
             let r = doc.profile.rules[i].clone();
@@ -938,6 +967,13 @@ impl App {
                 self.drag_anchor = Some((r.col, r.row_from));
                 self.scroll_to = Some((r.row_from, r.col));
                 self.range_text = r.range_text().replace('…', "");
+            }
+        }
+        if let Some(i) = refill {
+            let mut r = self.docs[self.cur].profile.rules[i].clone();
+            if let Some(n) = self.fill_template(&mut r) {
+                self.docs[self.cur].profile.rules[i] = r;
+                self.set_status(n, false);
             }
         }
         if changed {
@@ -959,10 +995,19 @@ impl App {
             changed |= ui.add(egui::TextEdit::singleline(&mut s.email_domain).desired_width(120.0)).changed();
             ui.checkbox(&mut s.clean_metadata, "Убрать автора, компанию, имена пользователей и пути их папок из служебных полей файла");
             ui.checkbox(&mut s.recalc_on_open, "Пересчёт формул при открытии в Excel");
-            changed |= ui
-                .checkbox(&mut s.inner_text, "Искать ФИО, организации, email, телефоны и внутри текста и формул")
-                .on_hover_text("Например «Ответственный: Иванов Иван Иванович», «Оплата ООО \"Ромашка\"» или =СУММЕСЛИ(…;\"Иванов И.И.\";…)")
-                .changed();
+            // Профиль прежних версий: снятая галочка «искать внутри текста» = «только целые ячейки».
+            if !s.inner_text && s.outside == Outside::All {
+                s.outside = Outside::Cells;
+            }
+            ui.label("Вне разметки:");
+            egui::ComboBox::from_id_salt("outside").selected_text(s.outside.title()).width(170.0).show_ui(ui, |ui| {
+                for o in Outside::ALL {
+                    changed |= ui.selectable_value(&mut s.outside, o, o.title()).on_hover_text(o.hint()).changed();
+                }
+            })
+            .response
+            .on_hover_text("Что делать с теми же значениями (ФИО, организации, ИНН, телефоны) в ячейках без правил — на других листах и в других файлах.\nОтдельные области можно защитить правилом «Не менять (защитить)»");
+            s.inner_text = s.outside == Outside::All;
         });
         if changed {
             self.preview_dirty = true;

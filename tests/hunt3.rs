@@ -484,7 +484,8 @@ fn g04b_company_uppercase_unruled_other_file() {
     let b2 = text(&read_book(&ob), "Выписка", "B2");
     eprintln!("B2: {b2}; leaks: {:?}", reps[1].leaks);
     assert!(!b2.contains("РОМАШКА"), "реальное название осталось: {b2}");
-    assert!(b2.starts_with("Оплата по счету 15, ООО \"") && b2.ends_with("\", без НДС"), "{b2}");
+    // Организация внутри фразы — всегда с ID, тем же, что в колонке; ID после закрывающей кавычки.
+    assert!(b2.starts_with("Оплата по счету 15, ООО \"") && b2.ends_with("\" (ID 1), без НДС"), "{b2}");
     assert!(reps[1].leaks.is_empty(), "{:?}", reps[1].leaks);
 }
 

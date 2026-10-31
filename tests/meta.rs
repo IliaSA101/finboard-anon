@@ -133,3 +133,62 @@ fn m04_setting_off_keeps_service_fields() {
     assert!(p["xl/workbook.xml"].contains("Петров Пётр") && p["xl/workbook.xml"].contains(r"D:\Клиенты\Ромашка\"), "{}", p["xl/workbook.xml"]);
     assert!(p["xl/connections.xml"].contains("petrov.p"), "{}", p["xl/connections.xml"]);
 }
+
+/// Копия книги с дополнительной частью из готовых байтов (UTF-16 не помещается в `Book::extra`).
+fn with_part(input: &Path, output: &Path, name: &str, bytes: &[u8]) {
+    let mut z = zip::ZipArchive::new(std::fs::File::open(input).unwrap()).unwrap();
+    let mut w = zip::ZipWriter::new(std::fs::File::create(output).unwrap());
+    for i in 0..z.len() {
+        w.raw_copy_file(z.by_index_raw(i).unwrap()).unwrap();
+    }
+    w.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+    std::io::Write::write_all(&mut w, bytes).unwrap();
+    w.finish().unwrap();
+}
+
+fn utf16le(s: &str) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xFE];
+    s.encode_utf16().for_each(|u| out.extend_from_slice(&u.to_le_bytes()));
+    out
+}
+
+fn read_utf16le(path: &Path, name: &str) -> String {
+    let mut z = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+    let mut b = Vec::new();
+    z.by_name(name).unwrap().read_to_end(&mut b).unwrap();
+    assert_eq!(&b[..2], &[0xFF, 0xFE], "метка UTF-16LE потеряна");
+    let units: Vec<u16> = b[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    String::from_utf16(&units).unwrap()
+}
+
+/// Свойства SharePoint/OneDrive (customXml в UTF-16): раньше копировались как есть с предупреждением
+/// «Malformed UTF-8». Теперь обрабатываются: имена тех, кому открыт доступ, и значения из правил
+/// заменяются, кодировка UTF-16 сохраняется.
+#[test]
+fn m05_sharepoint_custom_xml_utf16() {
+    let d = tmp("m05");
+    let (plain, input) = (d.join("plain.xlsx"), d.join("in.xlsx"));
+    write_xlsx(&plain, &people_book());
+    let xml = r#"<?xml version="1.0" encoding="utf-16"?><p:properties xmlns:p="http://schemas.microsoft.com/office/2006/metadata/properties"><documentManagement><SharedWithUsers xmlns="ns"><UserInfo><DisplayName>Петров Пётр</DisplayName><AccountId>17</AccountId><AccountType/></UserInfo></SharedWithUsers><Note xmlns="ns">Ответственный Иванов Иван Иванович</Note></documentManagement></p:properties>"#;
+    with_part(&plain, &input, "customXml/item1.xml", &utf16le(xml));
+    // Проверка утечек читает части в UTF-16.
+    let leaks = finboard_anon::anon::scan_leaks(&input, &["Петров Пётр".to_string()], &[]).unwrap();
+    assert!(leaks.iter().any(|l| l.part == "customXml/item1.xml"), "{leaks:?}");
+
+    let output = d.join("out.xlsx");
+    let job = Job { input: input.clone(), output: output.clone(), key_in: None, key_out: None, profile: prof(true) };
+    let rep = run(&job, &mut |_| {}).unwrap();
+    assert!(!rep.warnings.iter().any(|w| w.contains("customXml")), "{:?}", rep.warnings);
+    let out = read_utf16le(&output, "customXml/item1.xml");
+    for real in ["Петров", "Иванов Иван", ">17<"] {
+        assert!(!out.contains(real), "«{real}» осталось: {out}");
+    }
+    assert!(out.starts_with("<?xml") && out.contains("<DisplayName>Автор 1</DisplayName>"), "{out}");
+    assert!(rep.leaks.is_empty(), "{:?}", rep.leaks);
+
+    // Без очистки служебных полей имя остаётся, но значения из правил всё равно заменяются.
+    let output = d.join("keep.xlsx");
+    go(&input, &output, &prof(false));
+    let out = read_utf16le(&output, "customXml/item1.xml");
+    assert!(out.contains("Петров Пётр") && !out.contains("Иванов Иван"), "{out}");
+}

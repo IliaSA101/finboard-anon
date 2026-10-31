@@ -165,7 +165,8 @@ fn check_links(o: &Out) {
     let d2 = b("D2");
     assert!(!d2.contains("Ромашка") && d2.contains(&core(&romashka)), "{d2}");
     // Название без формы и кавычек внутри текста — такого написания нет ни в одной размеченной ячейке.
-    assert_eq!(b("D4"), format!("Сверка с {} за март", core(&romashka)));
+    // Организация внутри фразы — всегда с ID, тем же, что в колонке.
+    assert_eq!(b("D4"), format!("Сверка с {} (ID {}) за март", core(&romashka), id_of(&romashka).unwrap()));
 
     // Люди: «Иванов И.И.» — сокращение фейка полного ФИО из другого файла.
     let ivanov = strip_id_suffix(&a("A2")).to_string();

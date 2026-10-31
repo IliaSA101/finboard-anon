@@ -26,10 +26,11 @@ pub enum Kind {
     Mask,
     Text,
     Clear,
+    Keep,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 16] = [
+    pub const ALL: [Kind; 17] = [
         Kind::FullName,
         Kind::LastName,
         Kind::FirstName,
@@ -46,6 +47,7 @@ impl Kind {
         Kind::Mask,
         Kind::Text,
         Kind::Clear,
+        Kind::Keep,
     ];
 
     pub fn title(self) -> &'static str {
@@ -64,8 +66,9 @@ impl Kind {
             Kind::Company => "Организация",
             Kind::Account => "Номер (счёт/карта/договор)",
             Kind::Mask => "Маска (сохранить формат)",
-            Kind::Text => "Текст + ID",
+            Kind::Text => "Шаблон: подпись + номер",
             Kind::Clear => "Очистить",
+            Kind::Keep => "Не менять (защитить)",
         }
     }
 
@@ -85,20 +88,21 @@ impl Kind {
             Kind::Company => "ООО «Вектор» (ID 12) — организационная форма сохраняется",
             Kind::Account => "Цифры заменяются на ID с ведущими нулями, формат сохраняется",
             Kind::Mask => "Случайные цифры/буквы в том же формате, без ID",
-            Kind::Text => "<Подпись> <ID>, например «Клиент 12»",
+            Kind::Text => "Каждое разное значение → «подпись номер»: «Должность 1», «Налог 2». Подпись берётся из заголовка колонки, её можно изменить",
             Kind::Clear => "Пустое значение",
+            Kind::Keep => "Ячейки остаются как есть, даже если такие же значения заменяются в других местах",
         }
     }
 
     /// Можно ли включать/выключать ID для этого типа.
     pub fn id_optional(self) -> bool {
-        !matches!(self, Kind::BirthDate | Kind::Mask | Kind::Text | Kind::Clear)
+        !matches!(self, Kind::BirthDate | Kind::Mask | Kind::Text | Kind::Clear | Kind::Keep)
     }
 
     pub fn default_with_id(self) -> bool {
         !matches!(
             self,
-            Kind::LastName | Kind::FirstName | Kind::MiddleName | Kind::BirthDate | Kind::Mask | Kind::Clear
+            Kind::LastName | Kind::FirstName | Kind::MiddleName | Kind::BirthDate | Kind::Mask | Kind::Clear | Kind::Keep
         )
     }
 
@@ -115,13 +119,21 @@ impl Kind {
             Kind::Company => "company",
             Kind::Account => "account",
             Kind::Text => return Some(format!("text:{label}")),
-            Kind::BirthDate | Kind::Mask | Kind::Clear => return None,
+            Kind::BirthDate | Kind::Mask | Kind::Clear | Kind::Keep => return None,
         };
         Some(ns.to_string())
     }
 
+    /// Имя типа в файле-ключе. Не меняется вместе с названием в окне — иначе старые ключи не прочитаются.
+    pub fn key_name(self) -> &'static str {
+        match self {
+            Kind::Text => "Текст + ID",
+            k => k.title(),
+        }
+    }
+
     pub fn from_title(s: &str) -> Option<Kind> {
-        Kind::ALL.into_iter().find(|k| k.title() == s)
+        Kind::ALL.into_iter().find(|k| k.title() == s || k.key_name() == s)
     }
 }
 
@@ -137,7 +149,7 @@ pub struct Rule {
     pub kind: Kind,
     #[serde(default)]
     pub with_id: bool,
-    /// Подпись для типа «Текст + ID».
+    /// Подпись для типа «Шаблон».
     #[serde(default)]
     pub label: String,
 }
@@ -175,6 +187,11 @@ impl Rule {
         }
     }
 
+    /// Ячейка с подписью «Шаблона» — это заголовок колонки, попавший в диапазон, а не значение.
+    pub fn is_template_header(&self, text: &str) -> bool {
+        self.kind == Kind::Text && !self.label.trim().is_empty() && text.trim().to_lowercase() == self.label.trim().to_lowercase()
+    }
+
     pub fn with_id_effective(&self) -> bool {
         match self.kind {
             Kind::Text => true,
@@ -186,7 +203,7 @@ impl Rule {
     /// Ключ типа замены: одно и то же значение под одним ключом всегда даёт один фейк.
     /// Пишется в колонку «Тип» файла-ключа.
     pub fn kind_key(&self) -> String {
-        let mut s = self.kind.title().to_string();
+        let mut s = self.kind.key_name().to_string();
         if self.kind.id_optional() && self.with_id {
             s.push_str("+ID");
         }
@@ -226,8 +243,51 @@ pub struct Settings {
     /// Попросить Excel пересчитать формулы при открытии.
     pub recalc_on_open: bool,
     /// Заменять ФИО/email/телефоны и внутри длинного текста и строк в формулах.
+    /// Прежняя галочка; теперь — часть `outside` (выключенная = «только целые ячейки»).
     #[serde(default = "yes")]
     pub inner_text: bool,
+    /// Что делать со значениями вне разметки.
+    #[serde(default)]
+    pub outside: Outside,
+}
+
+/// Значения, размеченные где-то правилом, в ячейках вне разметки.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum Outside {
+    /// Заменять везде: целые ячейки и внутри текста и формул.
+    #[default]
+    All,
+    /// Только ячейки, где значение стоит целиком.
+    Cells,
+    /// Ячейки вне разметки не трогать.
+    Keep,
+}
+
+impl Outside {
+    pub const ALL: [Outside; 3] = [Outside::All, Outside::Cells, Outside::Keep];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Outside::All => "заменять везде",
+            Outside::Cells => "только целые ячейки",
+            Outside::Keep => "не трогать",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Outside::All => "Те же ФИО, организации, ИНН, телефоны заменяются во всех ячейках, внутри текста («Оплата ООО «Ромашка»»), формулах и примечаниях",
+            Outside::Cells => "Заменяются только ячейки, где значение стоит целиком; внутри текста и формул — нет",
+            Outside::Keep => "Ячейки без правил остаются как есть, их формулы тоже — результат формулы вроде СЧЁТЕСЛИ по ФИО может измениться. Сводные, диаграммы и примечания с теми же значениями всё равно заменяются — иначе в них останутся реальные данные",
+        }
+    }
+}
+
+impl Settings {
+    /// Искать значения внутри текста, формул, примечаний.
+    pub fn inner_search(&self) -> bool {
+        self.inner_text && self.outside == Outside::All
+    }
 }
 
 fn yes() -> bool {
@@ -243,6 +303,7 @@ impl Default for Settings {
             clean_metadata: true,
             recalc_on_open: true,
             inner_text: true,
+            outside: Outside::All,
         }
     }
 }

@@ -255,12 +255,32 @@ fn leak_scan_ignores_real_value_inside_fake() {
     let path = d.join("fake.xlsx");
     let mut b = Book::default();
     b.sheet("Л").push((1, 0, s("Иванова Мария (ID 2)")));
+    b.sheet("Л").push((2, 0, s("Звонил Иван")));
     write_xlsx(&path, &b);
     let leaks = finboard_anon::anon::scan_leaks(&path, &["Иван".to_string()], &["Иванова Мария (ID 2)"]).unwrap();
     assert!(leaks.is_empty(), "{leaks:?}");
     // А без такого фейка то же значение — настоящая находка.
     let leaks = finboard_anon::anon::scan_leaks(&path, &["Иван".to_string()], &["Петров Олег (ID 1)"]).unwrap();
     assert_eq!(leaks.len(), 1);
+}
+
+/// Проверка ищет значение отдельным словом: «Фирма1» внутри «Фирма13» — не утечка (ложная тревога у клиента),
+/// а сама «Фирма13» рядом с отброшенной «Фирма1» — утечка.
+#[test]
+fn leak_scan_matches_whole_words() {
+    let d = tmp("leak-words");
+    let path = d.join("fake.xlsx");
+    let mut b = Book::default();
+    b.sheet("Л").push((1, 0, s("Оплата Фирма13 по счёту, ТоргФирма1")));
+    write_xlsx(&path, &b);
+    let scan = |orig: &[&str]| {
+        let orig: Vec<String> = orig.iter().map(|s| s.to_string()).collect();
+        finboard_anon::anon::scan_leaks(&path, &orig, &["Петров Олег (ID 1)"]).unwrap()
+    };
+    assert!(scan(&["Фирма1"]).is_empty(), "{:?}", scan(&["Фирма1"]));
+    let leaks = scan(&["Фирма1", "Фирма13"]);
+    assert_eq!(leaks.len(), 1, "{leaks:?}");
+    assert_eq!(leaks[0].samples, vec!["Фирма13".to_string()], "{leaks:?}");
 }
 
 // ---------------------------------------------------------------- состояние: правила

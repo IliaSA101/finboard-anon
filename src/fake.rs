@@ -557,7 +557,8 @@ pub struct Faker {
     /// Название организации (ключ) → фейковое название: «ООО «Ромашка»» и «Ромашка» — одна организация.
     company: HashMap<String, String>,
     /// Название как написано в данных → фейковое: для замены внутри текста («Оплата ООО "Ромашка"»).
-    company_text: HashMap<String, String>,
+    /// Название организации как в данных → фейковое название (без формы) и ID, если правило с ID.
+    company_text: HashMap<String, (String, Option<u32>)>,
     /// Цифры ИНН, СНИЛС, паспорта, счёта (от 9 цифр) → фейковые цифры: один номер в любом виде
     /// («7707083893», «77 07 083893», «ИНН: 7707083893») и под любым из этих типов — один фейк.
     digits: HashMap<String, String>,
@@ -621,9 +622,18 @@ impl Faker {
         }
     }
 
-    /// Организации: название как в данных → фейковое название (без формы и ID).
-    pub fn company_names(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.company_text.iter().map(|(a, b)| (a.as_str(), b.as_str()))
+    /// Организации: название как в данных → фейковое название (без формы) и ID.
+    pub fn company_names(&self) -> impl Iterator<Item = (&str, &str, Option<u32>)> {
+        self.company_text.iter().map(|(a, (b, id))| (a.as_str(), b.as_str(), *id))
+    }
+
+    /// Что ставится до и после фейка при добавлении ID: для «{fake} (ID {id})» — ("", " (ID 3)").
+    pub fn id_affixes(&self, id: u32) -> (String, String) {
+        let fmt = self.s.id_format.replace("{id}", &id.to_string());
+        match fmt.split_once("{fake}") {
+            Some((pre, post)) => (pre.to_string(), post.to_string()),
+            None => (String::new(), String::new()),
+        }
     }
 
     /// Готовый фейк, если значение уже обработано.
@@ -688,6 +698,8 @@ impl Faker {
                 format!("{label} {id}")
             }
             Kind::Clear => String::new(),
+            // Защищённые области в замены не попадают (collect их пропускает).
+            Kind::Keep => original.to_string(),
         };
         self.entries.push(KeyEntry { kind_key: key.0.clone(), id: self.last_id, real: original.to_string(), fake: out.clone() });
         self.cache.insert(key, self.entries.len() - 1);
@@ -708,6 +720,14 @@ impl Faker {
         };
         self.last_id = Some(id);
         id
+    }
+
+    /// Номер, который получит (или уже получило) значение, — без побочных эффектов `id_for`.
+    fn peek_id(&self, ns: &str, norm: &str) -> u32 {
+        match self.ids.get(ns).and_then(|m| m.get(norm)) {
+            Some(&id) => id,
+            None => self.next_id.get(ns).copied().unwrap_or(1),
+        }
     }
 
     fn with_id(&self, fake: &str, id: u32) -> String {
@@ -1216,7 +1236,8 @@ impl Faker {
             let p = self.fake_person(&name, false);
             if name.chars().count() >= 4 {
                 // То же ФИО без «ИП» в другой колонке или в тексте («Ответственный: Козлов О.П.»).
-                self.company_text.entry(name.trim().to_string()).or_insert_with(|| p.clone());
+                // Без ID: номер ИП — из нумерации организаций, у людей своя.
+                self.company_text.entry(name.trim().to_string()).or_insert_with(|| (p.clone(), None));
             }
             format!("{pre}{p}")
         } else {
@@ -1230,7 +1251,9 @@ impl Faker {
             };
             let fake = apply_case(&name, &fake);
             if name.chars().count() >= 3 {
-                self.company_text.entry(name.trim().to_string()).or_insert_with(|| fake.clone());
+                // Название в любом написании и внутри текста получает тот же ID, что и в колонке.
+                let id = with_id.then(|| self.peek_id("company", &key));
+                self.company_text.entry(name.trim().to_string()).or_insert_with(|| (fake.clone(), id));
             }
             format!("{pre}{fake}{post}")
         };
@@ -1358,7 +1381,7 @@ impl Faker {
                         if is_ip(&rp, &rpost) {
                             self.register_person(&rn, &fname);
                             if rn.chars().count() >= 4 {
-                                self.company_text.entry(rn.trim().to_string()).or_insert_with(|| fname.clone());
+                                self.company_text.entry(rn.trim().to_string()).or_insert_with(|| (fname.clone(), None));
                             }
                             if e.id.is_none() {
                                 self.used_person.insert(fname.clone(), norm_text(&rn));
@@ -1369,7 +1392,7 @@ impl Faker {
                             let base = if fname.chars().any(char::is_lowercase) { fname.clone() } else { title_case(&fname) };
                             self.company.entry(norm_text(&rn)).or_insert(base);
                             if rn.chars().count() >= 3 {
-                                self.company_text.entry(rn.trim().to_string()).or_insert(fname);
+                                self.company_text.entry(rn.trim().to_string()).or_insert((fname, e.id));
                             }
                         }
                     }

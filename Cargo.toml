@@ -1,6 +1,6 @@
 [package]
 name = "finboard-anon"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Обезличивание персональных данных в Excel (xlsx) с сохранением дашбордов"
 license = "GPL-3.0-only"
