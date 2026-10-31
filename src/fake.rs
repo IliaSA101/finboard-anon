@@ -1647,7 +1647,7 @@ mod tests {
         for w in [true, false] {
             let mut r = rule(Kind::Account);
             r.with_id = w;
-            let reals = ["Дог1", "Дог2", "Дог3", "Счет1", "Налог10", "Налог1", "1", "А-12/3"];
+            let reals = ["Дог1", "Дог2", "Дог3", "Счет1", "Налог10", "Налог1", "1", "А-12/3", "Код1234"];
             let fakes: Vec<String> = reals.iter().map(|x| f.fake(&r, x, false)).collect();
             for (x, y) in reals.iter().zip(&fakes) {
                 assert!(!reals.contains(&y.as_str()), "{x} → {y}: фейк совпал с настоящим кодом");
@@ -1659,7 +1659,7 @@ mod tests {
         }
         let mut r = rule(Kind::Account);
         r.with_id = true;
-        assert_eq!(f.fake(&r, "Счет 5", false), "Счет 900009", "ID по всему коду, следующий после восьми");
+        assert_eq!(f.fake(&r, "Счет 5", false), "Счет 900010", "ID по всему коду, следующий после девяти");
     }
 
     #[test]

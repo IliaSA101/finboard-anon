@@ -550,8 +550,7 @@ pub fn parse_ref_bytes(b: &[u8]) -> Option<(u32, u32)> {
     if letters == 0 || letters > 3 {
         return None;
     }
-    let rest = b[i..].strip_prefix(b"$").unwrap_or(&b[i..]);
-    Some((col - 1, parse_u32(rest)?))
+    Some((col - 1, parse_u32(&b[i..])?))
 }
 
 /// Обходит непустые ячейки листа. Колбэк возвращает false, чтобы остановиться.
@@ -803,6 +802,8 @@ mod tests {
         assert_eq!(g.column_start(None), 4);
         assert_eq!(g.column_start(Some(1)), 4, "двойной щелчок по названию или шапке — от строки под шапкой");
         assert_eq!(g.column_start(Some(5)), 5, "по ячейке данных — от неё");
+        let title = grid(&[&["Отчёт за март", "", ""], &["1", "2", "3"]]);
+        assert_eq!(title.header_row(), None, "одиночное название над числами — не шапка");
         let flat = grid(&[&["1", "2"], &["3", "4"]]);
         assert_eq!((flat.header_row(), flat.column_start(None)), (None, 1), "без шапки — с первой строки");
     }
@@ -822,6 +823,7 @@ mod tests {
     #[test]
     fn date_formats() {
         assert_eq!(date_format(14, None), Some(false));
+        assert_eq!(date_format(17, None), Some(false), "ммм.гг");
         assert_eq!(date_format(22, None), Some(true));
         assert_eq!(date_format(0, None), None);
         assert_eq!(date_format(4, None), None);
