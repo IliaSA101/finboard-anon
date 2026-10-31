@@ -1,0 +1,13 @@
+/target
+# Ключи соответствия содержат реальные персональные данные: общий ключ папки и старые ключи файлов
+*КЛЮЧ*НЕ_ПЕРЕДАВАТЬ*.csv
+*.csv.tmp
+~$*.xlsx
+# Сборки для передачи — в выпуски GitHub, не в git
+/dist/*.zip
+/dist/finboard-anon/*.exe
+/dist/finboard-anon/LICENSE.txt
+/dist/finboard-anon/THIRD_PARTY_NOTICES.txt
+/dist/SHA256SUMS.txt
+/.claude/
+CLAUDE.md

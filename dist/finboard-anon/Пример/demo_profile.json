@@ -1,0 +1,14 @@
+{
+  "rules": [
+    {"sheet": "Данные", "col": 1, "row_from": 5, "row_to": 24, "kind": "FullName", "with_id": true},
+    {"sheet": "Данные", "col": 2, "row_from": 5, "row_to": 24, "kind": "Phone", "with_id": true},
+    {"sheet": "Данные", "col": 3, "row_from": 5, "row_to": 24, "kind": "Email", "with_id": true},
+    {"sheet": "Данные", "col": 4, "row_from": 5, "row_to": 24, "kind": "Inn", "with_id": true},
+    {"sheet": "Данные", "col": 5, "row_from": 5, "row_to": 24, "kind": "BirthDate", "with_id": false},
+    {"sheet": "Данные", "col": 6, "row_from": 5, "row_to": 24, "kind": "FullName", "with_id": true},
+    {"sheet": "Менеджеры", "col": 0, "row_from": 2, "row_to": null, "kind": "FullName", "with_id": true},
+    {"sheet": "Менеджеры", "col": 1, "row_from": 2, "row_to": null, "kind": "Phone", "with_id": true},
+    {"sheet": "Менеджеры", "col": 2, "row_from": 2, "row_to": null, "kind": "Email", "with_id": true}
+  ],
+  "settings": {"id_format": "{fake} (ID {id})", "email_domain": "example.com", "clean_metadata": true, "recalc_on_open": true}
+}
