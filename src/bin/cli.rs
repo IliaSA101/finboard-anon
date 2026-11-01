@@ -3,6 +3,9 @@
 //! finboard-anon-cli --profile profile.json --in data.xlsx --out data_anon.xlsx
 //!                   [--key ключ.csv] [--load-key старый_ключ.csv] [--no-key]
 //!
+//! --no-key — без ключа совсем: найденный ключ не загружается и не трогается, новый не пишется
+//! (как «Не использовать» в окне, но и без записи нового ключа).
+//!
 //! Несколько файлов одного заказчика — одним пакетом, с общими фейками и одним ключом:
 //! finboard-anon-cli --profile a.json --in a.xlsx --out a_anon.xlsx --profile b.json --in b.xlsx --out b_anon.xlsx
 
@@ -18,6 +21,8 @@ fn usage() -> ExitCode {
          [--key ключ.csv] [--load-key старый_ключ.csv] [--no-key]
   несколько файлов: повторить --in/--out (и --profile перед файлом, если у него свой профиль)
   ключ по умолчанию — общий для папки первого файла; если он уже есть, он дополняется
+  --no-key — без ключа: найденный ключ не загружается и не меняется, новый не записывается
+             (фейки и ID — заново; расшифровать такие файлы потом будет нечем)
   finboard-anon-cli --detect data.xlsx   (показать, что найдёт автоподбор)"
     );
     ExitCode::from(2)
@@ -96,10 +101,16 @@ fn main() -> ExitCode {
         settings.get_or_insert(pr.settings);
         jobs.push((FileJob { input, output: output.unwrap(), rules: pr.rules.clone() }, pr.rules));
     }
+    // --no-key — без ключа на входе и на выходе. Раньше найденный ключ всё равно загружался: фейки шли из него,
+    // хотя просили «без ключа».
+    if no_key && (key.is_some() || load_key.is_some()) {
+        eprintln!("Ошибка: --no-key нельзя вместе с --key или --load-key");
+        return usage();
+    }
     // Ключ уже есть (общий ключ папки или старый ключ файла) — подхватываем и дополняем,
     // а не перезаписываем: в нём фейки уже переданных файлов.
     let first = jobs[0].0.input.clone();
-    let found = find_key(&first);
+    let found = if no_key { None } else { find_key(&first) };
     let key_out = if no_key {
         None
     } else {

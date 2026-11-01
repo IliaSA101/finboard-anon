@@ -1,8 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,9 @@ fn anon_source_stem(stem: &str) -> Option<&str> {
 /// Файлы Excel в папке и её подпапках — по порядку имён. Без временных файлов открытой книги («~$…») и без
 /// результатов прошлых запусков: «отчёт_anon.xlsx» пропускается, только если рядом лежит его исходник «отчёт.xlsx»
 /// (файл, обезличенный заранее другим способом, — тоже исходник).
+/// Символические ссылки и точки соединения (junction) не открываются: ссылка на папку выше по дереву
+/// зациклила бы обход, а ссылка в чужую папку подмешала бы чужие файлы. Папки OneDrive «по запросу» — тоже
+/// точки повторной обработки, но не ссылки (`is_symlink` их не считает ссылками) — они обходятся как обычно.
 fn excel_files_in(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -58,8 +62,13 @@ fn excel_files_in(dir: &std::path::Path) -> Vec<PathBuf> {
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
         let mut here = Vec::new();
         for e in rd.flatten() {
+            // Тип записи каталога — без перехода по ссылке.
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
             let p = e.path();
-            if p.is_dir() {
+            if ft.is_dir() {
                 stack.push(p);
             } else if is_excel(&p) && !stem_lower(&p).starts_with("~$") {
                 here.push(p);
@@ -163,6 +172,38 @@ enum Msg {
     Done(Result<Vec<Report>, String>, Vec<Profile>),
 }
 
+/// Прочитанный файл: книга, ошибка чтения или `None` — файл уже открыт (не читался повторно).
+type Loaded = (PathBuf, Option<Result<Workbook, String>>);
+
+/// Сообщения фонового открытия файлов.
+enum OpenMsg {
+    /// Строка хода: «Открытие файлов: 3 из 120 — Продажи.xlsx».
+    Progress(String),
+    /// Готово: прочитанные файлы, «закрыть прежние», папки без файлов Excel.
+    Done(Vec<Loaded>, bool, Vec<PathBuf>),
+}
+
+/// Читает книги — тяжёлая часть открытия (общие строки каждого файла). Без окна: годится для фонового потока.
+/// Уже открытые (`known`) и повторы в списке не читаются.
+fn load_books(paths: Vec<PathBuf>, known: &HashSet<PathBuf>, progress: &mut dyn FnMut(usize, usize, &std::path::Path)) -> Vec<Loaded> {
+    let n = paths.len();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (k, path) in paths.into_iter().enumerate() {
+        if known.contains(&path) || !seen.insert(path.clone()) {
+            out.push((path, None));
+            continue;
+        }
+        progress(k + 1, n, &path);
+        // Сбой разбора одного файла — ошибка этого файла, а не оборванное открытие всех.
+        let wb = std::panic::catch_unwind(|| Workbook::open(&path))
+            .map_err(|_| "сбой чтения файла".to_string())
+            .and_then(|r| r.map_err(|e| format!("{e:#}")));
+        out.push((path, Some(wb)));
+    }
+    out
+}
+
 /// Сбой потока обработки (паника). Результаты пишутся во временные файлы и переименовываются только
 /// в конце, а исходные файлы только читаются — поэтому их сбой не задевает.
 fn crash_message(panic: Option<&str>) -> String {
@@ -215,6 +256,14 @@ struct App {
     status_err: bool,
     log: Vec<String>,
     job: Option<Receiver<Msg>>,
+    /// Флаг отмены идущей обработки: его поднимает закрытие окна с ответом «Прервать».
+    cancel: Option<Arc<AtomicBool>>,
+    /// Вопрос «Идёт обезличивание. Прервать?» на экране.
+    close_ask: bool,
+    /// Обработка прерывается по закрытию окна: окно закроется, когда поток уберёт временные файлы.
+    closing: bool,
+    /// Идущее фоновое открытие файлов.
+    opening: Option<Receiver<OpenMsg>>,
     /// Ход идущей обработки и её начало; этап и строка «Файл k из n» — из журнала, для полосы хода.
     progress: Option<(Arc<Progress>, Instant)>,
     stage: String,
@@ -259,7 +308,7 @@ impl App {
             }
         }
         let files: Vec<PathBuf> = args.into_iter().filter(|p| !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"))).collect();
-        app.open_files(files, false);
+        app.open_files_bg(files, false, &cc.egui_ctx);
         app
     }
 
@@ -283,6 +332,10 @@ impl App {
             status_err: false,
             log: Vec::new(),
             job: None,
+            cancel: None,
+            close_ask: false,
+            closing: false,
+            opening: None,
             progress: None,
             stage: String::new(),
             file_line: String::new(),
@@ -308,11 +361,101 @@ impl App {
         self.docs.get(self.cur)
     }
 
-    /// Открывает файлы; `replace` — закрыть уже открытые (новый набор файлов).
+    /// Пути уже открытых файлов — их не нужно читать заново (при «закрыть прежние» — никаких).
+    fn known_paths(&self, replace: bool) -> HashSet<PathBuf> {
+        if replace {
+            HashSet::new()
+        } else {
+            self.docs.iter().map(|d| d.path.clone()).collect()
+        }
+    }
+
+    /// Открывает файлы сразу, в этом потоке (для тестов окна; само окно открывает в фоне — `open_files_bg`);
+    /// `replace` — закрыть уже открытые (новый набор файлов).
+    #[cfg(test)]
     fn open_files(&mut self, paths: Vec<PathBuf>, replace: bool) {
         if paths.is_empty() {
             return;
         }
+        let loaded = load_books(paths, &self.known_paths(replace), &mut |_, _, _| {});
+        self.add_books(loaded, replace);
+    }
+
+    /// Открывает файлы и папки в фоне: обход большой папки и чтение общих строк каждого файла занимают
+    /// секунды и минуты — окно не замирает, в строке состояния — «Открытие файлов: k из n».
+    fn open_files_bg(&mut self, paths: Vec<PathBuf>, replace: bool, ctx: &egui::Context) {
+        if paths.is_empty() {
+            return;
+        }
+        if self.opening.is_some() {
+            self.set_status("Дождитесь: предыдущие файлы ещё открываются", true);
+            return;
+        }
+        let known = self.known_paths(replace);
+        let (tx, rx) = channel();
+        self.opening = Some(rx);
+        self.set_status("Открытие файлов…", false);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut files = Vec::new();
+            let mut empty = Vec::new();
+            for p in paths {
+                if p.is_dir() {
+                    let found = excel_files_in(&p);
+                    if found.is_empty() {
+                        empty.push(p);
+                    }
+                    files.extend(found);
+                } else {
+                    files.push(p);
+                }
+            }
+            let loaded = load_books(files, &known, &mut |k, n, p| {
+                let _ = tx.send(OpenMsg::Progress(format!("Открытие файлов: {k} из {n} — {}", file_name(p))));
+                ctx.request_repaint();
+            });
+            let _ = tx.send(OpenMsg::Done(loaded, replace, empty));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_open(&mut self) {
+        let Some(rx) = &self.opening else { return };
+        let mut msgs = Vec::new();
+        let mut gone = false;
+        loop {
+            match rx.try_recv() {
+                Ok(m) => msgs.push(m),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    gone = true;
+                    break;
+                }
+            }
+        }
+        for m in msgs {
+            match m {
+                OpenMsg::Progress(s) => self.set_status(s, false),
+                OpenMsg::Done(loaded, replace, empty) => {
+                    self.opening = None;
+                    if loaded.is_empty() {
+                        let dirs: Vec<String> = empty.iter().map(|d| d.display().to_string()).collect();
+                        self.set_status(format!("В папке {} нет файлов Excel", dirs.join(", ")), true);
+                    } else {
+                        self.add_books(loaded, replace);
+                    }
+                    return;
+                }
+            }
+        }
+        if gone {
+            self.opening = None;
+            self.set_status("Сбой при открытии файлов — откройте их ещё раз", true);
+        }
+    }
+
+    /// Прочитанные книги — в список файлов: профиль рядом с файлом, ключ папки, строка состояния.
+    fn add_books(&mut self, loaded: Vec<Loaded>, replace: bool) {
         if replace {
             self.docs.clear();
             self.key_in = None;
@@ -321,17 +464,19 @@ impl App {
         let mut notes: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
         let mut last = None;
-        for path in paths {
+        for (path, wb) in loaded {
             if let Some(i) = self.docs.iter().position(|d| d.path == path) {
                 last = Some(i);
                 continue;
             }
-            let wb = match Workbook::open(&path) {
-                Ok(wb) => wb,
-                Err(e) => {
-                    errors.push(format!("{}: {e:#}", file_name(&path)));
+            let wb = match wb {
+                Some(Ok(wb)) => wb,
+                Some(Err(e)) => {
+                    errors.push(format!("{}: {e}", file_name(&path)));
                     continue;
                 }
+                // Был открыт, когда открытие началось, а теперь закрыт — его не читали; не открываем.
+                None => continue,
             };
             let first = self.docs.is_empty();
             let mut profile = Profile::default();
@@ -538,6 +683,7 @@ impl App {
         }
         if let Some((r, profiles)) = finished {
             self.job = None;
+            self.cancel = None;
             let took = self.progress.take().map(|(_, t0)| format!(" — за {}", format_duration(t0.elapsed()))).unwrap_or_default();
             match r {
                 Ok(reports) => {
@@ -624,12 +770,15 @@ impl App {
         self.job = Some(rx);
         let progress = Arc::new(Progress::default());
         self.progress = Some((progress.clone(), Instant::now()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(cancel.clone());
         self.stage.clear();
         self.file_line.clear();
         self.set_status("Обработка…", false);
         std::thread::spawn(move || {
             // Счётчик — в потоке обработки: считаются только его чтения книг.
             finboard_anon::xlsx::track_progress(Some(progress));
+            finboard_anon::anon::track_cancel(Some(cancel));
             let tx_log = tx.clone();
             let ctx_log = ctx.clone();
             let res = guarded(|| {
@@ -648,32 +797,28 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("Открыть Excel…").on_hover_text("Можно выбрать сразу несколько файлов одного заказчика").clicked() {
+            let idle = self.opening.is_none();
+            if ui.add_enabled(idle, egui::Button::new("Открыть Excel…")).on_hover_text("Можно выбрать сразу несколько файлов одного заказчика").clicked() {
                 if let Some(p) = rfd::FileDialog::new().add_filter("Excel", &["xlsx", "xlsm"]).pick_files() {
-                    self.open_files(p, true);
+                    self.open_files_bg(p, true, ui.ctx());
                 }
             }
             if ui
-                .add_enabled(!self.docs.is_empty(), egui::Button::new("Добавить файл…"))
+                .add_enabled(idle && !self.docs.is_empty(), egui::Button::new("Добавить файл…"))
                 .on_hover_text("Ещё файл в тот же набор: одни и те же люди, организации и ИНН получат одни и те же фейки во всех файлах")
                 .clicked()
             {
                 if let Some(p) = rfd::FileDialog::new().add_filter("Excel", &["xlsx", "xlsm"]).pick_files() {
-                    self.open_files(p, false);
+                    self.open_files_bg(p, false, ui.ctx());
                 }
             }
             if ui
-                .button("Добавить папку…")
+                .add_enabled(idle, egui::Button::new("Добавить папку…"))
                 .on_hover_text("Все файлы Excel из папки и её подпапок (кроме уже обезличенных «…_anon»). Лишние — снять галочку или убрать из списка")
                 .clicked()
             {
                 if let Some(dir) = rfd::FileDialog::new().set_title("Папка с файлами Excel").pick_folder() {
-                    let files = excel_files_in(&dir);
-                    if files.is_empty() {
-                        self.set_status(format!("В папке {} нет файлов Excel", dir.display()), true);
-                    } else {
-                        self.open_files(files, false);
-                    }
+                    self.open_files_bg(vec![dir], false, ui.ctx());
                 }
             }
             ui.separator();
@@ -712,6 +857,9 @@ impl App {
                 }
             }
             ui.separator();
+            if !idle {
+                ui.spinner();
+            }
             let color = if self.status_err { Color32::from_rgb(220, 80, 60) } else { ui.visuals().text_color() };
             ui.label(RichText::new(&self.status).color(color));
         });
@@ -1507,7 +1655,7 @@ impl App {
         ui.horizontal(|ui| {
             let running = self.job.is_some();
             let on = self.docs.iter().filter(|d| d.on).count();
-            let can = on > 0 && !running;
+            let can = on > 0 && !running && self.opening.is_none();
             let label = match (self.docs.len(), on) {
                 (n, k) if n > 1 && k == n => format!("Обезличить все файлы ({n})…"),
                 (n, k) if n > 1 => format!("Обезличить отмеченные файлы ({k} из {n})…"),
@@ -1545,22 +1693,79 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Вопрос при закрытии окна во время обработки.
+    fn close_dialog(&mut self, ctx: &egui::Context) {
+        let mut answer = None;
+        egui::Window::new("Закрыть окно?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Идёт обезличивание. Прервать?").strong());
+                ui.label("Записанное до сих пор будет удалено; прежние результаты и ключ останутся как были.");
+                ui.horizontal(|ui| {
+                    if ui.button("Прервать и закрыть").clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("Продолжить обработку").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+        match answer {
+            Some(true) => self.confirm_close(),
+            Some(false) => self.close_ask = false,
+            None => {}
+        }
+    }
+
+    /// «Прервать и закрыть»: поток обработки останавливается на ближайшей части книги и удаляет временные
+    /// файлы; окно закрывается, когда он закончит (см. `ui`).
+    fn confirm_close(&mut self) {
+        self.close_ask = false;
+        self.closing = true;
+        if let Some(c) = &self.cancel {
+            c.store(true, Ordering::Relaxed);
+        }
+        self.set_status("Прерывание… окно закроется, когда временные файлы будут удалены", false);
+    }
+
     /// Кадр окна — без eframe, чтобы тесты гоняли его на настоящих событиях мыши и клавиатуры.
     fn ui(&mut self, ctx: &egui::Context) {
         self.poll_job();
+        self.poll_open();
+        // Прервано закрытием окна — поток убрал временные файлы и закончил: теперь окно закрывается.
+        if self.closing && self.job.is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        // Закрытие окна во время обработки — только с вопросом: иначе поток обрывается на полуслове,
+        // а рядом с результатами остаются временные файлы с данными.
+        // (Сведения об окне — через `get`: в тестах окна без экрана их нет, `viewport()` упал бы.)
+        let close_requested = ctx.input(|i| i.raw.viewports.get(&i.raw.viewport_id).is_some_and(|v| v.close_requested()));
+        if self.job.is_some() && close_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if !self.closing {
+                self.close_ask = true;
+            }
+        }
         // Полоса хода и время обновляются и без сообщений из потока обработки.
         if self.job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
-        // Перетащенная папка — все файлы Excel из неё.
+        // Перетащенная папка — все файлы Excel из неё (обход — в фоне).
         let dropped: Vec<PathBuf> = ctx
             .input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect::<Vec<_>>())
             .into_iter()
-            .flat_map(|p| if p.is_dir() { excel_files_in(&p) } else { vec![p] })
-            .filter(|p| is_excel(p))
+            .filter(|p| p.is_dir() || is_excel(p))
             .collect();
         if !dropped.is_empty() {
-            self.open_files(dropped, false);
+            self.open_files_bg(dropped, false, ctx);
+        }
+        // Обработка закончилась, пока висел вопрос, — спрашивать больше не о чем.
+        if self.close_ask && self.job.is_some() {
+            self.close_dialog(ctx);
+        } else {
+            self.close_ask = false;
         }
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.top_bar(ui));
         egui::TopBottomPanel::bottom("bottom").resizable(true).default_height(230.0).show(ctx, |ui| self.bottom_panel(ui));
@@ -1976,5 +2181,116 @@ mod tests {
         assert_eq!(r.link, "Контрагент");
         assert_eq!(r.kind_key(), "Адрес+ID@контрагент");
         assert_eq!(app.docs[0].profile.rules[1].link, "", "печать ушла не в то правило");
+    }
+
+    /// Кадр с запросом закрытия окна (крестик) или без; возвращает команды окну, отданные в этом кадре.
+    fn frame_close(s: &mut Screen, app: &mut App, close: bool) -> Vec<egui::ViewportCommand> {
+        s.t += 0.05;
+        let mut input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1500.0, 920.0))),
+            time: Some(s.t),
+            ..Default::default()
+        };
+        let vp = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+        if close {
+            vp.events.push(egui::ViewportEvent::Close);
+        }
+        let out = s.ctx.run(input, |ctx| app.ui(ctx));
+        out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.commands.clone()).unwrap_or_default()
+    }
+
+    /// Закрытие окна во время обработки обрывало поток без вопроса, рядом с результатами оставались временные
+    /// файлы. Теперь закрытие отменяется и звучит вопрос «Идёт обезличивание. Прервать?»; «Прервать» поднимает
+    /// флаг отмены (поток удаляет временные файлы), окно закрывается само, когда поток закончил.
+    #[test]
+    fn closing_window_during_job_asks_and_cancels() {
+        use egui::ViewportCommand::{CancelClose, Close};
+        let mut app = App::blank();
+        let mut s = Screen::new();
+        // Без обработки окно закрывается как обычно.
+        let cmds = frame_close(&mut s, &mut app, true);
+        assert!(!cmds.contains(&CancelClose) && !app.close_ask, "{cmds:?}");
+
+        let (tx, rx) = channel();
+        app.job = Some(rx);
+        app.progress = Some((Arc::new(Progress::default()), Instant::now()));
+        let flag = Arc::new(AtomicBool::new(false));
+        app.cancel = Some(flag.clone());
+        let cmds = frame_close(&mut s, &mut app, true);
+        assert!(cmds.contains(&CancelClose), "окно закрылось посреди обработки: {cmds:?}");
+        assert!(app.close_ask, "нет вопроса");
+        assert!(!flag.load(Ordering::Relaxed), "отмена без ответа");
+        // «Продолжить обработку» — вопрос убран, обработка идёт.
+        app.close_ask = false;
+        frame_close(&mut s, &mut app, false);
+        assert!(!app.close_ask && !flag.load(Ordering::Relaxed));
+        // Снова крестик и «Прервать и закрыть».
+        frame_close(&mut s, &mut app, true);
+        assert!(app.close_ask);
+        app.confirm_close();
+        assert!(flag.load(Ordering::Relaxed), "флаг отмены не поднят");
+        assert!(app.status.starts_with("Прерывание"), "{}", app.status);
+        // Поток ещё убирает за собой: крестик снова отменяется, вопрос не повторяется, окно не закрывается.
+        let cmds = frame_close(&mut s, &mut app, true);
+        assert!(cmds.contains(&CancelClose) && !cmds.contains(&Close) && !app.close_ask, "{cmds:?}");
+        // Поток закончил — окно закрывается.
+        tx.send(Msg::Done(Err("Обезличивание прервано.".into()), Vec::new())).unwrap();
+        let cmds = frame_close(&mut s, &mut app, false);
+        assert!(cmds.contains(&Close), "окно не закрылось после отмены: {cmds:?}");
+        assert!(app.job.is_none() && app.cancel.is_none());
+    }
+
+    /// Папка открывается в фоне: окно не ждёт ни обхода папки, ни чтения файлов (на больших папках замирало);
+    /// ход — в строке состояния, по окончании файлы в списке. Пустая папка — сообщение.
+    #[test]
+    fn folder_opens_in_background() {
+        let d = temp_dir("bg_open");
+        for n in ["a", "b", "c"] {
+            std::fs::copy(sample(), d.join(format!("{n}.xlsx"))).unwrap();
+        }
+        let mut app = App::blank();
+        let mut s = Screen::new();
+        let wait = |app: &mut App, s: &mut Screen| {
+            let t0 = Instant::now();
+            while app.opening.is_some() {
+                assert!(t0.elapsed() < Duration::from_secs(60), "открытие не закончилось: {}", app.status);
+                s.frame(app, vec![]);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        app.open_files_bg(vec![d.clone()], false, &s.ctx);
+        assert!(app.opening.is_some(), "открытие не в фоне");
+        assert!(app.docs.is_empty(), "файлы прочитаны в потоке окна");
+        wait(&mut app, &mut s);
+        assert_eq!(app.docs.len(), 3, "{}", app.status);
+        assert_eq!(app.status, "Открыто файлов: 3");
+        // Повторное открытие той же папки — те же три файла, без повторов.
+        app.open_files_bg(vec![d.clone()], false, &s.ctx);
+        wait(&mut app, &mut s);
+        assert_eq!(app.docs.len(), 3);
+        let e = temp_dir("bg_empty");
+        app.open_files_bg(vec![e.clone()], false, &s.ctx);
+        wait(&mut app, &mut s);
+        assert!(app.status_err && app.status.contains("нет файлов Excel"), "{}", app.status);
+        assert_eq!(app.docs.len(), 3);
+    }
+
+    /// Точка соединения (junction) на саму папку зацикливала обход («петля\петля\…» до предела длины пути,
+    /// с повторами файлов), на чужую папку — подмешивала чужие файлы. Ссылки теперь не открываются.
+    #[cfg(windows)]
+    #[test]
+    fn folder_skips_junctions() {
+        let d = temp_dir("junction");
+        let other = temp_dir("junction_other");
+        std::fs::write(d.join("a.xlsx"), b"x").unwrap();
+        std::fs::create_dir(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub").join("b.xlsx"), b"x").unwrap();
+        std::fs::write(other.join("other.xlsx"), b"x").unwrap();
+        for (link, target) in [(d.join("loop"), &d), (d.join("sub").join("up"), &d), (d.join("foreign"), &other)] {
+            let st = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(target).output().unwrap();
+            assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+        }
+        let names: Vec<String> = excel_files_in(&d).iter().map(|p| p.strip_prefix(&d).unwrap().to_string_lossy().replace('\\', "/")).collect();
+        assert_eq!(names, ["a.xlsx", "sub/b.xlsx"]);
     }
 }

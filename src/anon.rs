@@ -96,27 +96,30 @@ pub fn default_output_path(input: &Path) -> PathBuf {
 
 /// Результаты пакета: «<имя>_anon.xlsx» рядом с исходным или в выбранной папке.
 /// Одинаковые имена из разных папок не затирают друг друга: «отчет_anon_2.xlsx».
+/// Номер зависит только от полных путей исходных, а не от порядка, в котором файлы открыты: повторный
+/// прогон перезаписывает результат того же исходного, а не соседа с тем же именем.
 pub fn batch_outputs(inputs: &[PathBuf], dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut order: Vec<usize> = (0..inputs.len()).collect();
+    order.sort_by_cached_key(|&i| (inputs[i].to_string_lossy().to_lowercase(), inputs[i].clone()));
     let mut used: HashSet<String> = HashSet::new();
-    inputs
-        .iter()
-        .map(|input| {
-            let base = default_output_path(input);
-            let base = match dir {
-                Some(d) => d.join(base.file_name().unwrap_or_default()),
-                None => base,
-            };
-            let mut out = base.clone();
-            let mut n = 2;
-            while !used.insert(out.to_string_lossy().to_lowercase()) {
-                let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("книга");
-                let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("xlsx");
-                out = base.with_file_name(format!("{stem}_{n}.{ext}"));
-                n += 1;
-            }
-            out
-        })
-        .collect()
+    let mut outs = vec![PathBuf::new(); inputs.len()];
+    for i in order {
+        let base = default_output_path(&inputs[i]);
+        let base = match dir {
+            Some(d) => d.join(base.file_name().unwrap_or_default()),
+            None => base,
+        };
+        let mut out = base.clone();
+        let mut n = 2;
+        while !used.insert(out.to_string_lossy().to_lowercase()) {
+            let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("книга");
+            let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("xlsx");
+            out = base.with_file_name(format!("{stem}_{n}.{ext}"));
+            n += 1;
+        }
+        outs[i] = out;
+    }
+    outs
 }
 
 impl Report {
@@ -488,6 +491,11 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
             bail!("{name}: нет правил замены");
         }
     }
+    // Замок на записываемый ключ — до его чтения и до конца прогона: второй запуск на том же ключе
+    // (другое окно, командная строка) получит понятную ошибку, а не выдаст тем же ID других людей.
+    // Отпечаток ключа — тоже до чтения: перед записью он сверяется (запуски прежних версий замка не ставят).
+    let _key_lock = batch.key_out.as_deref().map(keyfile::lock).transpose()?;
+    let key_stamp = batch.key_out.as_deref().and_then(keyfile::stamp);
     let mut books = Vec::new();
     for f in &batch.files {
         let mut zip = open_zip(&f.input)?;
@@ -518,32 +526,22 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
         }
     }
 
-    // 3. Ключ — один на все файлы, до записи файлов: любой записанный результат покрыт ключом.
-    // Чужой ключ на этом месте (прогон без загрузки ключа) не затирается: в нём соответствия уже
-    // переданных файлов — он переименовывается. Загруженный ключ перезаписывается, но сначала его копия
-    // ложится рядом («_копия.csv»): если загрузка что-то упустила, прежние соответствия не потеряны.
-    if let Some(k) = &batch.key_out {
-        if k.exists() && !batch.key_in.as_deref().is_some_and(|i| same_file(i, k)) {
-            let backup = keyfile::backup_path(k);
-            std::fs::rename(k, &backup).with_context(|| format!("не переименовывается прежний ключ {}", k.display()))?;
-            log(format!("Прежний ключ не был загружен и сохранён как {}", backup.display()));
-        } else if k.exists() {
-            let copy = keyfile::keep_copy(k)?;
-            log(format!("Копия ключа до этого запуска: {}", copy.display()));
-        }
-        keyfile::write(k, &faker.entries)?;
-        log(format!("Ключ записан: {}", k.display()));
-    }
-
+    // 3. Все результаты — сначала во временные файлы рядом («…_anon.xlsx.tmp»); каждый проверяется на остатки
+    // реальных значений, и только когда записано и проверено всё, они встают на место все вместе (шаг 5).
+    // Сбой, отмена или открытый в Excel результат до этого — временные файлы удаляются, прежние результаты
+    // и ключ не тронуты.
+    let tmps: Vec<PathBuf> = batch.files.iter().map(|f| tmp_path(&f.output)).collect();
+    let _tmp_guard = RemoveOnDrop(&tmps);
     let mut reports = Vec::new();
     let mut scans = Vec::new();
     for (fi, f) in batch.files.iter().enumerate() {
+        check_cancel()?;
         if batch.files.len() > 1 {
             log(format!("Файл {} из {}: {}", fi + 1, batch.files.len(), file_name(&f.input)));
         }
         let (zip, wb) = &mut books[fi];
         let (maps, scan_extra) = build_maps(&faker, &plans, &rules, wb.date1904, batch.settings.inner_search());
-        let mut report = write_book(zip, wb, &f.rules, &faker, &maps, &batch.settings, &f.output, log)?;
+        let mut report = write_book(zip, wb, &f.rules, &faker, &maps, &batch.settings, &f.output, &tmps[fi], log)?;
         report.warnings.splice(0..0, plans[fi].warnings.iter().cloned());
         report.distinct_values = plans[fi].items.len();
         report.rule_heads = plans[fi].rule_heads.clone();
@@ -572,6 +570,7 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
         .collect();
     let own: Vec<HashSet<&str>> = plans.iter().map(|p| p.items.iter().map(|(_, s, _)| s.as_str()).collect()).collect();
     for (fi, f) in batch.files.iter().enumerate() {
+        check_cancel()?;
         let mut originals: Vec<String> = plans[fi].items.iter().map(|(_, s, _)| s.clone()).collect();
         originals.extend(scans[fi].iter().cloned());
         originals.extend(
@@ -580,7 +579,7 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
         originals.extend(faker.company_names().map(|(r, _, _)| r.to_string()));
         originals.sort();
         originals.dedup();
-        reports[fi].leaks = scan_leaks_with(&f.output, &originals, &fakes, &real_digits)?;
+        reports[fi].leaks = scan_leaks_with(&tmps[fi], &originals, &fakes, &real_digits)?;
         let kept = batch.settings.outside != Outside::All || f.rules.iter().any(|r| r.kind == Kind::Keep);
         if kept && !reports[fi].leaks.is_empty() {
             reports[fi].warnings.push(
@@ -589,7 +588,111 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
             );
         }
     }
+
+    // 5. На место — ключ и результаты.
+    check_cancel()?;
+    commit(batch, &faker, &tmps, key_stamp, log)?;
     Ok(reports)
+}
+
+/// Временный файл результата: «<имя>.xlsx.tmp» рядом с ним (на том же диске — переименование мгновенное).
+fn tmp_path(output: &Path) -> PathBuf {
+    let mut s = output.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
+thread_local! {
+    static CANCEL: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Флаг отмены обработки в этом потоке: окно поднимает его, когда обработку прерывают закрытием окна.
+/// Проверяется между частями книги и между файлами; до записи на место — временные файлы удаляются.
+pub fn track_cancel(flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
+    CANCEL.with(|c| *c.borrow_mut() = flag);
+}
+
+fn check_cancel() -> Result<()> {
+    if CANCEL.with(|c| c.borrow().as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))) {
+        bail!("Обезличивание прервано. Ничего не записано: временные файлы удалены, прежние результаты и ключ не тронуты.");
+    }
+    Ok(())
+}
+
+/// Можно ли заменить файл на месте. Excel держит открытую книгу так, что её нельзя ни записать, ни заменить
+/// (переименованием поверх) — это и проверяется: открытие на запись с правом удаления.
+fn replaceable(p: &Path) -> bool {
+    if !p.exists() {
+        return true;
+    }
+    let mut o = std::fs::OpenOptions::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const DELETE: u32 = 0x0001_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        o.access_mode(DELETE | GENERIC_WRITE);
+    }
+    #[cfg(not(windows))]
+    o.write(true);
+    o.open(p).is_ok()
+}
+
+/// Всё записано и проверено — на место. Сначала — можно ли заменить каждый результат и ключ (не открыт ли
+/// в Excel) и не изменился ли ключ, пока шла обработка: иначе ошибка, и ничего не тронуто.
+/// Затем ключ, затем результаты. Ключ первым: любой результат на месте покрыт ключом; сбой между ними
+/// оставляет в ключе записи, которых нет в файлах (безвредно — те же люди получат те же фейки в следующий раз),
+/// а не файлы, которые нечем расшифровать.
+fn commit(batch: &Batch, faker: &Faker, tmps: &[PathBuf], key_stamp: keyfile::Stamp, log: &mut dyn FnMut(String)) -> Result<()> {
+    let mut busy: Vec<String> = batch.files.iter().filter(|f| !replaceable(&f.output)).map(|f| format!("«{}»", f.output.display())).collect();
+    if let Some(k) = batch.key_out.as_deref().filter(|k| !replaceable(k)) {
+        busy.push(format!("ключ «{}»", k.display()));
+    }
+    if !busy.is_empty() {
+        bail!(
+            "Не заменяется {}: файл открыт в другой программе (закройте файл в Excel) или защищён от записи.\n\
+             Ничего не записано: прежние результаты и ключ не тронуты. Закройте файл и запустите обезличивание снова.",
+            busy.join(", ")
+        );
+    }
+    // Ключ — один на все файлы. Чужой ключ на этом месте (прогон без загрузки ключа) не затирается: в нём
+    // соответствия уже переданных файлов — он переименовывается. Загруженный ключ перезаписывается, но сначала
+    // его копия ложится рядом («_копия.csv»): если загрузка что-то упустила, прежние соответствия не потеряны.
+    if let Some(k) = &batch.key_out {
+        if keyfile::stamp(k) != key_stamp {
+            bail!(
+                "Ключ {} изменился, пока шла обработка (его записал другой запуск или его правили вручную).\n\
+                 Ничего не записано: запись затёрла бы чужие строки ключа. Запустите обезличивание снова — ключ загрузится заново.",
+                k.display()
+            );
+        }
+        if k.exists() && !batch.key_in.as_deref().is_some_and(|i| same_file(i, k)) {
+            let backup = keyfile::backup_path(k);
+            std::fs::rename(k, &backup).with_context(|| format!("не переименовывается прежний ключ {} — файлы не записаны", k.display()))?;
+            log(format!("Прежний ключ не был загружен и сохранён как {}", backup.display()));
+        } else if k.exists() {
+            let copy = keyfile::keep_copy(k)?;
+            log(format!("Копия ключа до этого запуска: {}", copy.display()));
+        }
+        keyfile::write(k, &faker.entries).context("файлы не записаны")?;
+        log(format!("Ключ записан: {}", k.display()));
+    }
+    // Только переименование: копирование поверх существующего пути при неудаче могло бы записать результат
+    // сквозь жёсткую ссылку прямо в исходный файл.
+    for (i, (f, tmp)) in batch.files.iter().zip(tmps).enumerate() {
+        if let Err(e) = std::fs::rename(tmp, &f.output) {
+            let names = |fs: &[FileJob]| fs.iter().map(|f| format!("«{}»", file_name(&f.output))).collect::<Vec<_>>().join(", ");
+            let done = if i == 0 { String::new() } else { format!("\nУже записаны: {}.", names(&batch.files[..i])) };
+            let key = if batch.key_out.is_some() { " Ключ записан и покрывает все файлы." } else { "" };
+            bail!(
+                "Не записан «{}»: {e}. Закройте файл в Excel и запустите обезличивание снова.{done}\n\
+                 Не записаны (их прежние версии не тронуты): {}.{key}",
+                f.output.display(),
+                names(&batch.files[i..])
+            );
+        }
+    }
+    Ok(())
 }
 
 fn file_name(p: &Path) -> String {
@@ -681,16 +784,19 @@ fn build_maps(faker: &Faker, plans: &[FilePlan], rules: &[&[Rule]], date1904: bo
     (maps, scan_extra)
 }
 
-/// Удаляет временный файл при выходе из области — и при ошибке, и при панике.
-struct RemoveOnDrop<'a>(&'a Path);
+/// Удаляет временные файлы при выходе из области — и при ошибке, и при отмене, и при панике
+/// (вставшие на место уже переименованы — их по этим путям нет).
+struct RemoveOnDrop<'a>(&'a [PathBuf]);
 
 impl Drop for RemoveOnDrop<'_> {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.0);
+        for p in self.0 {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
-/// Перезапись одной книги по готовым заменам.
+/// Перезапись одной книги по готовым заменам — во временный файл `tmp` (на место его ставит `commit`).
 #[allow(clippy::too_many_arguments)]
 fn write_book(
     zip: &mut Zip,
@@ -700,6 +806,7 @@ fn write_book(
     maps: &GlobalMaps,
     settings: &Settings,
     output: &Path,
+    tmp: &Path,
     log: &mut dyn FnMut(String),
 ) -> Result<Report> {
     let mut report = Report { output: output.to_path_buf(), ..Default::default() };
@@ -729,15 +836,14 @@ fn write_book(
     }
     let mut mashup: Vec<String> = Vec::new();
     let mut printer_unknown: Vec<String> = Vec::new();
-    let tmp = output.with_extension("tmp");
-    // При ошибке или сбое на любом шаге недописанный результат удаляется (после переименования его уже нет).
-    let _tmp_guard = RemoveOnDrop(&tmp);
+    // При ошибке или сбое на любом шаге недописанный результат удаляет `run_batch` (RemoveOnDrop).
     {
-        let out_file = File::create(&tmp).with_context(|| format!("не создаётся {}", tmp.display()))?;
+        let out_file = File::create(tmp).with_context(|| format!("не создаётся {}", tmp.display()))?;
         let mut zw = ZipWriter::new(BufWriter::new(out_file));
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         let empty: Vec<(usize, &Rule)> = Vec::new();
         for i in 0..zip.len() {
+            check_cancel()?;
             let name = zip.by_index_raw(i)?.name().to_string();
             if dropped.contains(&name.to_lowercase()) {
                 continue;
@@ -886,11 +992,12 @@ fn write_book(
                 None => zw.raw_copy_file(zip.by_index_raw(i)?)?,
             }
         }
-        zw.finish()?.flush()?;
+        // Сброс на диск до переименования: иначе при отключении питания на месте результата мог бы
+        // остаться пустой или недописанный файл.
+        let mut w = zw.finish()?;
+        w.flush()?;
+        w.get_ref().sync_all().with_context(|| format!("не записывается {}", tmp.display()))?;
     }
-    std::fs::rename(&tmp, &output)
-        .or_else(|_| std::fs::copy(&tmp, &output).map(|_| ()).and_then(|_| std::fs::remove_file(&tmp)))
-        .with_context(|| format!("не записывается {}", output.display()))?;
     report.rule_cells = stats.rule_cells;
     report.sst_replaced = stats.sst;
     report.formula_cache_replaced = stats.formula;
@@ -1474,11 +1581,60 @@ pub fn preview_batch(files: &[(PathBuf, Vec<Rule>)], settings: &Settings, key_in
         .collect())
 }
 
+/// Один и тот же файл на диске. Сравнение путей не видит жёстких ссылок (два имени одного файла):
+/// у существующих файлов сравнивается номер тома и номер файла на нём.
 fn same_file(a: &Path, b: &Path) -> bool {
+    if let (Some(x), Some(y)) = (file_id(a), file_id(b)) {
+        return x == y;
+    }
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(x), Ok(y)) => x == y,
         _ => a == b,
     }
+}
+
+/// Номер тома и номер файла на нём (`None` — файла нет или не открывается).
+#[cfg(windows)]
+fn file_id(p: &Path) -> Option<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    /// BY_HANDLE_FILE_INFORMATION из Windows API.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Info {
+        attributes: u32,
+        created: [u32; 2],
+        accessed: [u32; 2],
+        written: [u32; 2],
+        volume: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(file: *mut std::ffi::c_void, info: *mut Info) -> i32;
+    }
+    if !p.is_file() {
+        return None;
+    }
+    let f = File::open(p).ok()?;
+    let mut info = Info::default();
+    // SAFETY: описатель открытого файла жив, пока жив `f`; структура — по описанию Windows API.
+    let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) } != 0;
+    ok.then(|| (info.volume, (u64::from(info.index_high) << 32) | u64::from(info.index_low)))
+}
+
+#[cfg(unix)]
+fn file_id(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).ok().filter(|m| m.is_file()).map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn file_id(_: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 // ---------------------------------------------------------------- переписывание XML
