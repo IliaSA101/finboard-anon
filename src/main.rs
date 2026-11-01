@@ -1802,4 +1802,47 @@ mod tests {
         assert_eq!(app.status, "Готово: D:\\р_anon.xlsx — за 0 с");
         assert!(!app.status_err);
     }
+
+    /// Правило с другого листа не подсвечивается у ячейки этого листа, хотя колонка и строки совпадают.
+    #[test]
+    fn rule_on_other_sheet_is_not_pointed_to() {
+        let (mut app, mut s) = sample_app();
+        assert!(app.docs[0].wb.sheets.len() > 1);
+        let other = app.sheet_name(1);
+        app.docs[0].profile.rules.push(Rule::new(&other, 1, 1, None, Kind::FullName));
+        s.frame(&mut app, vec![]);
+        let p = s.cell(&app, 1, 4);
+        s.click(&mut app, p);
+        assert_eq!(app.cursor, Some((1, 4)));
+        assert_eq!(app.focus_rule, None, "подсвечено правило листа «{other}»");
+    }
+
+    /// «Нет правил в файлах: …» называет только отмеченные файлы: файл без галочки не обрабатывается,
+    /// правила ему не нужны.
+    #[test]
+    fn no_rules_message_names_only_checked_files() {
+        let d = temp_dir("norules");
+        let (a, b) = (d.join("a.xlsx"), d.join("b.xlsx"));
+        std::fs::copy(sample(), &a).unwrap();
+        std::fs::copy(sample(), &b).unwrap();
+        let mut app = App::blank();
+        app.open_files(vec![a, b], true);
+        app.docs[1].on = false;
+        app.start_job(&egui::Context::default());
+        assert!(app.job.is_none());
+        assert_eq!(app.status, "Нет правил в файлах: a.xlsx — добавьте правила или снимите с них галочку");
+        assert!(app.status_err);
+    }
+
+    /// Похожее на результат, но не результат программы («_anon_» без номера, «_anon_2024г») — это исходник:
+    /// он в списке, даже если рядом лежит файл с тем же началом имени.
+    #[test]
+    fn folder_keeps_files_that_only_look_like_results() {
+        let d = temp_dir("lookalike");
+        for f in ["Продажи.xlsx", "Продажи_anon_.xlsx", "Продажи_anon_2024г.xlsx", "Продажи_anon_7.xlsx"] {
+            std::fs::write(d.join(f), b"x").unwrap();
+        }
+        let names: Vec<String> = excel_files_in(&d).iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["Продажи.xlsx", "Продажи_anon_.xlsx", "Продажи_anon_2024г.xlsx"]);
+    }
 }
