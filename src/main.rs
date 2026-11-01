@@ -23,6 +23,9 @@ const GRID_COLS: u32 = 200;
 const ROW_H: f32 = 20.0;
 const HEAD_H: f32 = 28.0;
 const ROWNUM_W: f32 = 52.0;
+/// Наименьшая ширина панелей: слева — файлы и листы, справа — правила.
+const LEFT_MIN_W: f32 = 180.0;
+const RULES_MIN_W: f32 = 320.0;
 
 /// Профиль рядом с исходным файлом: «<имя>_профиль.json».
 fn side_profile_path(input: &std::path::Path) -> PathBuf {
@@ -129,6 +132,67 @@ fn stage_of(line: &str) -> Option<&'static str> {
 
 /// Подсказка к полю «Связь:» на карточке правила.
 const LINK_HINT: &str = "Оставьте пустым — одно значение везде получает один фейк. Впишите слово (например, «контрагент») — у колонок с этим словом свои фейки, не связанные с остальными.";
+
+/// Ширина надписи одной строкой — чтобы заранее решить, поместится ли она рядом с соседями.
+fn text_width(ui: &egui::Ui, text: &str, style: egui::TextStyle) -> f32 {
+    let font = style.resolve(ui.style());
+    ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, Color32::WHITE).size().x)
+}
+
+/// Ширина кнопки с надписью.
+fn button_width(ui: &egui::Ui, text: &str) -> f32 {
+    text_width(ui, text, egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.x
+}
+
+/// Содержимое строки не шире `w`: длинные подписи внутри обрезаются «…» (у `Label` полный текст — при наведении).
+fn within<R>(ui: &mut egui::Ui, w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.allocate_ui(vec2(w.max(0.0), ui.spacing().interact_size.y), |ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        add(ui)
+    })
+    .inner
+}
+
+/// Строка с переносом: если `w` (подпись с её полем) не помещается в остаток строки — с новой строки,
+/// чтобы подпись и поле не разрывались.
+fn keep_together(ui: &mut egui::Ui, w: f32) {
+    let row_started = ui.cursor().min.x > ui.max_rect().min.x + 0.5;
+    if row_started && ui.available_size_before_wrap().x < w {
+        ui.end_row();
+    }
+}
+
+/// Кнопки на карточке правила.
+#[derive(Clone, Copy, PartialEq)]
+enum RuleBtn {
+    Take,
+    Show,
+    Remove,
+}
+
+const RULE_BTNS: [(RuleBtn, &str); 3] = [(RuleBtn::Take, "Взять выделение"), (RuleBtn::Show, "Показать"), (RuleBtn::Remove, "Удалить")];
+
+/// Кнопки карточки правила; `rtl` — справа налево (прижаты к правому краю, как в широкой панели).
+fn rule_buttons(ui: &mut egui::Ui, rtl: bool, can_take: bool) -> Option<RuleBtn> {
+    let mut hit = None;
+    let mut order = RULE_BTNS;
+    if rtl {
+        order.reverse();
+    }
+    for (b, text) in order {
+        let clicked = match b {
+            RuleBtn::Take => ui
+                .add_enabled(can_take, egui::Button::new(text).small())
+                .on_hover_text("Перенести правило на диапазон, выделенный в таблице")
+                .clicked(),
+            _ => ui.small_button(text).clicked(),
+        };
+        if clicked {
+            hit = Some(b);
+        }
+    }
+    hit
+}
 
 /// Надпись на полосе хода: «37 % — Файл 2 из 10: Продажи.xlsx — запись · осталось ≈ 1 мин 20 с».
 /// Остаток — по доле и прошедшему времени, пока доля мала (до 3 %) — не оценивается.
@@ -886,8 +950,15 @@ impl App {
             .height_range(70.0..=max_files)
             .show_inside(ui, |ui| {
                 let on = self.docs.iter().filter(|d| d.on).count();
+                // Узкая панель: заголовок обрезается «…», а не раздвигает панель (иначе её не сузить).
                 ui.horizontal(|ui| {
-                    ui.heading(format!("Файлы ({on} из {})", self.docs.len()));
+                    let sp = ui.spacing();
+                    let all_w = if self.docs.len() > 1 {
+                        sp.icon_width + sp.icon_spacing + sp.item_spacing.x + text_width(ui, "все", egui::TextStyle::Body)
+                    } else {
+                        0.0
+                    };
+                    within(ui, ui.available_width() - all_w, |ui| ui.heading(format!("Файлы ({on} из {})", self.docs.len())));
                     if self.docs.len() > 1 {
                         let mut all = on == self.docs.len();
                         if ui.checkbox(&mut all, "все").on_hover_text("Отметить или снять все файлы").changed() {
@@ -903,9 +974,13 @@ impl App {
                             if ui.checkbox(&mut d.on, "").on_hover_text("Обрабатывать этот файл").changed() {
                                 self.preview_dirty = true;
                             }
+                            // Длинное имя обрезается «…» (полный путь — в подсказке): ширину панели задаёт
+                            // пользователь, а не самое длинное имя файла.
                             let label = format!("{}  [{}]", file_name(&d.path), d.profile.rules.len());
                             let text = if d.on { RichText::new(label) } else { RichText::new(label).weak().strikethrough() };
-                            if ui.selectable_label(self.cur == i, text).on_hover_text(d.path.display().to_string()).clicked() {
+                            let w = ui.available_width() - button_width(ui, "убрать") - ui.spacing().item_spacing.x;
+                            let item = within(ui, w, |ui| ui.selectable_label(self.cur == i, text));
+                            if item.on_hover_text(d.path.display().to_string()).clicked() {
                                 pick = Some(i);
                             }
                             if ui.small_button("убрать").on_hover_text("Убрать файл из списка (сам файл не удаляется)").clicked() {
@@ -927,10 +1002,17 @@ impl App {
         let names: Vec<String> = doc.wb.sheets.iter().map(|s| s.name.clone()).collect();
         let mut clicked = None;
         egui::ScrollArea::vertical().id_salt(("sheets", self.cur)).max_height(ui.available_height() - 80.0).show(ui, |ui| {
+            // Длинное имя листа — одной строкой с «…», полное — в подсказке.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
             for (i, n) in names.iter().enumerate() {
                 let cnt = doc.profile.rules.iter().filter(|r| &r.sheet == n).count();
                 let label = if cnt > 0 { format!("{n}  [{cnt}]") } else { n.clone() };
-                if ui.selectable_label(doc.cur_sheet == i, label).clicked() {
+                let cut = button_width(ui, &label) > ui.available_width();
+                let mut item = ui.selectable_label(doc.cur_sheet == i, label.as_str());
+                if cut {
+                    item = item.on_hover_text(label);
+                }
+                if item.clicked() {
                     clicked = Some(i);
                 }
             }
@@ -961,12 +1043,15 @@ impl App {
         let cur_sheet = self.docs[self.cur].cur_sheet;
         let sheet = self.sheet_name(cur_sheet);
 
-        // Строка добавления правила
-        ui.horizontal(|ui| {
+        // Строка добавления правила. С переносом: в узкой середине окна она не раздвигает панель —
+        // иначе вместе с ней раздвигалась и таблица, уходя правым краем под панель правил.
+        ui.horizontal_wrapped(|ui| {
             ui.label("Диапазон:");
             ui.add(egui::TextEdit::singleline(&mut self.range_text).id(egui::Id::new("range_text")).desired_width(110.0).hint_text("C5:C120"))
                 .on_hover_text("Например C5:C120, C5:C (до конца листа), B5:D100 (несколько колонок).\nМожно выделить мышью: протянуть по ячейкам, или щелчок — начало, Shift+щелчок — конец; щелчок по букве колонки — вся колонка.\nЕсли диапазон пересекается с правилом — правило заменяется новым");
             ui.checkbox(&mut self.new_to_end, "до конца листа");
+            // Список сам на новую строку не переносится — переносим его заранее.
+            keep_together(ui, 230.0);
             egui::ComboBox::from_id_salt("new_kind")
                 .selected_text(self.new_kind.title())
                 .width(230.0)
@@ -1165,7 +1250,12 @@ impl App {
             });
             let o = rect.min;
             let vis = Rect::from_min_size(o + vp.min.to_vec2(), vp.size());
-            let painter = ui.painter().clone();
+            // Всё — строго в видимой части: область прокрутки обрезает рисунок с запасом в 3 пикселя
+            // (`clip_rect_margin`), и в этом запасе ячейки проглядывали слева от номеров строк и под последней строкой.
+            let painter = ui.painter().with_clip_rect(vis);
+            // Прокручиваемые ячейки — только правее номеров строк и ниже строки с буквами колонок.
+            let body = painter.with_clip_rect(Rect::from_min_max(vis.min + vec2(ROWNUM_W, HEAD_H), vis.max));
+            let head = painter.with_clip_rect(Rect::from_min_max(vis.min + vec2(ROWNUM_W, 0.0), pos2(vis.max.x, vis.min.y + HEAD_H)));
             let r0 = ((vp.min.y - HEAD_H) / ROW_H).floor().max(0.0) as u32;
             let r1 = (((vp.max.y - HEAD_H) / ROW_H).ceil().max(0.0) as u32).min(nrows);
             let c0 = xs.partition_point(|&x| x <= vp.min.x - ROWNUM_W).saturating_sub(1);
@@ -1176,23 +1266,23 @@ impl App {
                 let row = ri + 1;
                 let y = o.y + HEAD_H + ri as f32 * ROW_H;
                 if row % 2 == 0 {
-                    painter.rect_filled(Rect::from_min_size(pos2(vis.min.x, y), vec2(vis.width(), ROW_H)), 0.0, visuals.faint_bg_color);
+                    body.rect_filled(Rect::from_min_size(pos2(vis.min.x, y), vec2(vis.width(), ROW_H)), 0.0, visuals.faint_bg_color);
                 }
                 for c in c0..c1 {
                     let col = c as u32;
                     let x = o.x + ROWNUM_W + xs[c];
                     let cr = Rect::from_min_size(pos2(x, y), vec2(widths[c], ROW_H));
                     if sel.is_some_and(|(sc, a, b)| sc == col && row >= a && row <= b) {
-                        painter.rect_filled(cr, 0.0, sel_fill);
+                        body.rect_filled(cr, 0.0, sel_fill);
                     } else if rules.iter().any(|x| x.covers(row, col)) {
-                        painter.rect_filled(cr, 0.0, rule_fill);
+                        body.rect_filled(cr, 0.0, rule_fill);
                     }
                     if cursor == Some((col, row)) {
-                        painter.rect_stroke(cr.shrink(1.0), 0.0, Stroke::new(2.0_f32, Color32::from_rgb(30, 120, 60)));
+                        body.rect_stroke(cr.shrink(1.0), 0.0, Stroke::new(2.0_f32, Color32::from_rgb(30, 120, 60)));
                     }
                     if let Some(cell) = grid.get(row, col) {
                         let color = if cell.formula { visuals.weak_text_color() } else { visuals.text_color() };
-                        painter.with_clip_rect(cr.shrink(1.0)).text(
+                        body.with_clip_rect(cr.shrink(1.0)).text(
                             pos2(x + 4.0, y + ROW_H / 2.0),
                             Align2::LEFT_CENTER,
                             cell_display(cell),
@@ -1200,9 +1290,9 @@ impl App {
                             color,
                         );
                     }
-                    painter.vline(cr.max.x, cr.y_range(), line);
+                    body.vline(cr.max.x, cr.y_range(), line);
                 }
-                painter.hline(vis.x_range(), y + ROW_H, line);
+                body.hline(vis.x_range(), y + ROW_H, line);
             }
 
             // Закреплённая строка с буквами колонок: своя заливка и крупные буквы — колонку видно сразу.
@@ -1211,12 +1301,12 @@ impl App {
                 let col = c as u32;
                 let cr = Rect::from_min_size(pos2(o.x + ROWNUM_W + xs[c], vis.min.y), vec2(widths[c], HEAD_H));
                 if cursor.is_some_and(|(cc, _)| cc == col) {
-                    painter.rect_filled(cr, 0.0, cur_fill);
+                    head.rect_filled(cr, 0.0, cur_fill);
                 } else if sel.is_some_and(|(sc, _, _)| sc == col) {
-                    painter.rect_filled(cr, 0.0, sel_fill);
+                    head.rect_filled(cr, 0.0, sel_fill);
                 }
-                painter.text(cr.center(), Align2::CENTER_CENTER, col_name(col), head_font.clone(), head_text);
-                painter.vline(cr.max.x, cr.y_range(), head_line);
+                head.text(cr.center(), Align2::CENTER_CENTER, col_name(col), head_font.clone(), head_text);
+                head.vline(cr.max.x, cr.y_range(), head_line);
             }
             painter.hline(vis.x_range(), vis.min.y + HEAD_H, head_line);
 
@@ -1360,7 +1450,7 @@ impl App {
         };
         ui.heading(format!("Правила замены ({})", doc.profile.rules.len()));
         if self.docs.len() > 1 {
-            ui.label(RichText::new(format!("Файл: {}", file_name(&doc.path))).strong());
+            ui.add(egui::Label::new(RichText::new(format!("Файл: {}", file_name(&doc.path))).strong()).truncate());
         }
         ui.label(RichText::new("Синим подсвечены ячейки под правилами. Формулы не меняются — они пересчитаются от фейков.").weak());
         ui.separator();
@@ -1428,48 +1518,90 @@ impl App {
                 }
                 let shown = frame.show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.strong(format!("{}!{}", r.sheet, r.range_text()));
-                        // Только название, которое прошло проверку предпросмотра (не ФИО, не номер, не значение из данных).
-                        let checked = |t: &String| pv.is_some_and(|p| p.head.as_ref() == Some(t));
-                        if let Some(h) = heads.get(&(r.sheet.clone(), r.col)).filter(|(hr, t)| *hr < r.row_from && checked(t)) {
-                            ui.label(format!("«{}»", h.1)).on_hover_text("Название колонки — из шапки таблицы");
+                    // Шапка карточки: адрес и название колонки, число ячеек, кнопки. Широкая панель — всё в одну
+                    // строку; узкая — число ячеек и кнопки переносятся на свои строки, а длинное обрезается «…»
+                    // (полный текст — при наведении): ничего не наезжает друг на друга и не уходит за край.
+                    let body = egui::TextStyle::Body;
+                    let sp = ui.spacing().item_spacing.x;
+                    let title = format!("{}!{}", r.sheet, r.range_text());
+                    // Только название, которое прошло проверку предпросмотра (не ФИО, не номер, не значение из данных).
+                    let checked = |t: &String| pv.is_some_and(|p| p.head.as_ref() == Some(t));
+                    let name = heads.get(&(r.sheet.clone(), r.col)).filter(|(hr, t)| *hr < r.row_from && checked(t)).map(|h| format!("«{}»", h.1));
+                    let count = pv.map(|p| {
+                        let part = sheet_rows.get(&r.sheet).is_some_and(|&n| n > GRID_ROWS);
+                        if part { format!("≈ {} ячеек в первых {GRID_ROWS} строках", p.cells) } else { format!("≈ {} ячеек", p.cells) }
+                    });
+                    let title_w = text_width(ui, &title, body.clone()) + name.as_ref().map_or(0.0, |n| sp + text_width(ui, n, body.clone()));
+                    let count_w = match &count {
+                        Some(c) => sp + text_width(ui, c, body.clone()),
+                        None if counting => sp + ui.spacing().interact_size.y,
+                        None => 0.0,
+                    };
+                    let buttons_w = RULE_BTNS.iter().map(|(_, t)| button_width(ui, t)).sum::<f32>() + 2.0 * sp;
+                    let avail = ui.available_width();
+                    let one_line = title_w + count_w + sp + buttons_w <= avail;
+                    let buttons_up = title_w + sp + buttons_w <= avail;
+                    let rtl = egui::Layout::right_to_left(egui::Align::Center);
+                    let name_hint = "Название колонки — из шапки таблицы";
+                    let count_hint = "Предпросмотр считается по строкам, видным в окне. Точное число замен и проверка — в отчёте после обезличивания";
+                    let mut btn = None;
+                    let count_ui = |ui: &mut egui::Ui| match &count {
+                        Some(text) => {
+                            ui.add(egui::Label::new(RichText::new(text).weak()).truncate()).on_hover_text(count_hint);
                         }
-                        match pv {
-                            Some(p) => {
-                                let part = sheet_rows.get(&r.sheet).is_some_and(|&n| n > GRID_ROWS);
-                                let text = if part { format!("≈ {} ячеек в первых {GRID_ROWS} строках", p.cells) } else { format!("≈ {} ячеек", p.cells) };
-                                ui.label(RichText::new(text).weak()).on_hover_text(
-                                    "Предпросмотр считается по строкам, видным в окне. Точное число замен и проверка — в отчёте после обезличивания",
-                                );
-                            }
-                            None if counting => {
-                                ui.spinner();
-                            }
-                            None => {}
+                        None if counting => {
+                            ui.spinner();
                         }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Удалить").clicked() {
-                                remove = Some(i);
+                        None => {}
+                    };
+                    if one_line {
+                        ui.horizontal(|ui| {
+                            ui.strong(&title);
+                            if let Some(n) = &name {
+                                ui.label(n).on_hover_text(name_hint);
                             }
-                            if ui.small_button("Показать").clicked() {
-                                goto = Some(i);
-                            }
-                            if ui
-                                .add_enabled(cur_sel.is_some(), egui::Button::new("Взять выделение").small())
-                                .on_hover_text("Перенести правило на диапазон, выделенный в таблице")
-                                .clicked()
-                            {
-                                take = Some(i);
+                            count_ui(ui);
+                            ui.with_layout(rtl, |ui| btn = rule_buttons(ui, true, cur_sel.is_some()));
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            let w = if buttons_up { ui.available_width() - buttons_w - sp } else { ui.available_width() };
+                            within(ui, w, |ui| {
+                                ui.add(egui::Label::new(RichText::new(&title).strong()).truncate());
+                                if let Some(n) = &name {
+                                    ui.add(egui::Label::new(n.as_str()).truncate()).on_hover_text(name_hint);
+                                }
+                            });
+                            if buttons_up {
+                                ui.with_layout(rtl, |ui| btn = rule_buttons(ui, true, cur_sel.is_some()));
                             }
                         });
-                    });
-                    // С переносом: в узкой панели «Связь:» уходит на следующую строку, а не за край.
+                        count_ui(ui);
+                        if !buttons_up {
+                            if buttons_w <= ui.available_width() {
+                                ui.horizontal(|ui| ui.with_layout(rtl, |ui| btn = rule_buttons(ui, true, cur_sel.is_some())));
+                            } else {
+                                ui.horizontal_wrapped(|ui| btn = rule_buttons(ui, false, cur_sel.is_some()));
+                            }
+                        }
+                    }
+                    match btn {
+                        Some(RuleBtn::Take) => take = Some(i),
+                        Some(RuleBtn::Show) => goto = Some(i),
+                        Some(RuleBtn::Remove) => remove = Some(i),
+                        None => {}
+                    }
+                    // С переносом: в узкой панели поля уходят на следующую строку, а не за край; подпись
+                    // и её поле не разрываются.
                     ui.horizontal_wrapped(|ui| {
+                        let bp = ui.spacing().button_padding.x;
+                        let edit_pad = 2.0 * 4.0; // поля TextEdit по краям
                         ui.label("Строки с");
                         changed |= ui.add(egui::DragValue::new(&mut r.row_from).range(1..=1_048_576)).changed();
-                        ui.label("по");
                         let from = r.row_from;
+                        let to_w = r.row_to.map_or(0.0, |to| sp + (text_width(ui, &to.to_string(), body.clone()) + 2.0 * bp).max(ui.spacing().interact_size.x));
+                        keep_together(ui, text_width(ui, "по", body.clone()) + to_w);
+                        ui.label("по");
                         if let Some(to) = &mut r.row_to {
                             changed |= ui.add(egui::DragValue::new(to).range(from..=1_048_576)).changed();
                         }
@@ -1478,6 +1610,7 @@ impl App {
                             r.row_to = if to_end { None } else { Some(max_rows.get(&r.sheet).copied().unwrap_or(from).max(from)) };
                             changed = true;
                         }
+                        keep_together(ui, text_width(ui, "колонка", body.clone()) + sp + 36.0 + edit_pad);
                         ui.label("колонка");
                         let mut col = col_name(r.col);
                         if ui.add(egui::TextEdit::singleline(&mut col).desired_width(36.0)).changed() {
@@ -1488,13 +1621,21 @@ impl App {
                         }
                         // «Очистить» и «Не менять» фейков не дают — связь им не нужна.
                         if !matches!(r.kind, Kind::Clear | Kind::Keep) {
+                            let others: Vec<&String> = used_links.iter().filter(|l| link_name(l) != r.link_name()).collect();
+                            let pick = !others.is_empty() || !r.link.trim().is_empty();
+                            let s = ui.spacing();
+                            let pick_w = if pick { sp + s.icon_spacing + s.icon_width + 2.0 * bp } else { 0.0 };
+                            // Поле связи сжимается до 50 пикселей, дальше — вместе с подписью на новую строку.
+                            let (link_min, link_max) = (50.0, 80.0);
+                            let label_w = text_width(ui, "Связь:", body.clone()) + sp;
+                            keep_together(ui, label_w + link_min + edit_pad + pick_w);
                             ui.label("Связь:").on_hover_text(LINK_HINT);
+                            let link_w = (ui.available_size_before_wrap().x - edit_pad - pick_w).clamp(link_min, link_max);
                             changed |= ui
-                                .add(egui::TextEdit::singleline(&mut r.link).id(egui::Id::new(("link", i))).desired_width(80.0).hint_text("общая"))
+                                .add(egui::TextEdit::singleline(&mut r.link).id(egui::Id::new(("link", i))).desired_width(link_w).hint_text("общая"))
                                 .on_hover_text(LINK_HINT)
                                 .changed();
-                            let others: Vec<&String> = used_links.iter().filter(|l| link_name(l) != r.link_name()).collect();
-                            if !others.is_empty() || !r.link.trim().is_empty() {
+                            if pick {
                                 egui::ComboBox::from_id_salt(("link_pick", i)).selected_text("").width(14.0).show_ui(ui, |ui| {
                                     if !r.link.trim().is_empty() && ui.selectable_label(false, "общая (пусто)").clicked() {
                                         r.link.clear();
@@ -1510,9 +1651,13 @@ impl App {
                             }
                         }
                     });
-                    ui.horizontal(|ui| {
+                    // Тоже с переносом: «с ID» и «подпись:» уходят на новую строку, список типов сужается.
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Тип правила:");
-                        egui::ComboBox::from_id_salt(("kind", i)).selected_text(r.kind.title()).width(230.0).show_ui(ui, |ui| {
+                        // Список сам на новую строку не переносится: уже 120 пикселей — переносим заранее.
+                        keep_together(ui, 120.0);
+                        let kind_w = ui.available_size_before_wrap().x.clamp(120.0, 230.0);
+                        egui::ComboBox::from_id_salt(("kind", i)).selected_text(r.kind.title()).width(kind_w).truncate().show_ui(ui, |ui| {
                             for k in Kind::ALL {
                                 if ui.selectable_value(&mut r.kind, k, k.title()).on_hover_text(k.hint()).changed() {
                                     r.with_id = k.default_with_id();
@@ -1525,6 +1670,7 @@ impl App {
                             changed |= ui.checkbox(&mut r.with_id, "с ID").on_hover_text("Добавлять ID для прослеживаемости").changed();
                         }
                         if r.kind == Kind::Text {
+                            keep_together(ui, text_width(ui, "подпись:", body.clone()) + sp + 60.0);
                             ui.label("подпись:");
                             changed |= ui
                                 .add(egui::TextEdit::singleline(&mut r.label).desired_width(110.0).hint_text("из заголовка"))
@@ -1532,9 +1678,10 @@ impl App {
                                 .changed();
                         }
                     });
+                    // Примеры замен — одной строкой с «…», полностью — при наведении.
                     if let Some(p) = pv {
                         for (o, f) in &p.samples {
-                            ui.label(RichText::new(format!("{o}  →  {f}")).small());
+                            ui.add(egui::Label::new(RichText::new(format!("{o}  →  {f}")).small()).truncate());
                         }
                         if p.below > 0 {
                             ui.label(
@@ -1548,7 +1695,7 @@ impl App {
                             );
                         }
                     }
-                    ui.label(RichText::new(format!("Пример: {}", r.kind.hint())).small().weak().italics());
+                    ui.add(egui::Label::new(RichText::new(format!("Пример: {}", r.kind.hint())).small().weak().italics()).truncate());
                     for w in pv.map_or(&[][..], |p| &p.risks[..]) {
                         ui.label(RichText::new(format!("Внимание: {w}")).small().color(Color32::from_rgb(220, 80, 60)));
                     }
@@ -1779,8 +1926,10 @@ impl App {
         }
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.top_bar(ui));
         egui::TopBottomPanel::bottom("bottom").resizable(true).default_height(230.0).show(ctx, |ui| self.bottom_panel(ui));
-        egui::SidePanel::left("sheets").resizable(true).default_width(210.0).show(ctx, |ui| self.sheets_panel(ui));
-        egui::SidePanel::right("rules").resizable(true).min_width(500.0).default_width(580.0).show(ctx, |ui| self.rules_panel(ui));
+        // Панели сужаются до своего минимума: длинные имена и подписи внутри обрезаются «…» и переносятся,
+        // а не раздвигают панель (раньше она отскакивала к ширине самого длинного имени).
+        egui::SidePanel::left("sheets").resizable(true).min_width(LEFT_MIN_W).default_width(210.0).show(ctx, |ui| self.sheets_panel(ui));
+        egui::SidePanel::right("rules").resizable(true).min_width(RULES_MIN_W).default_width(580.0).show(ctx, |ui| self.rules_panel(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.grid_panel(ui));
         // Не пересчитываем, пока кнопка мыши зажата (тянут поле со строками) — файлы читаются целиком.
         // Правка во время подсчёта — пересчёт сразу после него.
@@ -2342,5 +2491,275 @@ mod tests {
         }
         let names: Vec<String> = app.docs.iter().map(|d| file_name(&d.path)).collect();
         assert_eq!(names, ["a.xlsx", "b.xlsx", "c.xlsx"], "{}", app.status);
+    }
+
+    // ------------------------------------------------------------ раскладка окна (0.6.0)
+
+    /// Кадр окна заданного размера; возвращает нарисованное — каждую фигуру с её областью обрезки.
+    fn frame_sized(s: &mut Screen, app: &mut App, size: egui::Vec2, events: Vec<Event>) -> Vec<(Rect, egui::Shape)> {
+        fn walk(clip: Rect, shape: egui::Shape, out: &mut Vec<(Rect, egui::Shape)>) {
+            match shape {
+                egui::Shape::Vec(v) => v.into_iter().for_each(|s| walk(clip, s, out)),
+                s => out.push((clip, s)),
+            }
+        }
+        s.t += 0.05;
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), size)), time: Some(s.t), events, ..Default::default() };
+        let mut out = Vec::new();
+        for c in s.ctx.run(input, |ctx| app.ui(ctx)).shapes {
+            walk(c.clip_rect, c.shape, &mut out);
+        }
+        out
+    }
+
+    fn panel_rect(s: &Screen, id: &str) -> Rect {
+        egui::containers::panel::PanelState::load(&s.ctx, egui::Id::new(id)).expect("панель не нарисована").rect
+    }
+
+    /// Ширина панели — как будто её уже перетащили (так панель хранит ширину между кадрами).
+    fn set_panel_width(s: &Screen, id: &str, w: f32) {
+        let state = egui::containers::panel::PanelState { rect: Rect::from_min_size(pos2(0.0, 0.0), vec2(w, 100.0)) };
+        s.ctx.data_mut(|d| d.insert_persisted(egui::Id::new(id), state));
+    }
+
+    /// Видимые надписи, нарисованные в прямоугольнике (по их области обрезки): полный текст, где нарисован,
+    /// обрезан ли «…».
+    fn texts_in(shapes: &[(Rect, egui::Shape)], area: Rect) -> Vec<(String, Rect, bool)> {
+        shapes
+            .iter()
+            .filter_map(|(clip, s)| match s {
+                egui::Shape::Text(t) => {
+                    // По буквам, а не по `galley.rect`: в строке с переносом надпись начинается от левого края
+                    // строки с отступом, и её `rect` накрывал бы соседей слева.
+                    let mut r = Rect::NOTHING;
+                    for row in &t.galley.rows {
+                        for g in row.glyphs.iter().filter(|g| !g.chr.is_whitespace()) {
+                            r = r.union(Rect::from_x_y_ranges(g.pos.x..=g.pos.x + g.advance_width, row.rect.y_range()));
+                        }
+                    }
+                    let r = r.translate(t.pos.to_vec2());
+                    let shown = area.expand(0.5).contains_rect(*clip) && r.intersects(*clip);
+                    shown.then(|| (t.galley.text().to_string(), r, t.galley.elided))
+                }
+                _ => None,
+            })
+            .filter(|(t, _, _)| !t.trim().is_empty())
+            .collect()
+    }
+
+    /// В панели ничего не уходит за край по ширине: каждая фигура помещается в свою область обрезки
+    /// (вылезающее за край — обрезано, то есть не видно), и никакие две надписи не наезжают друг на друга.
+    fn assert_fits(shapes: &[(Rect, egui::Shape)], panel: Rect, what: &str) {
+        for (clip, s) in shapes {
+            if clip.min.x < panel.min.x - 0.5 || clip.max.x > panel.max.x + 0.5 {
+                continue;
+            }
+            let b = s.visual_bounding_rect();
+            if !b.is_finite() || !b.is_positive() {
+                continue;
+            }
+            let label = match s {
+                egui::Shape::Text(t) => t.galley.text().to_string(),
+                _ => format!("{s:?}").chars().take(80).collect(),
+            };
+            assert!(b.min.x >= clip.min.x - 1.5 && b.max.x <= clip.max.x + 1.5, "{what}: «{label}» {b:?} обрезано краем {clip:?}");
+        }
+        let texts = texts_in(shapes, panel);
+        for (k, (ta, ra, _)) in texts.iter().enumerate() {
+            for (tb, rb, _) in &texts[k + 1..] {
+                let i = ra.intersect(*rb);
+                assert!(!(i.width() > 1.0 && i.height() > 1.0), "{what}: «{ta}» {ra:?} наезжает на «{tb}» {rb:?}");
+            }
+        }
+    }
+
+    /// Ждёт предпросмотр правил (считается в фоне): с ним на карточках число ячеек и примеры замен.
+    fn wait_preview(s: &mut Screen, app: &mut App, size: egui::Vec2) {
+        app.preview_dirty = true;
+        let t0 = Instant::now();
+        loop {
+            frame_sized(s, app, size, vec![]);
+            let ready = app.preview_job.is_none() && !app.preview_dirty && app.preview.get(app.cur).is_some_and(|p| !p.is_empty());
+            if ready && app.preview_rules.get(app.cur) == Some(&app.docs[app.cur].profile.rules) {
+                break;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(60), "предпросмотр не посчитан: {}", app.status);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        frame_sized(s, app, size, vec![]);
+    }
+
+    /// Таблица, прокрученная вправо и вниз: синие ячейки проглядывали слева от номеров строк и под последней
+    /// строкой (поле обрезки области прокрутки шире видимой части на 3 пикселя). Теперь ячейки обрезаются
+    /// строго правее номеров строк и ниже букв колонок, а колонка номеров — сплошная на всю высоту.
+    #[test]
+    fn grid_frozen_header_hides_scrolled_cells() {
+        let (mut app, mut s) = sample_app();
+        // Таблица уже, чем её колонки: есть куда прокручивать вправо.
+        let size = vec2(1200.0, 800.0);
+        let sheet = app.sheet_name(0);
+        let ncols = app.docs[0].widths[&0].len() as u32;
+        assert!(ncols > 1);
+        for c in 0..ncols {
+            app.docs[0].profile.rules.push(Rule::new(&sheet, c, 1, None, Kind::Text));
+        }
+        let nrows = app.docs[0].grids[&0].max_row;
+        app.scroll_to = Some((nrows, ncols - 1));
+        // Несколько кадров: прямоугольник таблицы (`read_response`) — из кадра, а прокрутка меняет его.
+        for _ in 0..3 {
+            frame_sized(&mut s, &mut app, size, vec![]);
+        }
+        let shapes = frame_sized(&mut s, &mut app, size, vec![]);
+        assert!(app.last_vp.min.x > ROWNUM_W, "таблица не прокрутилась вправо: {:?}", app.last_vp);
+        let rect = s.ctx.read_response(app.grid_id.unwrap()).unwrap().rect;
+        let vis = Rect::from_min_size(rect.min + app.last_vp.min.to_vec2(), app.last_vp.size());
+        let body = Rect::from_min_max(vis.min + vec2(ROWNUM_W, HEAD_H), vis.max);
+        let eps = 0.01;
+        // Всё, что рисует таблица, — внутри видимой части, без 3-пиксельного запаса.
+        let mut seen = 0;
+        for (clip, sh) in &shapes {
+            if vis.expand(3.5).contains_rect(*clip) && clip.intersects(vis) {
+                seen += 1;
+                assert!(vis.expand(eps).contains_rect(*clip), "{clip:?} шире видимой части {vis:?}: {sh:?}");
+            }
+        }
+        assert!(seen > 50, "таблица не нарисована: {seen}");
+        // Узкая середина окна: строка «Диапазон:» переносится, а не раздвигает таблицу под панель правил.
+        let rules = panel_rect(&s, "rules");
+        assert!(vis.max.x <= rules.min.x + 0.5, "таблица {vis:?} уходит под панель правил {rules:?}");
+        // Синие ячейки — только правее номеров строк и ниже букв колонок; одна из них уходит под номера строк.
+        let rule_fill = Color32::from_rgba_unmultiplied(70, 130, 255, 60);
+        let mut under_nums = false;
+        let mut blue = 0;
+        for (clip, sh) in &shapes {
+            if let egui::Shape::Rect(r) = sh {
+                if r.fill == rule_fill {
+                    blue += 1;
+                    assert!(body.expand(eps).contains_rect(*clip), "синяя ячейка {:?} обрезана по {clip:?}, а не по {body:?}", r.rect);
+                    under_nums |= r.rect.min.x < body.min.x;
+                }
+            }
+        }
+        assert!(blue > 0, "нет синих ячеек");
+        assert!(under_nums, "нет ячейки под колонкой номеров — проверка ничего не проверила");
+        // Колонка номеров строк — сплошная заливка от букв колонок до низа видимой части (и под последней строкой).
+        let nums = shapes.iter().any(|(_, sh)| match sh {
+            egui::Shape::Rect(r) => {
+                r.fill.a() == 255
+                    && (r.rect.min.x - vis.min.x).abs() < eps
+                    && (r.rect.width() - ROWNUM_W).abs() < eps
+                    && (r.rect.min.y - (vis.min.y + HEAD_H)).abs() < eps
+                    && r.rect.max.y >= vis.max.y - eps
+            }
+            _ => false,
+        });
+        assert!(nums, "колонка номеров строк не закрашена на всю высоту");
+    }
+
+    /// Правая панель сужается до своего минимума, и карточки правил подстраиваются: число ячеек и кнопки
+    /// переносятся на свои строки, а не наезжают друг на друга; «Связь:», примеры и тип правила не уходят
+    /// за край. В широкой панели шапка карточки — по-прежнему одной строкой.
+    #[test]
+    fn rule_cards_fit_narrow_panel() {
+        let (mut app, mut s) = sample_app();
+        let size = vec2(1500.0, 920.0);
+        let sheet = app.sheet_name(0);
+        let mut text = Rule::new(&sheet, 2, 2, None, Kind::Text);
+        text.label = "Налог".into();
+        app.docs[0].profile.rules.push(Rule::new(&sheet, 1, 2, None, Kind::Address));
+        app.docs[0].profile.rules.push(text);
+        app.docs[0].profile.rules.push(Rule::new(&sheet, 0, 2, Some(5), Kind::FullName));
+        app.docs[0].profile.rules[0].link = "контрагент".into();
+        // Выделение — чтобы «Взять выделение» было доступно.
+        let p = s.cell(&app, 1, 3);
+        s.click(&mut app, p);
+
+        // Широкая панель: шапка одной строкой, число ячеек — на одной линии с кнопками.
+        wait_preview(&mut s, &mut app, size);
+        let shapes = frame_sized(&mut s, &mut app, size, vec![]);
+        let panel = panel_rect(&s, "rules");
+        assert!((panel.width() - 580.0).abs() < 1.0, "{panel:?}");
+        assert_fits(&shapes, panel, "широкая панель");
+        let texts = texts_in(&shapes, panel);
+        let find = |texts: &[(String, Rect, bool)], what: &str| texts.iter().find(|(t, _, _)| t.contains(what)).unwrap_or_else(|| panic!("нет «{what}»: {texts:?}")).1;
+        let (count, del) = (find(&texts, "ячеек"), find(&texts, "Удалить"));
+        assert!((count.center().y - del.center().y).abs() < 2.0, "в широкой панели шапка не в одну строку: {count:?} {del:?}");
+
+        // Самая узкая панель.
+        for w in [RULES_MIN_W, 400.0] {
+            set_panel_width(&s, "rules", w);
+            frame_sized(&mut s, &mut app, size, vec![]);
+            let shapes = frame_sized(&mut s, &mut app, size, vec![]);
+            let panel = panel_rect(&s, "rules");
+            assert!(panel.width() <= w + 0.5, "панель раздвинулась содержимым до {} (задано {w})", panel.width());
+            assert!(panel.max.x <= size.x + 0.5, "панель за краем окна: {panel:?}");
+            assert_fits(&shapes, panel, &format!("панель {w}"));
+            let texts = texts_in(&shapes, panel);
+            for what in ["ячеек", "Удалить", "Показать", "Взять выделение", "Связь:", "Тип правила:", "подпись:", "Пример:"] {
+                let r = find(&texts, what);
+                assert!(r.max.x <= panel.max.x + 0.5, "панель {w}: «{what}» за краем: {r:?}");
+            }
+            let link = s.ctx.read_response(egui::Id::new(("link", 0usize))).expect("нет поля «Связь:»").rect;
+            assert!(link.min.x >= panel.min.x && link.max.x <= panel.max.x, "панель {w}: поле «Связь:» {link:?} за краем {panel:?}");
+            assert!(link.width() >= 50.0, "поле «Связь:» сжалось до {}", link.width());
+        }
+        // Узкая: число ячеек ушло со строки адреса — ниже него.
+        set_panel_width(&s, "rules", RULES_MIN_W);
+        frame_sized(&mut s, &mut app, size, vec![]);
+        let texts = texts_in(&frame_sized(&mut s, &mut app, size, vec![]), panel_rect(&s, "rules"));
+        let title = find(&texts, &format!("{sheet}!"));
+        let count = find(&texts, "ячеек");
+        assert!(count.min.y >= title.max.y - 1.0, "число ячеек не перенесено под адрес: {title:?} {count:?}");
+    }
+
+    /// Левая панель с длинным именем файла сужалась только до ширины этого имени: при перетаскивании — чёрная
+    /// полоса, а после — отскок назад. Теперь имена обрезаются «…» (полностью — в подсказке), и панель
+    /// остаётся такой, какой её оставили.
+    #[test]
+    fn left_panel_narrows_with_long_file_name() {
+        let d = temp_dir("long_name");
+        let long = d.join("Продажи_и_возвраты_по_всем_филиалам_и_складам_2019-2026_полная_выгрузка_из_1С.xlsx");
+        std::fs::copy(sample(), &long).unwrap();
+        std::fs::copy(sample(), d.join("б.xlsx")).unwrap();
+        let mut app = App::blank();
+        app.open_files(vec![long, d.join("б.xlsx")], true);
+        assert_eq!(app.docs.len(), 2, "{}", app.status);
+        let size = vec2(1500.0, 920.0);
+        let mut s = Screen::new();
+        frame_sized(&mut s, &mut app, size, vec![]);
+        frame_sized(&mut s, &mut app, size, vec![]);
+        let start = panel_rect(&s, "sheets");
+        assert!((start.width() - 210.0).abs() < 1.0, "длинное имя раздвинуло панель: {start:?}");
+
+        // Тянем правый край панели мышью до 185 пикселей и отпускаем.
+        let y = 400.0;
+        let edge = pos2(start.max.x, y);
+        let target = pos2(185.0, y);
+        let btn = |p, pressed| Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        frame_sized(&mut s, &mut app, size, vec![Event::PointerMoved(edge)]);
+        frame_sized(&mut s, &mut app, size, vec![btn(edge, true)]);
+        for x in [start.max.x - 10.0, 195.0, target.x] {
+            frame_sized(&mut s, &mut app, size, vec![Event::PointerMoved(pos2(x, y))]);
+        }
+        frame_sized(&mut s, &mut app, size, vec![btn(target, false)]);
+        for _ in 0..3 {
+            frame_sized(&mut s, &mut app, size, vec![]);
+        }
+        let shapes = frame_sized(&mut s, &mut app, size, vec![]);
+        let panel = panel_rect(&s, "sheets");
+        assert!((panel.width() - 185.0).abs() < 1.0, "панель отскочила: ширина {} вместо 185", panel.width());
+        assert_fits(&shapes, panel, "левая панель");
+        let texts = texts_in(&shapes, panel);
+        let name = texts.iter().find(|(t, _, _)| t.starts_with("Продажи_и_")).unwrap_or_else(|| panic!("имени файла нет: {texts:?}"));
+        assert!(name.2, "длинное имя не обрезано «…»: {name:?}");
+        assert!(texts.iter().filter(|(t, _, _)| t == "убрать").count() == 2, "кнопки «убрать» не видны: {texts:?}");
+
+        // До минимума (180) и не уже.
+        set_panel_width(&s, "sheets", 120.0);
+        frame_sized(&mut s, &mut app, size, vec![]);
+        let shapes = frame_sized(&mut s, &mut app, size, vec![]);
+        let panel = panel_rect(&s, "sheets");
+        assert!((panel.width() - LEFT_MIN_W).abs() < 1.0, "минимум левой панели — {}, а не {LEFT_MIN_W}", panel.width());
+        assert_fits(&shapes, panel, "левая панель на минимуме");
     }
 }
