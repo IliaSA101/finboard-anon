@@ -850,7 +850,12 @@ impl App {
                 }
                 if let Some(p) = dlg.save_file() {
                     let pr = Profile { rules: self.docs[self.cur].profile.rules.clone(), settings: self.settings.clone() };
+                    // Профиль пересылают: имена листов и подписи, похожие на данные, — в журнал (маской).
+                    let files: Vec<(PathBuf, Vec<Rule>)> = self.docs.iter().map(|d| (d.path.clone(), d.profile.rules.clone())).collect();
+                    let risks = finboard_anon::anon::profile_risks(&pr, &files, self.key_in.as_deref()).unwrap_or_default();
+                    self.log.extend(risks.iter().map(|w| format!("Внимание: {w}")));
                     match pr.save(&p) {
+                        Ok(()) if !risks.is_empty() => self.set_status(format!("Профиль сохранён: {} — в нём есть похожее на данные, см. журнал", p.display()), true),
                         Ok(()) => self.set_status(format!("Профиль сохранён: {}", p.display()), false),
                         Err(e) => self.set_status(format!("{e:#}"), true),
                     }
@@ -1425,7 +1430,9 @@ impl App {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.strong(format!("{}!{}", r.sheet, r.range_text()));
-                        if let Some(h) = heads.get(&(r.sheet.clone(), r.col)).filter(|(hr, _)| *hr < r.row_from) {
+                        // Только название, которое прошло проверку предпросмотра (не ФИО, не номер, не значение из данных).
+                        let checked = |t: &String| pv.is_some_and(|p| p.head.as_ref() == Some(t));
+                        if let Some(h) = heads.get(&(r.sheet.clone(), r.col)).filter(|(hr, t)| *hr < r.row_from && checked(t)) {
                             ui.label(format!("«{}»", h.1)).on_hover_text("Название колонки — из шапки таблицы");
                         }
                         match pv {
@@ -1542,6 +1549,9 @@ impl App {
                         }
                     }
                     ui.label(RichText::new(format!("Пример: {}", r.kind.hint())).small().weak().italics());
+                    for w in pv.map_or(&[][..], |p| &p.risks[..]) {
+                        ui.label(RichText::new(format!("Внимание: {w}")).small().color(Color32::from_rgb(220, 80, 60)));
+                    }
                 });
                 if scroll && focus == Some(i) {
                     shown.response.scroll_to_me(Some(egui::Align::Center));
