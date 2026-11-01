@@ -285,6 +285,30 @@ pub fn split_company(s: &str) -> (String, String, String) {
     (String::new(), t.to_string(), String::new())
 }
 
+/// Слова полной организационно-правовой формы («Общество с ограниченной ответственностью», «Акционерное общество»…).
+const FORM_WORDS: &[&str] = &[
+    "общество", "с", "ограниченной", "ответственностью", "акционерное", "публичное", "непубличное", "закрытое", "открытое",
+    "индивидуальный", "предприниматель", "государственное", "муниципальное", "федеральное", "унитарное", "предприятие",
+    "некоммерческая", "автономная", "организация", "товарищество",
+];
+
+/// Снаружи названия в результате остаются только форма (ООО, АО, ИП, «Общество с ограниченной ответственностью»)
+/// и знаки: «(М) ООО «» → «ООО «», «» (Москва)» → «»». Прочие слова и номера рядом с названием — тоже данные
+/// заказчика (пометки, города, филиалы): они не переносятся в фейк.
+fn form_only(part: &str) -> String {
+    let form = |w: &str| {
+        let letters = w.trim_matches(|c: char| !c.is_alphabetic());
+        LEGAL_FORMS.contains(&letters.to_uppercase().as_str()) || FORM_WORDS.contains(&letters.to_lowercase().as_str())
+    };
+    let kept: Vec<&str> = part.split_whitespace().filter(|w| !w.chars().any(char::is_alphanumeric) || form(w)).collect();
+    if kept.is_empty() {
+        return String::new();
+    }
+    let lead = if part.starts_with(char::is_whitespace) { " " } else { "" };
+    let tail = if part.ends_with(char::is_whitespace) { " " } else { "" };
+    format!("{lead}{}{tail}", kept.join(" "))
+}
+
 /// Ключ организации: название без формы и кавычек, без регистра.
 pub fn company_key(s: &str) -> String {
     norm_text(&split_company(strip_id_suffix(s)).1)
@@ -1269,6 +1293,7 @@ impl Faker {
     fn fake_company(&mut self, orig: &str, with_id: bool) -> String {
         let (pre, name, post) = split_company(strip_id_suffix(orig));
         let key = norm_text(&name);
+        let (pre, post) = (form_only(&pre), form_only(&post));
         let s = if is_ip(&pre, &post) {
             // ИП — это человек: то же фейковое ФИО, что и в колонке ФИО.
             let p = self.fake_person(&name, false);
@@ -1695,6 +1720,27 @@ mod tests {
         let mut f = faker();
         let c = f.fake(&rule(Kind::Company), "ООО «Ромашка»", false);
         assert!(c.starts_with("ООО «") && c.ends_with("(ID 1)"), "{c}");
+    }
+
+    /// «(М) ООО "Восход"» → «(М) ООО "Прогресс"»: пометка перед формой (и город, филиал после кавычек)
+    /// переносилась в фейк как есть. Снаружи названия остаются только форма и знаки.
+    #[test]
+    fn company_drops_words_outside_name() {
+        let mut f = faker();
+        let r = rule(Kind::Company);
+        for (orig, starts, ends) in [
+            ("(М) ООО \"Восход\"", "ООО \"", "\" (ID 1)"),
+            ("Филиал №5 ООО «Восход» (Москва)", "ООО «", "» (ID 1)"),
+            ("Общество с ограниченной ответственностью «Восход» г. Тверь", "Общество с ограниченной ответственностью «", "» (ID 1)"),
+            ("Склад \"Восход\"", "\"", "\" (ID 1)"),
+            ("Восход, ООО", "", ", ООО (ID 1)"),
+        ] {
+            let c = f.fake(&r, orig, false);
+            assert!(c.starts_with(starts) && c.ends_with(ends), "{orig} → {c}");
+            for w in ["(М)", "Филиал", "№5", "Москва", "Тверь", "Склад", "Восход"] {
+                assert!(!c.contains(w), "{orig} → {c}: осталось «{w}»");
+            }
+        }
     }
 
     #[test]

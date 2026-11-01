@@ -1,9 +1,12 @@
 //! Чтение структуры xlsx: листы, общие строки, значения ячеек.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use quick_xml::events::{BytesStart, Event};
@@ -37,11 +40,65 @@ pub fn read_part(zip: &mut Zip, name: &str) -> Result<Option<Vec<u8>>> {
 }
 
 /// Часть архива потоком: лист в сотни мегабайт не читается в память целиком.
-pub fn part_reader<'a>(zip: &'a mut Zip, name: &str) -> Result<Option<BufReader<zip::read::ZipFile<'a, BufReader<File>>>>> {
+pub fn part_reader<'a>(zip: &'a mut Zip, name: &str) -> Result<Option<BufReader<Counted<zip::read::ZipFile<'a, BufReader<File>>>>>> {
     match zip.by_name(name) {
-        Ok(f) => Ok(Some(BufReader::with_capacity(1 << 16, f))),
+        Ok(f) => Ok(Some(BufReader::with_capacity(1 << 16, counted(f)))),
         Err(ZipError::FileNotFound) => Ok(None),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Ход долгой обработки для окна: байт частей книги прочитано и ожидается всего (оценка).
+/// Обработка идёт в своём потоке, окно читает счётчики из своего.
+#[derive(Debug, Default)]
+pub struct Progress {
+    pub done: AtomicU64,
+    pub total: AtomicU64,
+}
+
+impl Progress {
+    /// Доля сделанного, 0..1 (оценка — не больше 0,99, пока обработка не закончилась).
+    pub fn fraction(&self) -> f32 {
+        let (d, t) = (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed));
+        if t == 0 {
+            0.0
+        } else {
+            (d as f64 / t as f64).min(0.99) as f32
+        }
+    }
+}
+
+thread_local! {
+    static TRACK: RefCell<Option<Arc<Progress>>> = const { RefCell::new(None) };
+}
+
+/// Учитывать чтение частей книги в этом потоке (`None` — перестать). Предпросмотр в другом потоке не считается.
+pub fn track_progress(p: Option<Arc<Progress>>) {
+    TRACK.with(|t| *t.borrow_mut() = p);
+}
+
+/// Счётчик хода этого потока, если его ведут.
+pub fn progress() -> Option<Arc<Progress>> {
+    TRACK.with(|t| t.borrow().clone())
+}
+
+/// Чтение части книги, которое считается в ход обработки.
+pub struct Counted<R> {
+    inner: R,
+    p: Option<Arc<Progress>>,
+}
+
+pub fn counted<R: Read>(inner: R) -> Counted<R> {
+    Counted { inner, p: progress() }
+}
+
+impl<R: Read> Read for Counted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if let Some(p) = &self.p {
+            p.done.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        Ok(n)
     }
 }
 

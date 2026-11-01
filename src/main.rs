@@ -14,8 +14,8 @@ use finboard_anon::detect;
 use finboard_anon::profile::{Kind, Outside, Profile, Rule, Settings};
 use finboard_anon::xlsx::{col_name, load_grid, parse_range, Grid, GridCell, Workbook};
 
-/// Сколько строк листа загружать для просмотра.
-const GRID_ROWS: u32 = 20_000;
+/// Сколько строк листа загружать для просмотра — столько же читает и предпросмотр правил.
+const GRID_ROWS: u32 = finboard_anon::anon::PREVIEW_ROWS;
 const GRID_COLS: u32 = 200;
 const ROW_H: f32 = 20.0;
 const HEAD_H: f32 = 28.0;
@@ -35,24 +35,36 @@ fn is_excel(p: &std::path::Path) -> bool {
     p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("xlsx") || e.eq_ignore_ascii_case("xlsm"))
 }
 
-/// Файлы Excel в папке и её подпапках — по порядку имён. Без результатов прошлых запусков («…_anon»)
-/// и временных файлов открытой книги («~$…»).
+/// Имя без расширения в нижнем регистре.
+fn stem_lower(p: &std::path::Path) -> String {
+    p.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default()
+}
+
+/// Исходник результата прошлого запуска: «отчёт_anon», «отчёт_anon_2» → «отчёт».
+fn anon_source_stem(stem: &str) -> Option<&str> {
+    let (base, rest) = stem.rsplit_once("_anon")?;
+    (rest.is_empty() || rest.strip_prefix('_').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))).then_some(base)
+}
+
+/// Файлы Excel в папке и её подпапках — по порядку имён. Без временных файлов открытой книги («~$…») и без
+/// результатов прошлых запусков: «отчёт_anon.xlsx» пропускается, только если рядом лежит его исходник «отчёт.xlsx»
+/// (файл, обезличенный заранее другим способом, — тоже исходник).
 fn excel_files_in(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let mut here = Vec::new();
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
                 stack.push(p);
-            } else if is_excel(&p) {
-                let stem = p.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-                if !stem.starts_with("~$") && !stem.ends_with("_anon") && !stem.contains("_anon_") {
-                    out.push(p);
-                }
+            } else if is_excel(&p) && !stem_lower(&p).starts_with("~$") {
+                here.push(p);
             }
         }
+        let stems: std::collections::HashSet<String> = here.iter().map(|p| stem_lower(p)).collect();
+        out.extend(here.into_iter().filter(|p| !anon_source_stem(&stem_lower(p)).is_some_and(|b| stems.contains(b))));
     }
     out.sort();
     out
@@ -1120,6 +1132,30 @@ impl App {
             .enumerate()
             .filter_map(|(i, s)| doc.grids.get(&i).map(|g| (s.name.clone(), g.max_row)))
             .collect();
+        // Строк в листе на самом деле (загружены не все) — чтобы подписать, что предпросмотр по первым строкам.
+        let sheet_rows: HashMap<String, u32> = doc
+            .wb
+            .sheets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| doc.grids.get(&i).map(|g| (s.name.clone(), if g.truncated { g.dim_rows.unwrap_or(u32::MAX) } else { g.max_row })))
+            .collect();
+        // Названия колонок из шапки загруженных листов: (лист, колонка) → (строка шапки, текст).
+        let heads: HashMap<(String, u32), (u32, String)> = doc
+            .wb
+            .sheets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| doc.grids.get(&i).map(|g| (s.name.clone(), g)))
+            .flat_map(|(name, g)| {
+                let hr = g.header_row();
+                (0..=g.max_col).filter_map(move |c| {
+                    let hr = hr?;
+                    let t = g.get(hr, c)?.text.trim().to_string();
+                    (!t.is_empty()).then(|| ((name.clone(), c), (hr, t)))
+                })
+            })
+            .collect();
         let cur_sel = self.sel.map(|s| (self.sheet_name(doc.cur_sheet), s));
         let sel_last = cur_sel.as_ref().and_then(|(sh, _)| max_rows.get(sh).copied());
         let preview_rules = self.preview_rules.get(self.cur);
@@ -1147,9 +1183,16 @@ impl App {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.strong(format!("{}!{}", r.sheet, r.range_text()));
+                        if let Some(h) = heads.get(&(r.sheet.clone(), r.col)).filter(|(hr, _)| *hr < r.row_from) {
+                            ui.label(format!("«{}»", h.1)).on_hover_text("Название колонки — из шапки таблицы");
+                        }
                         match pv {
                             Some(p) => {
-                                ui.label(RichText::new(format!("≈ {} ячеек", p.cells)).weak());
+                                let part = sheet_rows.get(&r.sheet).is_some_and(|&n| n > GRID_ROWS);
+                                let text = if part { format!("≈ {} ячеек в первых {GRID_ROWS} строках", p.cells) } else { format!("≈ {} ячеек", p.cells) };
+                                ui.label(RichText::new(text).weak()).on_hover_text(
+                                    "Предпросмотр считается по строкам, видным в окне. Точное число замен и проверка — в отчёте после обезличивания",
+                                );
                             }
                             None if counting => {
                                 ui.spinner();
@@ -1195,6 +1238,7 @@ impl App {
                         }
                     });
                     ui.horizontal(|ui| {
+                        ui.label("Тип правила:");
                         egui::ComboBox::from_id_salt(("kind", i)).selected_text(r.kind.title()).width(230.0).show_ui(ui, |ui| {
                             for k in Kind::ALL {
                                 if ui.selectable_value(&mut r.kind, k, k.title()).on_hover_text(k.hint()).changed() {
@@ -1561,16 +1605,33 @@ mod tests {
         assert_eq!(app.focus_rule, None);
     }
 
-    /// Папка: файлы Excel из всех подпапок; результаты прошлых запусков и временные файлы Excel — нет.
+    /// Папка: файлы Excel из всех подпапок; результаты прошлых запусков (рядом с исходником) и временные файлы Excel — нет.
     #[test]
     fn folder_lists_excel_files_recursively() {
         let d = temp_dir("folder");
         std::fs::create_dir_all(d.join("2024").join("март")).unwrap();
-        for f in ["Продажи.xlsx", "Продажи_anon.xlsx", "~$Продажи.xlsx", "Отчёт.XLSM", "заметки.txt", "2024/Затраты.xlsx", "2024/март/ДДС.xlsx", "2024/ДДС_anon_2.xlsx"] {
+        for f in [
+            "Продажи.xlsx",
+            "Продажи_anon.xlsx",
+            "Продажи_anon_2.xlsx",
+            "~$Продажи.xlsx",
+            "Отчёт.XLSM",
+            "заметки.txt",
+            // Обезличен заранее, исходника рядом нет — это исходник для программы (тестовые файлы клиента).
+            "Продажи2019-2026_anon.xlsx",
+            "Отчёт_anon_итог.xlsx",
+            "2024/Затраты.xlsx",
+            "2024/Затраты_anon.xlsx",
+            "2024/март/ДДС.xlsx",
+            "2024/ДДС_anon.xlsx",
+        ] {
             std::fs::write(d.join(f), b"x").unwrap();
         }
         let names: Vec<String> = excel_files_in(&d).iter().map(|p| p.strip_prefix(&d).unwrap().to_string_lossy().replace('\\', "/")).collect();
-        assert_eq!(names, ["2024/Затраты.xlsx", "2024/март/ДДС.xlsx", "Отчёт.XLSM", "Продажи.xlsx"]);
+        assert_eq!(
+            names,
+            ["2024/ДДС_anon.xlsx", "2024/Затраты.xlsx", "2024/март/ДДС.xlsx", "Отчёт.XLSM", "Отчёт_anon_итог.xlsx", "Продажи.xlsx", "Продажи2019-2026_anon.xlsx"]
+        );
     }
 
     /// Файл без галочки не обрабатывается и в предпросмотр не даёт значений.

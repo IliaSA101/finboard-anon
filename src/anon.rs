@@ -42,6 +42,8 @@ pub struct Report {
     pub key_path: Option<PathBuf>,
     /// Заменено ячеек по каждому правилу.
     pub rule_cells: Vec<usize>,
+    /// Название колонки каждого правила — из строки шапки листа (если есть).
+    pub rule_heads: Vec<Option<String>>,
     pub distinct_values: usize,
     pub sst_replaced: usize,
     pub formula_cache_replaced: usize,
@@ -118,7 +120,11 @@ impl Report {
         for (i, r) in profile.rules.iter().enumerate() {
             let n = self.rule_cells.get(i).copied().unwrap_or(0);
             let what = if r.kind == Kind::Keep { "оставлено как есть" } else { "заменено" };
-            l.push(format!("  {}!{} [{}]: {what} ячеек {}", r.sheet, r.range_text(), r.kind.title(), n));
+            let col = match self.rule_heads.get(i).and_then(|h| h.as_deref()) {
+                Some(h) => format!("колонка «{h}», "),
+                None => String::new(),
+            };
+            l.push(format!("  {}!{} — {col}правило «{}»: {what} ячеек {}", r.sheet, r.range_text(), r.kind.title(), n));
         }
         l.push(format!(
             "Уникальных значений: {}; общих строк: {}; формул (текст/кэш/очищено кэшей): {}/{}/{}; прочих мест (сводные, диаграммы, примечания): {}",
@@ -448,11 +454,14 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
         books.push((zip, wb));
     }
     let rules: Vec<&[Rule]> = batch.files.iter().map(|f| f.rules.as_slice()).collect();
+    if let Some(p) = crate::xlsx::progress() {
+        p.total.store(expected_reads(&mut books, &rules), std::sync::atomic::Ordering::Relaxed);
+    }
 
     // 1–2. Значения под правилами всех файлов и их фейки — тем же кодом, что и предпросмотр.
     log("Сбор значений по правилам…".into());
     let paths: Vec<&Path> = batch.files.iter().map(|f| f.input.as_path()).collect();
-    let (plans, faker, key_entries) = plan_batch(&mut books, &paths, &rules, &batch.settings, batch.key_in.as_deref())?;
+    let (plans, faker, key_entries) = plan_batch(&mut books, &paths, &rules, &batch.settings, batch.key_in.as_deref(), None)?;
     if batch.key_in.is_some() {
         log(format!("Загружен ключ: {key_entries} записей"));
     }
@@ -491,6 +500,7 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
         let mut report = write_book(zip, wb, &f.rules, &faker, &maps, &batch.settings, &f.output, log)?;
         report.warnings.splice(0..0, plans[fi].warnings.iter().cloned());
         report.distinct_values = plans[fi].items.len();
+        report.rule_heads = plans[fi].rule_heads.clone();
         reports.push(report);
         scans.push(scan_extra);
     }
@@ -659,7 +669,7 @@ fn write_book(
                 let srules = sheet_rules.get(&si).unwrap_or(&empty);
                 zw.start_file(name.clone(), opts.compression_level(Some(1)).large_file(true))?;
                 let changed = rewrite_sheet(
-                    BufReader::with_capacity(1 << 16, zip.by_index(i)?),
+                    BufReader::with_capacity(1 << 16, crate::xlsx::counted(zip.by_index(i)?)),
                     &mut zw,
                     &wb.sst,
                     srules,
@@ -828,15 +838,22 @@ pub struct FilePlan {
     pub rule_samples: Vec<Vec<String>>,
     /// Заполненные ячейки той же колонки ниже конца правила (не под другим правилом): таблица длиннее правила.
     pub rule_below: Vec<usize>,
+    /// Название колонки правила из строки шапки листа (та же строка, что у «колонки целиком» в окне).
+    pub rule_heads: Vec<Option<String>>,
     pub warnings: Vec<String>,
 }
 
-fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule]) -> Result<FilePlan> {
+/// В скольких первых строках листа искать шапку таблицы.
+const HEAD_ROWS: u32 = 50;
+
+/// `limit` — читать на каждом листе только первые строки (предпросмотр большого файла); `None` — весь лист.
+fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule], limit: Option<u32>) -> Result<FilePlan> {
     let (sheet_rules, mut warnings) = rules_by_sheet(wb, rules);
     let mut items: Vec<(usize, String, bool)> = Vec::new();
     let mut rule_cells = vec![0usize; rules.len()];
     let mut rule_below = vec![0usize; rules.len()];
     let mut rule_samples: Vec<Vec<String>> = vec![Vec::new(); rules.len()];
+    let mut rule_heads: Vec<Option<String>> = vec![None; rules.len()];
     // По типу замены — уже встреченные значения.
     let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
     for (si, info) in wb.sheets.iter().enumerate() {
@@ -844,8 +861,21 @@ fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule]) -> Result<FilePlan> {
         let xml = part_reader(zip, &info.path)?.with_context(|| format!("нет части {}", info.path))?;
         let keys: Vec<String> = srules.iter().map(|(_, r)| r.kind_key()).collect();
         let below = |r: &Rule, row: u32, col: u32| r.kind != Kind::Keep && col == r.col && r.row_to.is_some_and(|to| row > to);
-        let want = |row: u32, col: u32| srules.iter().any(|(_, r)| r.covers(row, col) || below(r, row, col));
+        // Первая ячейка за пределом нужна, чтобы остановить чтение листа (строки в листе идут по порядку).
+        let past = |row: u32| limit.is_some_and(|m| row > m);
+        // Шапка листа — строка с наибольшим числом текстовых ячеек среди первых HEAD_ROWS (как `Grid::header_row`).
+        let mut head_cells: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+        let want = |row: u32, col: u32| row <= HEAD_ROWS || past(row) || srules.iter().any(|(_, r)| r.covers(row, col) || below(r, row, col));
         scan_cells_where(xml, &wb.sst, want, |row, col, v| {
+            if past(row) {
+                return false;
+            }
+            if row <= HEAD_ROWS && !v.numeric && !v.text.trim().is_empty() {
+                head_cells.entry(row).or_default().push((col, v.text.clone()));
+            }
+            if !srules.iter().any(|(_, r)| r.covers(row, col) || below(r, row, col)) {
+                return true;
+            }
             // Кэш формулы под правилом (ФИО из другой книги, ВПР) — те же персональные данные.
             // Ошибки, логические значения, заголовки и «Итого» — нет.
             if v.special || crate::detect::is_label(&v.text) {
@@ -879,6 +909,12 @@ fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule]) -> Result<FilePlan> {
             }
             true
         })?;
+        let head = head_cells.iter().filter(|(_, c)| c.len() >= 2).max_by_key(|(r, c)| (c.len(), std::cmp::Reverse(**r)));
+        if let Some((&hr, cells)) = head {
+            for (ri, r) in srules.iter().filter(|(_, r)| hr < r.row_from) {
+                rule_heads[*ri] = cells.iter().find(|(c, _)| *c == r.col).map(|(_, t)| t.trim().to_string());
+            }
+        }
     }
     for (ri, &n) in rule_below.iter().enumerate().filter(|(_, n)| **n > 0) {
         let r = &rules[ri];
@@ -890,7 +926,32 @@ fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule]) -> Result<FilePlan> {
             crate::xlsx::col_name(r.col)
         ));
     }
-    Ok(FilePlan { items, rule_cells, rule_samples, rule_below, warnings })
+    // Шапкой могли счесть строку данных (таблица без шапки): реальное значение в журнал не попадает.
+    let values: HashSet<&str> = items.iter().map(|(_, s, _)| s.as_str()).collect();
+    for h in &mut rule_heads {
+        if h.as_deref().is_some_and(|t| values.contains(t)) {
+            *h = None;
+        }
+    }
+    Ok(FilePlan { items, rule_cells, rule_samples, rule_below, rule_heads, warnings })
+}
+
+/// Сколько байт прочитает обработка (для полосы хода): листы с правилами — при сборе значений; все листы —
+/// при поиске формул, при записи и при проверке результата (там же и прочие части XML).
+fn expected_reads(books: &mut [(Zip, Workbook)], rules: &[&[Rule]]) -> u64 {
+    let mut total = 0;
+    for ((zip, wb), rs) in books.iter_mut().zip(rules) {
+        for i in 0..zip.len() {
+            let Ok(f) = zip.by_index_raw(i) else { continue };
+            let (name, size) = (f.name().to_string(), f.size());
+            match wb.sheets.iter().find(|s| s.path == name) {
+                Some(s) => total += size * if rs.iter().any(|r| r.sheet == s.name) { 4 } else { 3 },
+                None if name.ends_with(".xml") || name.ends_with(".rels") || name.ends_with(".vml") => total += size,
+                None => {}
+            }
+        }
+    }
+    total
 }
 
 /// Значения всех файлов и один генератор на всех: строки всех книг заняты для фейков,
@@ -901,10 +962,11 @@ pub fn plan_batch(
     rules: &[&[Rule]],
     settings: &Settings,
     key_in: Option<&Path>,
+    limit: Option<u32>,
 ) -> Result<(Vec<FilePlan>, Faker, usize)> {
     let mut plans = Vec::new();
     for ((zip, wb), r) in books.iter_mut().zip(rules) {
-        plans.push(collect(zip, wb, r)?);
+        plans.push(collect(zip, wb, r, limit)?);
     }
     let mut faker = Faker::new(settings);
     for (_, wb) in books.iter() {
@@ -983,7 +1045,11 @@ fn kind_conflicts(plans: &mut [FilePlan], rules: &[&[Rule]], faker: &Faker, file
     }
 }
 
-/// Предпросмотр одного правила: число ячеек и первые пары «реальное → фейк».
+/// Сколько первых строк каждого листа читает предпросмотр. Это строки, видные в окне: на файле в сотни тысяч
+/// строк полный проход занимал секунды на каждую правку правил, а ничего не проверял — проверка идёт при обработке.
+pub const PREVIEW_ROWS: u32 = 20_000;
+
+/// Предпросмотр одного правила: число ячеек и первые пары «реальное → фейк» (по первым `PREVIEW_ROWS` строкам листа).
 #[derive(Clone, Debug, Default)]
 pub struct RulePreview {
     pub cells: usize,
@@ -996,7 +1062,8 @@ pub fn preview(input: &Path, profile: &Profile, key_in: Option<&Path>) -> Result
     Ok(preview_batch(&[(input.to_path_buf(), profile.rules.clone())], &profile.settings, key_in)?.remove(0))
 }
 
-/// Предпросмотр пакета: по каждому файлу — по каждому правилу. Фейки те же, что даст `run_batch`.
+/// Предпросмотр пакета: по каждому файлу — по каждому правилу, по первым `PREVIEW_ROWS` строкам листов.
+/// Фейки те же, что даст `run_batch`, если листы не длиннее; на длинных номера ID в примерах могут отличаться.
 pub fn preview_batch(files: &[(PathBuf, Vec<Rule>)], settings: &Settings, key_in: Option<&Path>) -> Result<Vec<Vec<RulePreview>>> {
     let mut books = Vec::new();
     for (input, _) in files {
@@ -1006,7 +1073,7 @@ pub fn preview_batch(files: &[(PathBuf, Vec<Rule>)], settings: &Settings, key_in
     }
     let rules: Vec<&[Rule]> = files.iter().map(|(_, r)| r.as_slice()).collect();
     let paths: Vec<&Path> = files.iter().map(|(p, _)| p.as_path()).collect();
-    let (plans, faker, _) = plan_batch(&mut books, &paths, &rules, settings, key_in)?;
+    let (plans, faker, _) = plan_batch(&mut books, &paths, &rules, settings, key_in, Some(PREVIEW_ROWS))?;
     Ok(plans
         .iter()
         .zip(&rules)
@@ -2785,11 +2852,12 @@ pub fn scan_leaks_with(path: &Path, originals: &[String], fakes: &[&str], digits
     let mut zip = open_zip(path)?;
     let mut leaks = Vec::new();
     for i in 0..zip.len() {
-        let mut f = zip.by_index(i)?;
+        let f = zip.by_index(i)?;
         let name = f.name().to_string();
         if !(name.ends_with(".xml") || name.ends_with(".rels") || name.ends_with(".vml")) {
             continue;
         }
+        let mut f = crate::xlsx::counted(f);
         let mut count = 0;
         let mut samples: Vec<String> = Vec::new();
         let mut check = |data: &[u8]| {
