@@ -8,6 +8,7 @@ pub mod anon;
 pub mod detect;
 pub mod fake;
 pub mod keyfile;
+mod links;
 mod names;
 pub mod profile;
 pub mod xlsx;
