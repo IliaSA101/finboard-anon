@@ -264,8 +264,8 @@ fn utf16le(s: &str) -> Vec<u8> {
 }
 
 /// Часть customXml в UTF-16 с непарным суррогатом раньше обрывала всю обработку («неверный UTF-16»).
-/// Теперь книга обезличивается, битая часть копируется как есть — с предупреждением, и проверка результата
-/// не обещает, что в ней чисто. Исправная часть UTF-16 рядом по-прежнему обрабатывается.
+/// Теперь книга обезличивается, битая часть удаляется из результата (с 0.5.0 — не копируется как есть:
+/// в ней могли остаться имена) — с предупреждением. Исправная часть UTF-16 рядом по-прежнему обрабатывается.
 #[test]
 fn broken_utf16_custom_xml_warns_and_rest_is_anonymized() {
     let d = tmp("p5_utf16");
@@ -278,19 +278,12 @@ fn broken_utf16_custom_xml_warns_and_rest_is_anonymized() {
     repack(&input, &|_, _| None, &[("customXml/item1.xml", broken.clone()), ("customXml/item2.xml", good)]);
 
     let report = run(&job(&input, &output, vec![Rule::new("Л", 0, 2, None, Kind::FullName)]), &mut |_| {}).unwrap();
-    assert!(
-        report.warnings.iter().any(|w| w.contains("customXml/item1.xml") && w.contains("не прочитана")),
-        "{:?}",
-        report.warnings
-    );
-    assert!(report.unchecked.iter().any(|u| u == "customXml/item1.xml"), "{:?}", report.unchecked);
     let summary = report.summary(&Profile::default()).join("\n");
-    assert!(summary.contains("Внимание: часть customXml/item1.xml не прочитана"), "{summary}");
-    assert!(!summary.contains("реальных значений из размеченных колонок в нём не найдено."), "{summary}");
+    assert!(summary.contains("Внимание: часть customXml/item1.xml повреждена (кодировка) и удалена из результата"), "{summary}");
 
     let parts: std::collections::HashMap<String, Vec<u8>> = unpack(&output).into_iter().collect();
-    // Битая часть — байт в байт как была.
-    assert_eq!(parts["customXml/item1.xml"], broken);
+    // Битой части в результате нет.
+    assert!(!parts.contains_key("customXml/item1.xml"), "битая часть осталась");
     // Исправная — обезличена и осталась в UTF-16.
     let item2 = &parts["customXml/item2.xml"];
     assert_eq!(&item2[..2], &[0xFF, 0xFE]);

@@ -476,6 +476,10 @@ pub struct Batch {
 }
 
 pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Report>> {
+    run_batch_inner(batch, log).map_err(crate::xlsx::plain_error)
+}
+
+fn run_batch_inner(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Report>> {
     if batch.files.is_empty() {
         bail!("Нет файлов для обработки");
     }
@@ -495,6 +499,10 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
     // (другое окно, командная строка) получит понятную ошибку, а не выдаст тем же ID других людей.
     // Отпечаток ключа — тоже до чтения: перед записью он сверяется (запуски прежних версий замка не ставят).
     let _key_lock = batch.key_out.as_deref().map(keyfile::lock).transpose()?;
+    // Временный файл ключа от прерванного запуска — с настоящими значениями; под замком его никто не пишет.
+    if let Some(tmp) = batch.key_out.as_deref().and_then(keyfile::remove_leftover_tmp) {
+        log(format!("Удалён временный файл ключа, оставшийся от прерванного запуска (в нём были настоящие значения): {}", tmp.display()));
+    }
     let key_stamp = batch.key_out.as_deref().and_then(keyfile::stamp);
     let mut books = Vec::new();
     for f in &batch.files {
@@ -580,6 +588,15 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
         originals.sort();
         originals.dedup();
         reports[fi].leaks = scan_leaks_with(&tmps[fi], &originals, &fakes, &real_digits)?;
+        // Фейк из ключа совпал с реальным номером другой строки — поиск по результату его не отличит от фейка.
+        let clashes = &plans[fi].clashes;
+        if !clashes.is_empty() {
+            reports[fi].leaks.push(Leak {
+                part: "номера: фейк из ключа прошлых запусков совпал с реальным номером другой строки".into(),
+                count: clashes.len(),
+                samples: clashes.iter().take(8).cloned().collect(),
+            });
+        }
         let kept = batch.settings.outside != Outside::All || f.rules.iter().any(|r| r.kind == Kind::Keep);
         if kept && !reports[fi].leaks.is_empty() {
             reports[fi].warnings.push(
@@ -666,15 +683,26 @@ fn commit(batch: &Batch, faker: &Faker, tmps: &[PathBuf], key_stamp: keyfile::St
                 k.display()
             );
         }
+        let mut moved = None;
         if k.exists() && !batch.key_in.as_deref().is_some_and(|i| same_file(i, k)) {
             let backup = keyfile::backup_path(k);
             std::fs::rename(k, &backup).with_context(|| format!("не переименовывается прежний ключ {} — файлы не записаны", k.display()))?;
             log(format!("Прежний ключ не был загружен и сохранён как {}", backup.display()));
+            moved = Some(backup);
         } else if k.exists() {
             let copy = keyfile::keep_copy(k)?;
             log(format!("Копия ключа до этого запуска: {}", copy.display()));
         }
-        keyfile::write(k, &faker.entries).context("файлы не записаны")?;
+        if let Err(e) = keyfile::write(k, &faker.entries) {
+            // Прежний ключ уже отложен под другим именем, а новый не записался: на месте ключа пусто. Прежний
+            // возвращается на место; не вышло — сообщение говорит, где он, чтобы его не сочли потерянным.
+            let old = match moved {
+                Some(b) if !k.exists() && std::fs::rename(&b, k).is_ok() => format!("\nПрежний ключ возвращён на место: {}.", k.display()),
+                Some(b) => format!("\nПрежний ключ не потерян — он лежит под именем {}.", b.display()),
+                None => String::new(),
+            };
+            bail!("{e:#}.\nФайлы не записаны: их прежние версии не тронуты.{old}");
+        }
         log(format!("Ключ записан: {}", k.display()));
     }
     // Только переименование: копирование поверх существующего пути при неудаче могло бы записать результат
@@ -830,14 +858,29 @@ fn write_book(
     // Миниатюра первого листа (docProps/thumbnail.*) — картинка с реальными данными: в результат не попадает,
     // ссылки на неё убираются из связей и типов частей.
     let names: Vec<String> = zip.file_names().map(String::from).collect();
-    let dropped = thumbnail_parts(zip, &names)?;
+    let mut dropped = thumbnail_parts(zip, &names)?;
     if !dropped.is_empty() {
         log("Миниатюра первого листа (docProps/thumbnail) удалена".into());
+    }
+    // Часть customXml в UTF-16, которая не раскодируется: ни обезличить, ни проверить её нельзя, а свойства
+    // SharePoint в ней — имена и учётные записи людей. В результат не попадает, как и миниатюра: вместе с её
+    // связями, ссылкой на неё и типом. Решается до записи: связи и типы частей идут в архиве раньше неё.
+    for n in &names {
+        let low = n.to_lowercase();
+        if low.starts_with("customxml/") && low.ends_with(".xml") && !low.contains("/_rels/") && broken_utf16(zip.by_name(n)?)? {
+            let (dir, file) = low.rsplit_once('/').unwrap_or(("", &low));
+            dropped.insert(format!("{dir}/_rels/{file}.rels"));
+            dropped.insert(low);
+            report.warnings.push(format!("часть {n} повреждена (кодировка) и удалена из результата"));
+            log(format!("Часть {n} повреждена (кодировка) — удалена"));
+        }
     }
     let mut mashup: Vec<String> = Vec::new();
     let mut printer_unknown: Vec<String> = Vec::new();
     // Части, которые не удалось прочитать (битый UTF-16): скопированы без обезличивания.
     let mut unreadable: Vec<String> = Vec::new();
+    // Очищены подключения к базам данных / пути к связанным файлам — о каждом одно предупреждение.
+    let (mut conn_cleaned, mut links_masked) = (false, false);
     // При ошибке или сбое на любом шаге недописанный результат удаляет `run_batch` (RemoveOnDrop).
     {
         let out_file = File::create(tmp).with_context(|| format!("не создаётся {}", tmp.display()))?;
@@ -877,8 +920,7 @@ fn write_book(
             }
             let printer = !is_xml && name.to_lowercase().starts_with("xl/printersettings/");
             let new: Option<Vec<u8>> = if printer && settings.clean_metadata {
-                let mut data = Vec::new();
-                zip.by_index(i)?.read_to_end(&mut data)?;
+                let data = crate::xlsx::read_all(zip.by_index(i)?)?;
                 match clean_devmode(&data) {
                     Some(r) => (r != data).then_some(r),
                     None => {
@@ -889,16 +931,15 @@ fn write_book(
             } else if !is_xml || (other_rels && !sheet_rels) {
                 None
             } else if broken_utf16(zip.by_index(i)?)? {
-                // Битая часть не останавливает обработку книги: копируется как есть, о ней — предупреждение,
-                // и итог проверки не обещает, что в ней чисто.
+                // Битая часть (не customXml — те удалены выше) не останавливает обработку книги: копируется
+                // как есть, о ней — предупреждение, и итог проверки не обещает, что в ней чисто.
                 report.warnings.push(format!(
                     "часть {name} не прочитана (неверная кодировка UTF-16) — скопирована как есть, без обезличивания и проверки; перед пересылкой откройте и пересохраните книгу в Excel"
                 ));
                 unreadable.push(name.clone());
                 None
             } else {
-                let mut data = Vec::new();
-                zip.by_index(i)?.read_to_end(&mut data)?;
+                let mut data = crate::xlsx::read_all(zip.by_index(i)?)?;
                 // OneDrive и SharePoint пишут customXml в UTF-16: обрабатываем как текст и сохраняем в той же кодировке.
                 let utf16 = utf16_bom(&data);
                 if let Some(be) = utf16 {
@@ -964,36 +1005,55 @@ fn write_book(
                     (r, _) => r,
                 }
             };
-            let new = if !dropped.is_empty() && (name == "_rels/.rels" || name == "[Content_Types].xml") {
+            // Ссылки на удалённые части (миниатюра, битый customXml): в связях любой части и в типах частей.
+            let new = if !dropped.is_empty() && (name.ends_with(".rels") || name == "[Content_Types].xml") {
                 let cur = match &new {
                     Some(b) => b.clone(),
-                    None => {
-                        let mut d = Vec::new();
-                        zip.by_index(i)?.read_to_end(&mut d)?;
-                        d
-                    }
+                    None => crate::xlsx::read_all(zip.by_index(i)?)?,
                 };
-                String::from_utf8(cur).ok().and_then(|t| drop_part_refs(&t, &dropped)).map(String::into_bytes).or(new)
+                // Цели связей — от папки части, которой принадлежат связи: «xl/_rels/workbook.xml.rels» → «xl/».
+                let base = name.find("_rels/").map_or("", |p| &name[..p]);
+                String::from_utf8(cur).ok().and_then(|t| drop_part_refs(&t, &dropped, base)).map(String::into_bytes).or(new)
             } else {
                 new
             };
             // Пути профиля пользователя в служебных частях: связи (гиперссылки, внешние книги), книга,
             // подключения, свойства файла (база гиперссылок). Тексты ячеек, примечаний и кэшей — данные,
-            // их меняют только правила.
+            // их меняют только правила. Подключения к базам и пути к связанным файлам очищаются целиком.
             let service = name.ends_with(".rels")
                 || name == wb.workbook_path
                 || name == "xl/connections.xml"
+                || name.starts_with("xl/externalLinks/")
                 || name.starts_with("docProps/");
             let new = if settings.clean_metadata && is_xml && service {
-                let cur = match &new {
-                    Some(b) => b.clone(),
-                    None => {
-                        let mut d = Vec::new();
-                        zip.by_index(i)?.read_to_end(&mut d)?;
-                        d
-                    }
+                let mut touched = new.is_some();
+                let mut cur = match new {
+                    Some(b) => b,
+                    None => crate::xlsx::read_all(zip.by_index(i)?)?,
                 };
-                String::from_utf8(cur).ok().and_then(|t| mask_user_paths(&t)).map(String::into_bytes).or(new)
+                let cleaned = if name == "xl/connections.xml" {
+                    crate::links::clean_connections(&cur).with_context(|| format!("{name}: подключения не разобраны"))?
+                } else if name.ends_with(".rels") || name.starts_with("xl/externalLinks/") {
+                    crate::links::mask_linked_files(&cur).with_context(|| format!("{name}: связи не разобраны"))?
+                } else {
+                    None
+                };
+                if let Some(c) = cleaned {
+                    if name == "xl/connections.xml" {
+                        conn_cleaned = true;
+                    } else {
+                        links_masked = true;
+                    }
+                    cur = c;
+                    touched = true;
+                }
+                match String::from_utf8(cur) {
+                    Ok(t) => match mask_user_paths(&t) {
+                        Some(m) => Some(m.into_bytes()),
+                        None => touched.then(|| t.into_bytes()),
+                    },
+                    Err(e) => touched.then(|| e.into_bytes()),
+                }
             } else {
                 new
             };
@@ -1022,6 +1082,15 @@ fn write_book(
     report.formula_text_replaced = stats.formula_text;
     report.formula_cache_cleared = stats.formula_cleared;
     report.other_replaced = stats.other;
+    if conn_cleaned {
+        report.warnings.push("подключения к базам данных очищены (сервер, логин, запрос) — обновить данные из базы в результате нельзя".into());
+    }
+    if links_masked {
+        report.warnings.push(
+            "пути к связанным файлам (другие книги в формулах, связанные объекты) заменены на «external…» — формулы показывают сохранённые значения, обновить связи в результате нельзя"
+                .into(),
+        );
+    }
     let (warnings, unchecked) = binary_part_warnings(&names, &dropped, &mashup, &printer_unknown);
     report.warnings.extend(warnings);
     report.unchecked = unchecked;
@@ -1037,11 +1106,11 @@ fn thumbnail_parts(zip: &mut Zip, names: &[String]) -> Result<HashSet<String>> {
         names.iter().map(|n| n.to_lowercase()).filter(|n| n.starts_with("docprops/thumbnail")).collect();
     if names.iter().any(|n| n == "_rels/.rels") {
         let mut rels = String::new();
-        zip.by_name("_rels/.rels")?.read_to_string(&mut rels).ok();
+        crate::xlsx::limited(zip.by_name("_rels/.rels")?).read_to_string(&mut rels).ok();
         for tag in xml_tags(&rels) {
             if tag_local(tag) == "Relationship" && tag_attr(tag, "Type").is_some_and(|t| t.ends_with("/metadata/thumbnail")) {
                 if let Some(t) = tag_attr(tag, "Target") {
-                    out.insert(t.trim_start_matches('/').to_lowercase());
+                    out.insert(part_path("", t));
                 }
             }
         }
@@ -1087,9 +1156,29 @@ fn tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
-/// Убирает из связей (_rels/.rels) и типов частей ([Content_Types].xml) ссылки на удалённые части —
-/// иначе Excel предложит «восстановить» книгу.
-fn drop_part_refs(xml: &str, dropped: &HashSet<String>) -> Option<String> {
+/// Путь части в архиве (строчными) по цели связи: от корня («/customXml/item1.xml») или от папки `base`
+/// части-владельца связей («../customXml/item1.xml» от «xl/»).
+fn part_path(base: &str, target: &str) -> String {
+    let full = match target.strip_prefix('/') {
+        Some(t) => t.to_string(),
+        None => format!("{base}{target}"),
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in full.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/").to_lowercase()
+}
+
+/// Убирает из связей (*.rels; `base` — папка части, которой они принадлежат) и типов частей
+/// ([Content_Types].xml) ссылки на удалённые части — иначе Excel предложит «восстановить» книгу.
+fn drop_part_refs(xml: &str, dropped: &HashSet<String>, base: &str) -> Option<String> {
     let mut out = String::with_capacity(xml.len());
     let mut rest = xml;
     let mut changed = false;
@@ -1099,12 +1188,12 @@ fn drop_part_refs(xml: &str, dropped: &HashSet<String>) -> Option<String> {
         let Some(e) = rest.find('>').map(|e| e + 1) else { break };
         let tag = &rest[..e];
         let target = match tag_local(tag) {
-            "Relationship" if tag_attr(tag, "TargetMode") != Some("External") => tag_attr(tag, "Target"),
-            "Override" => tag_attr(tag, "PartName"),
+            "Relationship" if tag_attr(tag, "TargetMode") != Some("External") => tag_attr(tag, "Target").map(|t| part_path(base, t)),
+            "Override" => tag_attr(tag, "PartName").map(|t| part_path("", t)),
             _ => None,
         };
         rest = &rest[e..];
-        if target.is_some_and(|t| dropped.contains(&t.trim_start_matches('/').to_lowercase())) {
+        if target.is_some_and(|t| dropped.contains(&t)) {
             changed = true;
             // Непустая форма: <Relationship …></Relationship>.
             if !tag.ends_with("/>") && rest.starts_with("</") {
@@ -1266,6 +1355,9 @@ pub struct FilePlan {
     /// Название колонки правила из строки шапки листа (та же строка, что у «колонки целиком» в окне).
     pub rule_heads: Vec<Option<String>>,
     pub warnings: Vec<String>,
+    /// Реальные номера (цифры), совпавшие с фейком другого номера этого файла (`number_clashes`):
+    /// в результате такой номер стоит в чужой строке. Идут в находки проверки результата.
+    pub clashes: Vec<String>,
 }
 
 /// В скольких первых строках листа искать шапку таблицы.
@@ -1283,7 +1375,10 @@ fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule], limit: Option<u32>) -> 
     let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
     for (si, info) in wb.sheets.iter().enumerate() {
         let Some(srules) = sheet_rules.get(&si) else { continue };
+        check_cancel()?;
         let xml = part_reader(zip, &info.path)?.with_context(|| format!("нет части {}", info.path))?;
+        // Отмена — и посреди листа в сотни тысяч строк: проверяется через каждые CANCEL_EVERY ячеек.
+        let (mut read, mut cancelled) = (0usize, false);
         let keys: Vec<String> = srules.iter().map(|(_, r)| r.kind_key()).collect();
         let below = |r: &Rule, row: u32, col: u32| r.kind != Kind::Keep && col == r.col && r.row_to.is_some_and(|to| row > to);
         // Первая ячейка за пределом нужна, чтобы остановить чтение листа (строки в листе идут по порядку).
@@ -1292,6 +1387,11 @@ fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule], limit: Option<u32>) -> 
         let mut head_cells: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
         let want = |row: u32, col: u32| row <= HEAD_ROWS || past(row) || srules.iter().any(|(_, r)| r.covers(row, col) || below(r, row, col));
         scan_cells_where(xml, &wb.sst, want, |row, col, v| {
+            read += 1;
+            if read % CANCEL_EVERY == 0 && check_cancel().is_err() {
+                cancelled = true;
+                return false;
+            }
             if past(row) {
                 return false;
             }
@@ -1334,6 +1434,9 @@ fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule], limit: Option<u32>) -> 
             }
             true
         })?;
+        if cancelled {
+            check_cancel()?;
+        }
         let head = head_cells.iter().filter(|(_, c)| c.len() >= 2).max_by_key(|(r, c)| (c.len(), std::cmp::Reverse(**r)));
         if let Some((&hr, cells)) = head {
             for (ri, r) in srules.iter().filter(|(_, r)| hr < r.row_from) {
@@ -1358,7 +1461,7 @@ fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule], limit: Option<u32>) -> 
             *h = None;
         }
     }
-    Ok(FilePlan { items, rule_cells, rule_samples, rule_below, rule_heads, warnings })
+    Ok(FilePlan { items, rule_cells, rule_samples, rule_below, rule_heads, warnings, clashes: Vec::new() })
 }
 
 /// Сколько байт прочитает обработка (для полосы хода): листы с правилами — при сборе значений; все листы —
@@ -1392,8 +1495,10 @@ pub fn plan_batch(
 ) -> Result<(Vec<FilePlan>, Faker, usize)> {
     let mut plans = Vec::new();
     for ((zip, wb), r) in books.iter_mut().zip(rules) {
+        check_cancel()?;
         plans.push(collect(zip, wb, r, limit)?);
     }
+    check_cancel()?;
     let mut faker = Faker::new(settings);
     // Порядок связей — по правилам: вне разметки значение из нескольких связей получает фейк первой.
     let links: Vec<String> = rules.iter().flat_map(|rs| rs.iter().map(Rule::link_name)).collect();
@@ -1412,12 +1517,77 @@ pub fn plan_batch(
     faker.prepare_companies(all().filter(|(r, _)| r.kind == Kind::Company).map(|(_, it)| it.1.as_str()));
     faker.note_reals(all().map(|(_, it)| it.1.as_str()));
     let todo: Vec<(&Rule, &String, bool)> = all().map(|(r, it)| (r, &it.1, it.2)).collect();
-    for (r, original, numeric) in todo {
+    for (i, (r, original, numeric)) in todo.into_iter().enumerate() {
+        if i % CANCEL_EVERY == 0 {
+            check_cancel()?;
+        }
         faker.fake(r, original, numeric);
     }
+    check_cancel()?;
     kind_conflicts(&mut plans, rules, &faker, files);
     link_overlaps(&mut plans, &faker);
+    widened_numbers(&mut plans, &faker);
+    number_clashes(&mut plans, rules, &faker);
     Ok((plans, faker, key_entries))
+}
+
+/// Через сколько ячеек при сборе значений и значений при выборе фейков проверяется отмена.
+const CANCEL_EVERY: usize = 1024;
+
+/// Номера, получившие фейк длиннее настоящего: свободных номеров той же длины не хватило (короткие номера,
+/// тысячи значений — все номера этой длины реальные или уже выданы). Совпасть с чужим номером фейку нельзя,
+/// поэтому он длиннее. Одна строка на файл, без самих номеров (журнал могут переслать).
+fn widened_numbers(plans: &mut [FilePlan], faker: &Faker) {
+    for p in plans.iter_mut() {
+        let n = p.items.iter().filter(|(_, o, _)| faker.is_widened(o)).count();
+        if n > 0 {
+            p.warnings.push(format!(
+                "Номеров, чей фейк длиннее настоящего: {n}. Свободных номеров той же длины не хватило — все они реальные номера или фейки других значений, а совпасть с чужим номером фейку нельзя. Если длина номера важна (проверки, формулы ДЛСТР) — учтите это"
+            ));
+        }
+    }
+}
+
+/// Номер для сравнения: телефоны — каждый в ячейке по 10 цифрам (без 8/+7), прочие номера — все цифры
+/// (у 11 цифр на 7/8 — тоже без первой, как сравнивает генератор). Короче пяти цифр — не номер.
+fn number_keys(kind: Kind, s: &str) -> Vec<String> {
+    let parts: Vec<&str> = if kind == Kind::Phone { s.split([';', ',', '\n']).collect() } else { vec![s] };
+    parts.into_iter().map(crate::fake::phone_key).filter(|d| d.len() >= 5).collect()
+}
+
+/// Фейк номера, совпавший с реальным номером другого значения прогона или ключа. Новые фейки с реальными
+/// номерами не совпадают (генератор их обходит), но фейк из ключа прошлых запусков мог достаться номеру,
+/// который появился в данных позже: в результате реальный номер стоит в чужой строке, а проверка результата
+/// фейки не ищет — сказала бы «не найдено». Такие номера — в `FilePlan::clashes`, а оттуда в находки проверки.
+fn number_clashes(plans: &mut [FilePlan], rules: &[&[Rule]], faker: &Faker) {
+    let number = |k: Kind| matches!(k, Kind::Phone | Kind::Inn | Kind::Snils | Kind::Passport | Kind::Account);
+    let mut reals: HashSet<String> = HashSet::new();
+    for e in &faker.entries {
+        if let Some((k, _, _)) = parse_kind_key(&e.kind_key).filter(|(k, _, _)| number(*k)) {
+            reals.extend(number_keys(k, &e.real));
+        }
+    }
+    for (p, rs) in plans.iter_mut().zip(rules) {
+        let mut found: Vec<String> = Vec::new();
+        for (ri, original, _) in &p.items {
+            let r = &rs[*ri];
+            if !number(r.kind) {
+                continue;
+            }
+            let own = number_keys(r.kind, original);
+            // Короткий код («Дог1») — не номер: его фейк длиннее любого кода по замыслу.
+            if own.is_empty() {
+                continue;
+            }
+            let Some(fake) = faker.get(&r.kind_key(), original) else { continue };
+            for k in number_keys(r.kind, fake) {
+                if !own.contains(&k) && reals.contains(&k) && !found.contains(&k) {
+                    found.push(k);
+                }
+            }
+        }
+        p.clashes = found;
+    }
 }
 
 /// Порядок связей: общая — 0, остальные — по первому правилу (файлы по порядку, в файле — правила по порядку).
@@ -1570,6 +1740,10 @@ pub fn preview(input: &Path, profile: &Profile, key_in: Option<&Path>) -> Result
 /// Предпросмотр пакета: по каждому файлу — по каждому правилу, по первым `PREVIEW_ROWS` строкам листов.
 /// Фейки те же, что даст `run_batch`, если листы не длиннее; на длинных номера ID в примерах могут отличаться.
 pub fn preview_batch(files: &[(PathBuf, Vec<Rule>)], settings: &Settings, key_in: Option<&Path>) -> Result<Vec<Vec<RulePreview>>> {
+    preview_batch_inner(files, settings, key_in).map_err(crate::xlsx::plain_error)
+}
+
+fn preview_batch_inner(files: &[(PathBuf, Vec<Rule>)], settings: &Settings, key_in: Option<&Path>) -> Result<Vec<Vec<RulePreview>>> {
     let mut books = Vec::new();
     for (input, _) in files {
         let mut zip = open_zip(input)?;
@@ -1603,13 +1777,30 @@ pub fn preview_batch(files: &[(PathBuf, Vec<Rule>)], settings: &Settings, key_in
 
 /// Один и тот же файл на диске. Сравнение путей не видит жёстких ссылок (два имени одного файла):
 /// у существующих файлов сравнивается номер тома и номер файла на нём.
+/// Файлов ещё нет (результаты первого прогона) — сравниваются полные пути, в Windows без учёта регистра:
+/// «A.xlsx» и «a.xlsx» там — один файл, и второй результат записался бы поверх первого.
 fn same_file(a: &Path, b: &Path) -> bool {
     if let (Some(x), Some(y)) = (file_id(a), file_id(b)) {
         return x == y;
     }
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => a == b,
+    let (x, y) = (full_path(a), full_path(b));
+    if cfg!(windows) {
+        x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase()
+    } else {
+        x == y
+    }
+}
+
+/// Полный путь для сравнения: существующий файл — как его видит система; нового файла — путь его папки
+/// и имя («.\a.xlsx» и «a.xlsx» — одно и то же).
+fn full_path(p: &Path) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    match (dir.canonicalize(), p.file_name()) {
+        (Ok(d), Some(n)) => d.join(n),
+        _ => std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()),
     }
 }
 
@@ -2351,7 +2542,8 @@ fn decode_utf16(data: &[u8], be: bool) -> Result<String> {
 
 /// Часть с меткой UTF-16, которая не раскодируется (непарные суррогаты). Лишний последний байт, как и
 /// прежде, отбрасывается при раскодировании. Части без метки читаются только до третьего байта.
-fn broken_utf16<R: Read>(mut f: zip::read::ZipFile<'_, R>) -> Result<bool> {
+fn broken_utf16<R: Read>(f: zip::read::ZipFile<'_, R>) -> Result<bool> {
+    let mut f = crate::xlsx::limited(f);
     let mut head = [0u8; 2];
     let mut got = 0;
     while got < 2 {
@@ -2541,7 +2733,14 @@ impl Generic<'_> {
             Event::End(_) => {
                 stack.pop();
             }
-            Event::Text(e) => {
+            Event::Text(_) | Event::CData(_) => {
+                // Текст в CDATA (<t><![CDATA[Иванов Иван]]></t>) — тот же текст, что и обычный: заменяется так же,
+                // замена пишется обычным текстом.
+                let text = match &ev {
+                    Event::CData(e) => Ok(String::from_utf8_lossy(e)),
+                    Event::Text(e) => e.unescape(),
+                    _ => unreachable!(),
+                };
                 let top = stack.last().map(|v| v.as_slice()).unwrap_or(b"");
                 if let Some((_, repl)) = overrides.iter().find(|(n, _)| *n == top) {
                     // «{n}» — номер: авторы примечаний должны остаться разными.
@@ -2551,13 +2750,13 @@ impl Generic<'_> {
                     } else {
                         repl.to_string()
                     };
-                    if e.unescape().map(|t| t != repl).unwrap_or(true) {
+                    if text.as_ref().map(|t| *t != repl).unwrap_or(true) {
                         w.write_event(Event::Text(BytesText::new(&repl)))?;
                         *changed = true;
                         return Ok(());
                     }
                 } else {
-                    let text = e.unescape()?;
+                    let text = text?;
                     if !text.trim().is_empty() {
                         if let Some(out) = maps.replace_in(&text) {
                             w.write_event(Event::Text(BytesText::new(&out)))?;

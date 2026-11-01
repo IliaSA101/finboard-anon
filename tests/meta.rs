@@ -99,9 +99,12 @@ fn m02_user_profile_paths_in_every_service_part() {
                 assert!(!xml.contains("petrov.p"), "форма «{form}»: имя пользователя осталось в {name}: {xml}");
             }
         }
-        for name in ["xl/worksheets/_rels/sheet1.xml.rels", "xl/externalLinks/_rels/externalLink1.xml.rels", "xl/connections.xml", "docProps/app.xml"] {
+        for name in ["xl/worksheets/_rels/sheet1.xml.rels", "docProps/app.xml"] {
             assert!(p[name].contains("Отчет.xlsx"), "форма «{form}»: путь сломан в {name}: {}", p[name]);
         }
+        // Путь к другой книге и к файлу подключения заменяется целиком (0.5.0): в нём сетевые папки и имена файлов.
+        assert!(p["xl/externalLinks/_rels/externalLink1.xml.rels"].contains(r#"Target="external.xlsx""#), "{}", p["xl/externalLinks/_rels/externalLink1.xml.rels"]);
+        assert!(p["xl/connections.xml"].contains(r#"odcFile="connection.odc""#) && p["xl/connections.xml"].contains(r#"sourceFile="source.xlsx""#), "{}", p["xl/connections.xml"]);
         assert!(p["xl/sharedStrings.xml"].contains(&path), "форма «{form}»: ячейка без правила изменена");
     }
 }

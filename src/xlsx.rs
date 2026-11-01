@@ -40,10 +40,82 @@ pub fn read_part(zip: &mut Zip, name: &str) -> Result<Option<Vec<u8>>> {
 /// Больше предела память растёт по мере чтения — сколько данных на самом деле есть.
 pub const PREALLOC_LIMIT: u64 = 64 << 20;
 
-/// Часть архива целиком (заранее — не больше PREALLOC_LIMIT, сколько бы ни обещал заголовок).
-pub fn read_all<R: Read>(mut f: zip::read::ZipFile<'_, R>) -> Result<Vec<u8>> {
+/// Предел размера части после распаковки, если она целиком ложится в память (общие строки, записи сводных,
+/// примечания, прочий XML): 2 ГБ. Обработка держит рядом исходник и результат, то есть нужно втрое больше;
+/// настоящие общие строки даже у книги на миллион строк — сотни мегабайт. Сжатая в 2 МБ «архивная бомба»
+/// распаковывается в гигабайты нулей — без предела она съедала всю память компьютера.
+pub const PART_LIMIT: u64 = 2 << 30;
+
+/// Предел для листов: 8 ГБ. Лист идёт потоком и памяти не занимает — предел лишь не даёт часами
+/// распаковывать бомбу. Лист на всю сетку Excel (миллион строк) при обычной плотности — около 2 ГБ,
+/// предел вчетверо больше.
+pub const SHEET_LIMIT: u64 = 8 << 30;
+
+thread_local! {
+    static LIMITS: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Для тестов: другие пределы (часть в памяти, лист) в этом потоке; None — обычные.
+#[doc(hidden)]
+pub fn set_part_limits(limits: Option<(u64, u64)>) {
+    LIMITS.with(|l| l.set(limits));
+}
+
+fn limits() -> (u64, u64) {
+    LIMITS.with(|l| l.get()).unwrap_or((PART_LIMIT, SHEET_LIMIT))
+}
+
+/// Часть распаковалась больше предела: файл повреждён или собран нарочно.
+#[derive(Debug, Clone)]
+pub struct TooBig(String);
+
+impl std::fmt::Display for TooBig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TooBig {}
+
+fn size_text(n: u64) -> String {
+    match n {
+        n if n >= 1 << 30 => format!("{} ГБ", n >> 30),
+        n if n >= 1 << 20 => format!("{} МБ", n >> 20),
+        n if n >= 1 << 10 => format!("{} КБ", n >> 10),
+        n => format!("{n} байт"),
+    }
+}
+
+/// Ошибка «часть слишком большая» — одной понятной строкой. Разбор XML заворачивает ошибку чтения в свою
+/// («I/O error: …»), и в сообщении она повторялась бы дважды.
+pub fn plain_error(e: anyhow::Error) -> anyhow::Error {
+    let found = e.chain().find_map(|c| {
+        let io = c
+            .downcast_ref::<std::io::Error>()
+            .or_else(|| c.downcast_ref::<Arc<std::io::Error>>().map(|a| a.as_ref()))
+            .or_else(|| match c.downcast_ref::<quick_xml::Error>() {
+                Some(quick_xml::Error::Io(a)) => Some(a.as_ref()),
+                _ => None,
+            });
+        io.and_then(|io| io.get_ref()).and_then(|i| i.downcast_ref::<TooBig>()).cloned()
+    });
+    match found {
+        Some(t) => anyhow::Error::new(t),
+        None => e,
+    }
+}
+
+/// Чтение части целиком, с пределом PART_LIMIT.
+pub fn limited<'a, R: Read>(f: zip::read::ZipFile<'a, R>) -> Counted<zip::read::ZipFile<'a, R>> {
+    let name = f.name().to_string();
+    Counted { inner: f, p: None, name, read: 0, limit: limits().0 }
+}
+
+/// Часть архива целиком (заранее — не больше PREALLOC_LIMIT, сколько бы ни обещал заголовок;
+/// всего — не больше PART_LIMIT).
+pub fn read_all<R: Read>(f: zip::read::ZipFile<'_, R>) -> Result<Vec<u8>> {
     let mut v = Vec::with_capacity(f.size().min(PREALLOC_LIMIT) as usize);
-    f.read_to_end(&mut v)?;
+    limited(f).read_to_end(&mut v)?;
     Ok(v)
 }
 
@@ -90,19 +162,32 @@ pub fn progress() -> Option<Arc<Progress>> {
     TRACK.with(|t| t.borrow().clone())
 }
 
-/// Чтение части книги, которое считается в ход обработки.
+/// Чтение части книги: считается в ход обработки (листы) и не может распаковаться больше предела.
 pub struct Counted<R> {
     inner: R,
     p: Option<Arc<Progress>>,
+    name: String,
+    read: u64,
+    limit: u64,
 }
 
-pub fn counted<R: Read>(inner: R) -> Counted<R> {
-    Counted { inner, p: progress() }
+/// Лист потоком: в ход обработки, с пределом SHEET_LIMIT.
+pub fn counted<'a, R: Read>(f: zip::read::ZipFile<'a, R>) -> Counted<zip::read::ZipFile<'a, R>> {
+    let name = f.name().to_string();
+    Counted { inner: f, p: progress(), name, read: 0, limit: limits().1 }
 }
 
 impl<R: Read> Read for Counted<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        if self.read > self.limit {
+            return Err(std::io::Error::other(TooBig(format!(
+                "часть {} слишком большая после распаковки (больше {}) — файл повреждён или это не обычная книга Excel",
+                self.name,
+                size_text(self.limit)
+            ))));
+        }
         if let Some(p) = &self.p {
             p.done.fetch_add(n as u64, Ordering::Relaxed);
         }
@@ -269,7 +354,7 @@ pub struct Workbook {
 impl Workbook {
     pub fn open(path: &Path) -> Result<Workbook> {
         let mut zip = open_zip(path)?;
-        Workbook::from_zip(&mut zip)
+        Workbook::from_zip(&mut zip).map_err(plain_error)
     }
 
     pub fn from_zip(zip: &mut Zip) -> Result<Workbook> {
@@ -317,7 +402,7 @@ impl Workbook {
         // Общие строки — потоком: часть в сотни мегабайт не держится в памяти рядом с разобранными строками.
         let sst = match &sst_path {
             Some(p) => match zip.by_name(p) {
-                Ok(f) => parse_sst(BufReader::with_capacity(1 << 16, f))?,
+                Ok(f) => parse_sst(BufReader::with_capacity(1 << 16, limited(f)))?,
                 Err(ZipError::FileNotFound) => Vec::new(),
                 Err(e) => return Err(e.into()),
             },
@@ -816,7 +901,8 @@ pub fn load_grid(path: &Path, wb: &Workbook, sheet: usize, max_rows: u32) -> Res
         };
         g.cells.insert((r, c), GridCell { text: v.text, numeric: v.numeric, formula: v.formula, date });
         true
-    })?;
+    })
+    .map_err(plain_error)?;
     Ok(g)
 }
 
