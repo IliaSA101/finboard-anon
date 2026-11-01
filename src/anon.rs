@@ -476,6 +476,10 @@ pub struct Batch {
 }
 
 pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Report>> {
+    run_batch_inner(batch, log).map_err(crate::xlsx::plain_error)
+}
+
+fn run_batch_inner(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Report>> {
     if batch.files.is_empty() {
         bail!("Нет файлов для обработки");
     }
@@ -854,14 +858,29 @@ fn write_book(
     // Миниатюра первого листа (docProps/thumbnail.*) — картинка с реальными данными: в результат не попадает,
     // ссылки на неё убираются из связей и типов частей.
     let names: Vec<String> = zip.file_names().map(String::from).collect();
-    let dropped = thumbnail_parts(zip, &names)?;
+    let mut dropped = thumbnail_parts(zip, &names)?;
     if !dropped.is_empty() {
         log("Миниатюра первого листа (docProps/thumbnail) удалена".into());
+    }
+    // Часть customXml в UTF-16, которая не раскодируется: ни обезличить, ни проверить её нельзя, а свойства
+    // SharePoint в ней — имена и учётные записи людей. В результат не попадает, как и миниатюра: вместе с её
+    // связями, ссылкой на неё и типом. Решается до записи: связи и типы частей идут в архиве раньше неё.
+    for n in &names {
+        let low = n.to_lowercase();
+        if low.starts_with("customxml/") && low.ends_with(".xml") && !low.contains("/_rels/") && broken_utf16(zip.by_name(n)?)? {
+            let (dir, file) = low.rsplit_once('/').unwrap_or(("", &low));
+            dropped.insert(format!("{dir}/_rels/{file}.rels"));
+            dropped.insert(low);
+            report.warnings.push(format!("часть {n} повреждена (кодировка) и удалена из результата"));
+            log(format!("Часть {n} повреждена (кодировка) — удалена"));
+        }
     }
     let mut mashup: Vec<String> = Vec::new();
     let mut printer_unknown: Vec<String> = Vec::new();
     // Части, которые не удалось прочитать (битый UTF-16): скопированы без обезличивания.
     let mut unreadable: Vec<String> = Vec::new();
+    // Очищены подключения к базам данных / пути к связанным файлам — о каждом одно предупреждение.
+    let (mut conn_cleaned, mut links_masked) = (false, false);
     // При ошибке или сбое на любом шаге недописанный результат удаляет `run_batch` (RemoveOnDrop).
     {
         let out_file = File::create(tmp).with_context(|| format!("не создаётся {}", tmp.display()))?;
@@ -901,8 +920,7 @@ fn write_book(
             }
             let printer = !is_xml && name.to_lowercase().starts_with("xl/printersettings/");
             let new: Option<Vec<u8>> = if printer && settings.clean_metadata {
-                let mut data = Vec::new();
-                zip.by_index(i)?.read_to_end(&mut data)?;
+                let data = crate::xlsx::read_all(zip.by_index(i)?)?;
                 match clean_devmode(&data) {
                     Some(r) => (r != data).then_some(r),
                     None => {
@@ -913,16 +931,15 @@ fn write_book(
             } else if !is_xml || (other_rels && !sheet_rels) {
                 None
             } else if broken_utf16(zip.by_index(i)?)? {
-                // Битая часть не останавливает обработку книги: копируется как есть, о ней — предупреждение,
-                // и итог проверки не обещает, что в ней чисто.
+                // Битая часть (не customXml — те удалены выше) не останавливает обработку книги: копируется
+                // как есть, о ней — предупреждение, и итог проверки не обещает, что в ней чисто.
                 report.warnings.push(format!(
                     "часть {name} не прочитана (неверная кодировка UTF-16) — скопирована как есть, без обезличивания и проверки; перед пересылкой откройте и пересохраните книгу в Excel"
                 ));
                 unreadable.push(name.clone());
                 None
             } else {
-                let mut data = Vec::new();
-                zip.by_index(i)?.read_to_end(&mut data)?;
+                let mut data = crate::xlsx::read_all(zip.by_index(i)?)?;
                 // OneDrive и SharePoint пишут customXml в UTF-16: обрабатываем как текст и сохраняем в той же кодировке.
                 let utf16 = utf16_bom(&data);
                 if let Some(be) = utf16 {
@@ -988,36 +1005,55 @@ fn write_book(
                     (r, _) => r,
                 }
             };
-            let new = if !dropped.is_empty() && (name == "_rels/.rels" || name == "[Content_Types].xml") {
+            // Ссылки на удалённые части (миниатюра, битый customXml): в связях любой части и в типах частей.
+            let new = if !dropped.is_empty() && (name.ends_with(".rels") || name == "[Content_Types].xml") {
                 let cur = match &new {
                     Some(b) => b.clone(),
-                    None => {
-                        let mut d = Vec::new();
-                        zip.by_index(i)?.read_to_end(&mut d)?;
-                        d
-                    }
+                    None => crate::xlsx::read_all(zip.by_index(i)?)?,
                 };
-                String::from_utf8(cur).ok().and_then(|t| drop_part_refs(&t, &dropped)).map(String::into_bytes).or(new)
+                // Цели связей — от папки части, которой принадлежат связи: «xl/_rels/workbook.xml.rels» → «xl/».
+                let base = name.find("_rels/").map_or("", |p| &name[..p]);
+                String::from_utf8(cur).ok().and_then(|t| drop_part_refs(&t, &dropped, base)).map(String::into_bytes).or(new)
             } else {
                 new
             };
             // Пути профиля пользователя в служебных частях: связи (гиперссылки, внешние книги), книга,
             // подключения, свойства файла (база гиперссылок). Тексты ячеек, примечаний и кэшей — данные,
-            // их меняют только правила.
+            // их меняют только правила. Подключения к базам и пути к связанным файлам очищаются целиком.
             let service = name.ends_with(".rels")
                 || name == wb.workbook_path
                 || name == "xl/connections.xml"
+                || name.starts_with("xl/externalLinks/")
                 || name.starts_with("docProps/");
             let new = if settings.clean_metadata && is_xml && service {
-                let cur = match &new {
-                    Some(b) => b.clone(),
-                    None => {
-                        let mut d = Vec::new();
-                        zip.by_index(i)?.read_to_end(&mut d)?;
-                        d
-                    }
+                let mut touched = new.is_some();
+                let mut cur = match new {
+                    Some(b) => b,
+                    None => crate::xlsx::read_all(zip.by_index(i)?)?,
                 };
-                String::from_utf8(cur).ok().and_then(|t| mask_user_paths(&t)).map(String::into_bytes).or(new)
+                let cleaned = if name == "xl/connections.xml" {
+                    crate::links::clean_connections(&cur).with_context(|| format!("{name}: подключения не разобраны"))?
+                } else if name.ends_with(".rels") || name.starts_with("xl/externalLinks/") {
+                    crate::links::mask_linked_files(&cur).with_context(|| format!("{name}: связи не разобраны"))?
+                } else {
+                    None
+                };
+                if let Some(c) = cleaned {
+                    if name == "xl/connections.xml" {
+                        conn_cleaned = true;
+                    } else {
+                        links_masked = true;
+                    }
+                    cur = c;
+                    touched = true;
+                }
+                match String::from_utf8(cur) {
+                    Ok(t) => match mask_user_paths(&t) {
+                        Some(m) => Some(m.into_bytes()),
+                        None => touched.then(|| t.into_bytes()),
+                    },
+                    Err(e) => touched.then(|| e.into_bytes()),
+                }
             } else {
                 new
             };
@@ -1046,6 +1082,15 @@ fn write_book(
     report.formula_text_replaced = stats.formula_text;
     report.formula_cache_cleared = stats.formula_cleared;
     report.other_replaced = stats.other;
+    if conn_cleaned {
+        report.warnings.push("подключения к базам данных очищены (сервер, логин, запрос) — обновить данные из базы в результате нельзя".into());
+    }
+    if links_masked {
+        report.warnings.push(
+            "пути к связанным файлам (другие книги в формулах, связанные объекты) заменены на «external…» — формулы показывают сохранённые значения, обновить связи в результате нельзя"
+                .into(),
+        );
+    }
     let (warnings, unchecked) = binary_part_warnings(&names, &dropped, &mashup, &printer_unknown);
     report.warnings.extend(warnings);
     report.unchecked = unchecked;
@@ -1061,11 +1106,11 @@ fn thumbnail_parts(zip: &mut Zip, names: &[String]) -> Result<HashSet<String>> {
         names.iter().map(|n| n.to_lowercase()).filter(|n| n.starts_with("docprops/thumbnail")).collect();
     if names.iter().any(|n| n == "_rels/.rels") {
         let mut rels = String::new();
-        zip.by_name("_rels/.rels")?.read_to_string(&mut rels).ok();
+        crate::xlsx::limited(zip.by_name("_rels/.rels")?).read_to_string(&mut rels).ok();
         for tag in xml_tags(&rels) {
             if tag_local(tag) == "Relationship" && tag_attr(tag, "Type").is_some_and(|t| t.ends_with("/metadata/thumbnail")) {
                 if let Some(t) = tag_attr(tag, "Target") {
-                    out.insert(t.trim_start_matches('/').to_lowercase());
+                    out.insert(part_path("", t));
                 }
             }
         }
@@ -1111,9 +1156,29 @@ fn tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
-/// Убирает из связей (_rels/.rels) и типов частей ([Content_Types].xml) ссылки на удалённые части —
-/// иначе Excel предложит «восстановить» книгу.
-fn drop_part_refs(xml: &str, dropped: &HashSet<String>) -> Option<String> {
+/// Путь части в архиве (строчными) по цели связи: от корня («/customXml/item1.xml») или от папки `base`
+/// части-владельца связей («../customXml/item1.xml» от «xl/»).
+fn part_path(base: &str, target: &str) -> String {
+    let full = match target.strip_prefix('/') {
+        Some(t) => t.to_string(),
+        None => format!("{base}{target}"),
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in full.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/").to_lowercase()
+}
+
+/// Убирает из связей (*.rels; `base` — папка части, которой они принадлежат) и типов частей
+/// ([Content_Types].xml) ссылки на удалённые части — иначе Excel предложит «восстановить» книгу.
+fn drop_part_refs(xml: &str, dropped: &HashSet<String>, base: &str) -> Option<String> {
     let mut out = String::with_capacity(xml.len());
     let mut rest = xml;
     let mut changed = false;
@@ -1123,12 +1188,12 @@ fn drop_part_refs(xml: &str, dropped: &HashSet<String>) -> Option<String> {
         let Some(e) = rest.find('>').map(|e| e + 1) else { break };
         let tag = &rest[..e];
         let target = match tag_local(tag) {
-            "Relationship" if tag_attr(tag, "TargetMode") != Some("External") => tag_attr(tag, "Target"),
-            "Override" => tag_attr(tag, "PartName"),
+            "Relationship" if tag_attr(tag, "TargetMode") != Some("External") => tag_attr(tag, "Target").map(|t| part_path(base, t)),
+            "Override" => tag_attr(tag, "PartName").map(|t| part_path("", t)),
             _ => None,
         };
         rest = &rest[e..];
-        if target.is_some_and(|t| dropped.contains(&t.trim_start_matches('/').to_lowercase())) {
+        if target.is_some_and(|t| dropped.contains(&t)) {
             changed = true;
             // Непустая форма: <Relationship …></Relationship>.
             if !tag.ends_with("/>") && rest.starts_with("</") {
@@ -1675,6 +1740,10 @@ pub fn preview(input: &Path, profile: &Profile, key_in: Option<&Path>) -> Result
 /// Предпросмотр пакета: по каждому файлу — по каждому правилу, по первым `PREVIEW_ROWS` строкам листов.
 /// Фейки те же, что даст `run_batch`, если листы не длиннее; на длинных номера ID в примерах могут отличаться.
 pub fn preview_batch(files: &[(PathBuf, Vec<Rule>)], settings: &Settings, key_in: Option<&Path>) -> Result<Vec<Vec<RulePreview>>> {
+    preview_batch_inner(files, settings, key_in).map_err(crate::xlsx::plain_error)
+}
+
+fn preview_batch_inner(files: &[(PathBuf, Vec<Rule>)], settings: &Settings, key_in: Option<&Path>) -> Result<Vec<Vec<RulePreview>>> {
     let mut books = Vec::new();
     for (input, _) in files {
         let mut zip = open_zip(input)?;
@@ -2473,7 +2542,8 @@ fn decode_utf16(data: &[u8], be: bool) -> Result<String> {
 
 /// Часть с меткой UTF-16, которая не раскодируется (непарные суррогаты). Лишний последний байт, как и
 /// прежде, отбрасывается при раскодировании. Части без метки читаются только до третьего байта.
-fn broken_utf16<R: Read>(mut f: zip::read::ZipFile<'_, R>) -> Result<bool> {
+fn broken_utf16<R: Read>(f: zip::read::ZipFile<'_, R>) -> Result<bool> {
+    let mut f = crate::xlsx::limited(f);
     let mut head = [0u8; 2];
     let mut got = 0;
     while got < 2 {
@@ -2663,7 +2733,14 @@ impl Generic<'_> {
             Event::End(_) => {
                 stack.pop();
             }
-            Event::Text(e) => {
+            Event::Text(_) | Event::CData(_) => {
+                // Текст в CDATA (<t><![CDATA[Иванов Иван]]></t>) — тот же текст, что и обычный: заменяется так же,
+                // замена пишется обычным текстом.
+                let text = match &ev {
+                    Event::CData(e) => Ok(String::from_utf8_lossy(e)),
+                    Event::Text(e) => e.unescape(),
+                    _ => unreachable!(),
+                };
                 let top = stack.last().map(|v| v.as_slice()).unwrap_or(b"");
                 if let Some((_, repl)) = overrides.iter().find(|(n, _)| *n == top) {
                     // «{n}» — номер: авторы примечаний должны остаться разными.
@@ -2673,13 +2750,13 @@ impl Generic<'_> {
                     } else {
                         repl.to_string()
                     };
-                    if e.unescape().map(|t| t != repl).unwrap_or(true) {
+                    if text.as_ref().map(|t| *t != repl).unwrap_or(true) {
                         w.write_event(Event::Text(BytesText::new(&repl)))?;
                         *changed = true;
                         return Ok(());
                     }
                 } else {
-                    let text = e.unescape()?;
+                    let text = text?;
                     if !text.trim().is_empty() {
                         if let Some(out) = maps.replace_in(&text) {
                             w.write_event(Event::Text(BytesText::new(&out)))?;
