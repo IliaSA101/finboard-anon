@@ -479,12 +479,16 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
 
     // 3. Ключ — один на все файлы, до записи файлов: любой записанный результат покрыт ключом.
     // Чужой ключ на этом месте (прогон без загрузки ключа) не затирается: в нём соответствия уже
-    // переданных файлов — он переименовывается.
+    // переданных файлов — он переименовывается. Загруженный ключ перезаписывается, но сначала его копия
+    // ложится рядом («_копия.csv»): если загрузка что-то упустила, прежние соответствия не потеряны.
     if let Some(k) = &batch.key_out {
         if k.exists() && !batch.key_in.as_deref().is_some_and(|i| same_file(i, k)) {
             let backup = keyfile::backup_path(k);
             std::fs::rename(k, &backup).with_context(|| format!("не переименовывается прежний ключ {}", k.display()))?;
             log(format!("Прежний ключ не был загружен и сохранён как {}", backup.display()));
+        } else if k.exists() {
+            let copy = keyfile::keep_copy(k)?;
+            log(format!("Копия ключа до этого запуска: {}", copy.display()));
         }
         keyfile::write(k, &faker.entries)?;
         log(format!("Ключ записан: {}", k.display()));
