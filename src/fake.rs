@@ -11,6 +11,7 @@
 //!   один фейк не достанется и в разных связях.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::OnceLock;
 
 use crate::names::*;
@@ -499,6 +500,54 @@ impl Person {
     }
 }
 
+/// Инициалы фейка на местах инициалов оригинала: буквы `letters` по кругу, регистр и точки — как в оригинале.
+fn put_initials(p: &Person, letters: &[char], out: &mut [String]) {
+    let mut li = 0;
+    for (i, t) in p.toks.iter().enumerate() {
+        if p.roles[i] != Role::Initials {
+            continue;
+        }
+        out[i] = t
+            .chars()
+            .map(|c| {
+                if c.is_alphabetic() {
+                    let l = letters[li % letters.len().max(1)];
+                    li += 1;
+                    if c.is_lowercase() { l.to_lowercase().next().unwrap_or(l) } else { l }
+                } else {
+                    c
+                }
+            })
+            .collect();
+    }
+}
+
+/// Все разные пары инициалов «имя.отчество» из словарей фейков, по порядку: варианты для «Фамилия И.О.»,
+/// когда случайные инициалы уже у другого человека с той же фейковой фамилией.
+fn initial_pairs(female: bool) -> &'static [(char, char)] {
+    fn build(names: &[&str]) -> Vec<(char, char)> {
+        let mut v = Vec::new();
+        for n in names {
+            for s in PATR_STEMS {
+                let pair = (n.chars().next().unwrap_or('А'), s.chars().next().unwrap_or('А'));
+                if !v.contains(&pair) {
+                    v.push(pair);
+                }
+            }
+        }
+        v
+    }
+    static M: OnceLock<Vec<(char, char)>> = OnceLock::new();
+    static F: OnceLock<Vec<(char, char)>> = OnceLock::new();
+    if female { F.get_or_init(|| build(FEMALE)) } else { M.get_or_init(|| build(MALE)) }
+}
+
+/// Города и улицы фейковых адресов в виде для сравнения (`norm_text`).
+fn addr_norms() -> &'static (Vec<String>, Vec<String>) {
+    static S: OnceLock<(Vec<String>, Vec<String>)> = OnceLock::new();
+    S.get_or_init(|| (CITIES.iter().map(|c| norm_text(c)).collect(), STREETS.iter().map(|c| norm_text(c)).collect()))
+}
+
 /// Убирает приписку вида «(ID 12)» в конце — она остаётся от прошлого обезличивания.
 pub fn strip_id_suffix(s: &str) -> &str {
     let t = s.trim_end();
@@ -745,7 +794,8 @@ pub struct Faker {
     date_shift: HashMap<i64, i64>,
     /// Фейки с ID из загруженного ключа: повторный прогон по уже обезличенному файлу их не трогает.
     known_fakes: HashSet<String>,
-    /// Фейковое ФИО без ID → чьё оно (нормализованное исходное): разные люди не должны сливаться.
+    /// Фейковое ФИО без ID (без регистра и лишних пробелов, как сравнивает ВПР) → чьё оно (нормализованное
+    /// исходное и связь): разные люди не должны сливаться.
     used_person: HashMap<String, String>,
     /// Строки, которые уже есть в книге (реальные значения, шапки): фейк не должен с ними совпасть —
     /// иначе две колонки умной таблицы назовутся одинаково или фейк совпадёт с другим человеком.
@@ -939,6 +989,16 @@ impl Faker {
         if d.len() >= 5 {
             self.real_digits.insert(phone_key(&d));
             self.real_digits.insert(d);
+        }
+        // Текст прогона — тоже реальные значения: фейк адреса, ФИО, организации не должен совпасть ни с одним,
+        // даже если строки нет среди общих строк книги (ячейка inlineStr — например, результат прошлого
+        // обезличивания, — или результат формулы). Строка из общих уже здесь — второй раз не разбирается.
+        if !number_like(s) {
+            let n = norm_text(s);
+            if !self.taken.contains(&n) {
+                self.taken.insert(company_key(s));
+                self.taken.insert(n);
+            }
         }
     }
 
@@ -1212,14 +1272,50 @@ impl Faker {
         (0..list.len()).map(|i| list[(start + i) % list.len()]).find(|c| ok(c))
     }
 
-    fn synth_surname(&self, r: &mut Rng) -> String {
+    /// Придуманная фамилия, когда словарные кончились. Случайных попыток — с запасом; когда свободных почти
+    /// нет, придуманные перебираются по порядку (общий курсор: каждая проверяется один раз за прогон), после
+    /// трёхсложных — четырёхсложные и длиннее: свободная найдётся всегда.
+    fn synth_surname(&mut self, r: &mut Rng) -> String {
         const C: &[&str] = &["б", "в", "г", "д", "з", "к", "л", "м", "н", "п", "р", "с", "т", "ф", "х", "ч", "ш"];
         const V: &[&str] = &["а", "е", "и", "о", "у"];
         const E: &[&str] = &["ов", "ев", "ин", "ский"];
-        loop {
+        let free = |f: &Faker, s: &str| !f.used_surname.contains(&norm_word(s)) && !f.taken.contains(&norm_word(s));
+        let shape = "surname";
+        let tries = if self.seq_cursor.contains_key(shape) { RANDOM_TRIES_SPENT } else { 10_000 };
+        for _ in 0..tries {
             let s = format!("{}{}{}{}{}{}", r.pick(C), r.pick(V), r.pick(C), r.pick(V), r.pick(C), r.pick(E));
             let s = title_case(&s);
-            if !self.used_surname.contains(&norm_word(&s)) && !self.taken.contains(&norm_word(&s)) {
+            if free(self, &s) {
+                return s;
+            }
+        }
+        let (_, mut c) = self.seq_cursor.get(shape).copied().unwrap_or((0, 0));
+        loop {
+            // c-я придуманная фамилия: слоги «согласная+гласная» (два, затем три…), согласная, окончание.
+            let (mut i, mut syl) = (c, 2u32);
+            loop {
+                let span = ((C.len() * V.len()) as u64).pow(syl) * (C.len() * E.len()) as u64;
+                if i < span {
+                    break;
+                }
+                i -= span;
+                syl += 1;
+            }
+            c += 1;
+            let e = E[(i % E.len() as u64) as usize];
+            i /= E.len() as u64;
+            let last = C[(i % C.len() as u64) as usize];
+            i /= C.len() as u64;
+            let mut s = String::new();
+            for _ in 0..syl {
+                let cv = (i % (C.len() * V.len()) as u64) as usize;
+                i /= (C.len() * V.len()) as u64;
+                s.push_str(C[cv / V.len()]);
+                s.push_str(V[cv % V.len()]);
+            }
+            let s = title_case(&format!("{s}{last}{e}"));
+            if free(self, &s) {
+                self.seq_cursor.insert(shape.to_string(), (0, c));
                 return s;
             }
         }
@@ -1254,8 +1350,19 @@ impl Faker {
                 let list = if female { FEMALE } else { MALE };
                 let mut r = Rng::new(&[&self.s.salt, "first", &key, if female { "f" } else { "m" }]);
                 let taken = &self.taken;
+                let own_or_taken = |c: &str| norm_word(c) == key || taken.contains(&norm_word(c));
+                // Имён в словаре меньше, чем разных имён в данных: имя повторится у разных людей (ФИО различат
+                // фамилия, отчество, а без ID — проверка в `fake_person`), но не станет своим настоящим
+                // и не совпадёт с другой строкой книги.
                 let f = Self::pick_unique(list, &self.used_first[g], &key, &mut r, &|c: &str| taken.contains(&norm_word(c)))
-                    .unwrap_or_else(|| r.pick(list))
+                    .unwrap_or_else(|| {
+                        let c = r.pick(list);
+                        if !own_or_taken(c) {
+                            return c;
+                        }
+                        let start = r.below(list.len());
+                        (0..list.len()).map(|i| list[(start + i) % list.len()]).find(|c| !own_or_taken(c)).unwrap_or(c)
+                    })
                     .to_string();
                 self.used_first[g].insert(norm_word(&f));
                 self.first[g].insert(key, f.clone());
@@ -1273,15 +1380,17 @@ impl Faker {
                 let mut r = Rng::new(&[&self.s.salt, "patr", &key]);
                 let n = PATR_STEMS.len();
                 let start = r.below(n);
+                let own_or_taken = |i: usize| {
+                    let st = PATR_STEMS[i];
+                    norm_word(st) == key
+                        || self.taken.contains(&norm_word(&format!("{st}ич")))
+                        || self.taken.contains(&norm_word(&format!("{st}на")))
+                };
+                // Свободные кончились — отчество повторится у разных людей, но не своё настоящее и не строка книги.
                 let i = (0..n)
                     .map(|k| (start + k) % n)
-                    .find(|i| {
-                        let st = PATR_STEMS[*i];
-                        !self.used_patr.contains(i)
-                            && norm_word(st) != key
-                            && !self.taken.contains(&norm_word(&format!("{st}ич")))
-                            && !self.taken.contains(&norm_word(&format!("{st}на")))
-                    })
+                    .find(|i| !self.used_patr.contains(i) && !own_or_taken(*i))
+                    .or_else(|| (0..n).map(|k| (start + k) % n).find(|i| !own_or_taken(*i)))
                     .unwrap_or(start);
                 self.used_patr.insert(i);
                 self.patr.insert(key, i);
@@ -1325,83 +1434,193 @@ impl Faker {
                 [f, pt].iter().filter_map(|s| s.chars().next()).collect()
             }
         };
-        let mut li = 0;
         let mut out = Vec::with_capacity(p.toks.len());
         for (i, t) in p.toks.iter().enumerate() {
             let s = match p.roles[i] {
                 Role::Surname => self.map_surname(t, female),
                 Role::First => self.map_first(t, female),
                 Role::Patr => self.map_patr(t, female),
-                Role::Initials => t
-                    .chars()
-                    .map(|c| {
-                        if c.is_alphabetic() {
-                            let l = initials[li % initials.len().max(1)];
-                            li += 1;
-                            if c.is_lowercase() { l.to_lowercase().next().unwrap_or(l) } else { l }
-                        } else {
-                            c
-                        }
-                    })
-                    .collect(),
+                Role::Initials => String::new(),
                 Role::Keep => t.clone(),
             };
             out.push(s);
         }
+        put_initials(&p, &initials, &mut out);
         if with_id {
             let id = self.id_for("person", &id_norm);
             return self.with_id(&out.join(" "), id);
         }
         // Без ID фейк — единственное, что различает людей (ВПР, сводные): при совпадении
-        // с чужим берём другое отчество, затем другое имя, в крайнем случае номер.
+        // с чужим берём другое отчество, затем другое имя (у «Фамилия И.О.» — другие инициалы),
+        // в крайнем случае — номер тёзки: «Петров Олег Юрьевич 2».
         let first_pos = p.roles.iter().position(|r| *r == Role::First);
         let patr_pos = p.roles.iter().position(|r| *r == Role::Patr);
         let names = if female { FEMALE } else { MALE };
         let mut r = Rng::new(&[&self.s.salt, "uniq", &id_norm]);
         let (h1, h2) = (r.below(PATR_STEMS.len()), r.below(names.len()));
-        let mut fake = out.join(" ");
-        let mut k = 0usize;
-        let taken = |f: &str, me: &Faker| {
-            let n = norm_text(f);
-            n != id_norm && me.taken.contains(&n)
-        };
+        let pairs = initial_pairs(female);
+        let h3 = r.below(pairs.len());
+        let base = out.join(" ");
         let me = self.person_owner(&id_norm);
-        while self.used_person.get(&fake).is_some_and(|owner| *owner != me) || taken(&fake, self) {
-            k += 1;
-            let mut alt = out.clone();
-            if let Some(i) = patr_pos {
-                let stem = PATR_STEMS[(h1 + k) % PATR_STEMS.len()];
-                alt[i] = apply_case(&p.toks[i], &format!("{stem}{}", if female { "на" } else { "ич" }));
-            }
-            if let Some(i) = first_pos.filter(|_| patr_pos.is_none() || k >= PATR_STEMS.len()) {
-                alt[i] = apply_case(&p.toks[i], names[(h2 + k / PATR_STEMS.len().max(1)) % names.len()]);
-            }
-            fake = alt.join(" ");
-            if k > PATR_STEMS.len() * names.len() {
-                fake = format!("{} {k}", out.join(" "));
-            }
+        let own = [norm.as_str(), id_norm.as_str()];
+        if self.person_free(&base, &me, &own) {
+            self.used_person.insert(norm_text(&base), me);
+            return base;
         }
-        self.used_person.insert(fake.clone(), me);
+        // Перебор, как до 0.6: отчество по кругу, затем имя; у «Фамилия И.О.» без полной формы — другие
+        // инициалы того же пола. Пока свободных много, хватает нескольких шагов — фейки те же, что прежде.
+        let initials_mode = first_pos.is_none() && patr_pos.is_none() && source.is_none() && p.is_initials_form();
+        let (np, nn) = (PATR_STEMS.len(), names.len());
+        let patr = |i: usize, stem: &str| apply_case(&p.toks[i], &format!("{stem}{}", if female { "на" } else { "ич" }));
+        let alt = |k: usize| {
+            let mut alt = out.clone();
+            if initials_mode {
+                let (a, b) = pairs[(h3 + k) % pairs.len()];
+                put_initials(&p, &[a, b], &mut alt);
+            }
+            if let Some(i) = patr_pos {
+                alt[i] = patr(i, PATR_STEMS[(h1 + k) % np]);
+            }
+            if let Some(i) = first_pos.filter(|_| patr_pos.is_none() || k >= np) {
+                alt[i] = apply_case(&p.toks[i], names[(h2 + k / np.max(1)) % nn]);
+            }
+            alt.join(" ")
+        };
+        let walk = match (first_pos, patr_pos) {
+            (None, None) if initials_mode => pairs.len() - 1,
+            (None, None) => 0,
+            _ => np * nn,
+        };
+        // Те же варианты по порядку: имя × отчество (только отчество, только имя, пары инициалов). Сетка одна
+        // для всех с той же фейковой фамилией и тем же видом записи — по ней идёт общий курсор.
+        let grid_len = match (first_pos, patr_pos) {
+            (Some(_), Some(_)) => nn * np,
+            (None, Some(_)) => np,
+            (Some(_), None) => nn,
+            (None, None) if initials_mode => pairs.len(),
+            (None, None) => 0,
+        };
+        let grid = |c: usize| {
+            let mut g = out.clone();
+            match (first_pos, patr_pos) {
+                (Some(f), Some(i)) => {
+                    g[f] = apply_case(&p.toks[f], names[c / np]);
+                    g[i] = patr(i, PATR_STEMS[c % np]);
+                }
+                (None, Some(i)) => g[i] = patr(i, PATR_STEMS[c]),
+                (Some(f), None) => g[f] = apply_case(&p.toks[f], names[c]),
+                (None, None) => put_initials(&p, &[pairs[c].0, pairs[c].1], &mut g),
+            }
+            g.join(" ")
+        };
+        let variant = |choice: &str| -> Option<String> {
+            let (tag, n) = choice.split_at(1);
+            let n: usize = n.parse().ok()?;
+            Some(match tag {
+                "a" => alt(n),
+                "g" if n < grid_len => grid(n),
+                "n" => format!("{base} {n}"),
+                _ => return None,
+            })
+        };
+        // Тот же человек в другом написании (регистр, пробелы) — тот же выбор, что и в первый раз.
+        let memo = format!("fio:{me}\u{1}{norm}");
+        if let Some(fake) = self.seq_issued.get(&memo).and_then(|(c, _)| variant(c)) {
+            return fake;
+        }
+        let cluster: Vec<String> = out
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let varied = Some(i) == first_pos || Some(i) == patr_pos || (initials_mode && p.roles[i] == Role::Initials);
+                if varied { "\u{1}".to_string() } else { norm_text(t) }
+            })
+            .collect();
+        let shape = format!("fio#{}|{}", female as u8, cluster.join(" "));
+        let mut choice = None;
+        // Как у номеров: случайный перебор ограничен, а если по сетке уже шли — свободных почти нет, сразу по сетке.
+        if !self.seq_cursor.contains_key(&shape) {
+            choice = (1..=walk.min(RANDOM_TRIES as usize)).find(|&k| self.person_free(&alt(k), &me, &own)).map(|k| format!("a{k}"));
+        }
+        if choice.is_none() && grid_len > 0 {
+            // Всё до курсора занято навсегда (другими людьми или строками книги) — перебор не возвращается назад.
+            let mut c = self.seq_cursor.get(&shape).map_or(0, |&(_, c)| c as usize);
+            while c < grid_len {
+                c += 1;
+                if self.person_free(&grid(c - 1), &me, &own) {
+                    choice = Some(format!("g{}", c - 1));
+                    break;
+                }
+            }
+            self.seq_cursor.insert(shape, (0, c as u64));
+        }
+        let choice = choice.unwrap_or_else(|| {
+            // Сетка кончилась — номер тёзки, наименьший свободный: «Петров Олег Юрьевич 2». Курсор свой у каждого
+            // фейка-основы, всё до него занято навсегда.
+            let shape = format!("fio|{}", norm_text(&base));
+            let mut n = self.seq_cursor.get(&shape).map_or(2, |&(_, c)| c);
+            while !self.person_free(&format!("{base} {n}"), &me, &own) {
+                n += 1;
+            }
+            self.seq_cursor.insert(shape, (0, n + 1));
+            format!("n{n}")
+        });
+        let fake = variant(&choice).unwrap_or(base);
+        self.used_person.insert(norm_text(&fake), me);
+        self.seq_issued.insert(memo, (choice, false));
         fake
     }
 
+    /// Свободно ли фейковое ФИО без ID для владельца `me`: не выдано другому человеку (без учёта регистра —
+    /// ВПР не различает «ПЕТРОВ» и «Петров»), не совпадает ни со строкой книги, ни с реальным значением прогона
+    /// или ключа, ни со своим настоящим (`own` — нормализованные исходные).
+    fn person_free(&self, fake: &str, me: &str, own: &[&str]) -> bool {
+        let n = norm_text(fake);
+        self.used_person.get(&n).map_or(true, |o| o == me) && !self.taken.contains(&n) && !own.contains(&n.as_str())
+    }
+
+    /// ФИО, которое не разобрать (цифры, лишние знаки): случайное ФИО из словарей. Случайных попыток — как
+    /// до 0.6; когда свободных не нашлось — сочетания словарей по порядку (общий курсор: каждое проверяется
+    /// один раз за прогон), после всех 600 000 — те же с номером тёзки. Занятое или реальное — никогда.
     fn fallback_person(&mut self, norm: &str, with_id: bool) -> String {
-        let mut attempt = 0u32;
-        loop {
-            let mut r = Rng::new(&[&self.s.salt, "person", norm, &attempt.to_string()]);
-            let fake = format!("{} {} {}ич", r.pick(SURNAMES), r.pick(MALE), r.pick(PATR_STEMS));
-            if with_id {
-                let id = self.id_for("person", norm);
-                return self.with_id(&fake, id);
-            }
-            let me = self.person_owner(norm);
-            let clash = self.used_person.get(&fake).is_some_and(|o| *o != me) || self.taken.contains(&norm_text(&fake));
-            if !clash || attempt > 1000 {
-                self.used_person.insert(fake.clone(), me);
-                return fake;
-            }
-            attempt += 1;
+        let salt = self.s.salt.clone();
+        let random = |attempt: u32| {
+            let mut r = Rng::new(&[&salt, "person", norm, &attempt.to_string()]);
+            format!("{} {} {}ич", r.pick(SURNAMES), r.pick(MALE), r.pick(PATR_STEMS))
+        };
+        if with_id {
+            let fake = random(0);
+            let id = self.id_for("person", norm);
+            return self.with_id(&fake, id);
         }
+        let me = self.person_owner(norm);
+        let memo = format!("fbp:{me}");
+        if let Some((fake, _)) = self.seq_issued.get(&memo) {
+            return fake.clone();
+        }
+        let shape = "person|fallback";
+        let tries = if self.seq_cursor.contains_key(shape) { RANDOM_TRIES_SPENT } else { 1001 };
+        let found = (0..tries).map(random).find(|f| self.person_free(f, &me, &[norm]));
+        let fake = found.unwrap_or_else(|| {
+            let (_, mut c) = self.seq_cursor.get(shape).copied().unwrap_or((0, 0));
+            let (np, nm) = (PATR_STEMS.len(), MALE.len());
+            let span = (SURNAMES.len() * nm * np) as u64;
+            loop {
+                let (m, i) = ((c / span) as usize, (c % span) as usize);
+                c += 1;
+                let mut f = format!("{} {} {}ич", SURNAMES[i / (nm * np)], MALE[i / np % nm], PATR_STEMS[i % np]);
+                if m > 0 {
+                    f.push_str(&format!(" {}", m + 1));
+                }
+                if self.person_free(&f, &me, &[norm]) {
+                    self.seq_cursor.insert(shape.to_string(), (0, c));
+                    break f;
+                }
+            }
+        });
+        self.used_person.insert(norm_text(&fake), me);
+        self.seq_issued.insert(memo, (fake.clone(), false));
+        fake
     }
 
     fn fake_name_part(&mut self, kind: Kind, original: &str, with_id: bool) -> String {
@@ -1492,14 +1711,28 @@ impl Faker {
             self.used_email.insert(e.clone());
             return e;
         }
-        for n in 0.. {
+        // Свободен: не выдан другому и не совпадает с реальным адресом из книги, прогона или ключа.
+        let free = |f: &Faker, e: &str| !f.used_email.contains(e) && !f.taken.contains(&norm_text(e));
+        for n in 0..2_020 {
             let num = if n < 20 { 10 + r.below(90) } else { 100 + r.below(9900) };
             let e = format!("{local}{num}@{domain}");
-            if self.used_email.insert(e.clone()) {
+            if free(self, &e) {
+                self.used_email.insert(e.clone());
                 return e;
             }
         }
-        unreachable!()
+        // Все номера при этом имени заняты — пятизначные по порядку (курсор на имя: каждый проверяется один раз).
+        let shape = format!("email|{local}@{domain}");
+        let (_, mut c) = self.seq_cursor.get(&shape).copied().unwrap_or((0, 0));
+        loop {
+            let e = format!("{local}{}@{domain}", 10_000 + c);
+            c += 1;
+            if free(self, &e) {
+                self.seq_cursor.insert(shape, (0, c));
+                self.used_email.insert(e.clone());
+                return e;
+            }
+        }
     }
 
     fn fake_phone(&mut self, orig: &str, with_id: bool) -> String {
@@ -1763,27 +1996,72 @@ impl Faker {
         let first = orig.split([',', ' ']).next().unwrap_or("");
         let index = first.len() == 6 && first.chars().all(|c| c.is_ascii_digit());
         // Разные адреса — разные фейки: без ID адрес — единственное, что их различает.
-        // Занятый фейк (чужой или настоящий адрес из книги) — следующий вариант, детерминированно.
+        // Занятый фейк (чужой или настоящий адрес из книги, прогона, ключа) — следующий вариант, детерминированно.
         let me = self.person_owner(norm);
-        for n in 0..=10_000u32 {
-            let mut s = String::new();
-            if index {
-                s.push_str(&format!("{}, ", 100000 + r.below(900000)));
-            }
-            let (city, street) = (r.pick(CITIES), r.pick(STREETS));
+        let flat = norm.contains("кв");
+        let free = |f: &Faker, k: &str| f.used_address.get(k).map_or(k != norm && !f.taken.contains(k), |o| *o == me);
+        // Свободных почти не осталось и случайные попытки кончились — адреса того же вида по порядку.
+        let shape = format!("addr|{index}|{flat}");
+        let tries = if self.seq_cursor.contains_key(&shape) { RANDOM_TRIES_SPENT } else { 10_001 };
+        // Вариант сразу собирается в виде для сравнения (строчными, ё → е — как `norm_text`): когда свободных
+        // мало, попыток на адрес — сотня, и каждая без лишних строк.
+        let (cities, streets) = addr_norms();
+        let mut k = String::new();
+        for n in 0..tries {
+            let idx = index.then(|| 100000 + r.below(900000));
+            let (ci, si) = (r.below(CITIES.len()), r.below(STREETS.len()));
             let house = 1 + r.below(if n < 100 { 120 } else { 999 });
-            s.push_str(&format!("г. {city}, ул. {street}, д. {house}"));
-            if norm.contains("кв") {
-                s.push_str(&format!(", кв. {}", 1 + r.below(250)));
+            let fl = flat.then(|| 1 + r.below(250));
+            k.clear();
+            if let Some(i) = idx {
+                let _ = write!(k, "{i}, ");
             }
-            let k = norm_text(&s);
-            let free = self.used_address.get(&k).map_or(k != norm && !self.taken.contains(&k), |o| *o == me);
-            if free || n == 10_000 {
+            let _ = write!(k, "г. {}, ул. {}, д. {house}", cities[ci], streets[si]);
+            if let Some(f) = fl {
+                let _ = write!(k, ", кв. {f}");
+            }
+            if free(self, &k) {
+                let mut s = idx.map_or_else(String::new, |i| format!("{i}, "));
+                s.push_str(&format!("г. {}, ул. {}, д. {house}", CITIES[ci], STREETS[si]));
+                if let Some(f) = fl {
+                    s.push_str(&format!(", кв. {f}"));
+                }
                 self.used_address.entry(k).or_insert(me);
                 return s;
             }
         }
-        unreachable!()
+        // Город × улица × дом (× квартира) по порядку; когда кончатся все — те же с корпусом: «д. 5, корп. 2».
+        // Всё до курсора занято навсегда — перебор не возвращается назад, каждый адрес проверяется один раз.
+        let (houses, flats) = (999u64, if flat { 250u64 } else { 1 });
+        let span = CITIES.len() as u64 * STREETS.len() as u64 * houses * flats;
+        let (_, mut c) = self.seq_cursor.get(&shape).copied().unwrap_or((0, 0));
+        loop {
+            let (korp, mut i) = (c / span, c % span);
+            c += 1;
+            let fl = 1 + i % flats;
+            i /= flats;
+            let house = 1 + i % houses;
+            i /= houses;
+            let street = STREETS[(i % STREETS.len() as u64) as usize];
+            let city = CITIES[(i / STREETS.len() as u64) as usize];
+            let mut s = String::new();
+            if index {
+                s.push_str(&format!("{}, ", 100000 + r.below(900000)));
+            }
+            s.push_str(&format!("г. {city}, ул. {street}, д. {house}"));
+            if korp > 0 {
+                s.push_str(&format!(", корп. {}", korp + 1));
+            }
+            if flat {
+                s.push_str(&format!(", кв. {fl}"));
+            }
+            let k = norm_text(&s);
+            if free(self, &k) {
+                self.seq_cursor.insert(shape, (0, c));
+                self.used_address.entry(k).or_insert(me);
+                return s;
+            }
+        }
     }
 
     fn fake_company(&mut self, orig: &str, with_id: bool) -> String {
@@ -1855,24 +2133,37 @@ impl Faker {
 
     fn new_company_name(&mut self, key: &str) -> String {
         let mut r = Rng::new(&[&self.s.salt, "company", key]);
-        // Попытки не кончаются, пока название не свободно: номер в конце растёт, и свободное найдётся всегда.
-        for attempt in 0u32.. {
+        let free = |f: &Faker, n: &str| !f.used_company.contains(n) && !f.taken.contains(n) && n != key;
+        let shape = "company";
+        let tries = if self.seq_cursor.contains_key(shape) { RANDOM_TRIES_SPENT } else { 400 };
+        for attempt in 0..tries {
             let name = if attempt < 20 {
                 r.pick(COMPANY_NAMES).to_string()
             } else if attempt < 150 {
                 format!("{} {}", r.pick(COMPANY_NAMES), r.pick(COMPANY_SUFFIXES))
-            } else if attempt < 400 {
-                format!("{} {}", r.pick(COMPANY_NAMES), 2 + r.below(9998))
             } else {
-                format!("{} {}", r.pick(COMPANY_NAMES), 10_000 + attempt)
+                format!("{} {}", r.pick(COMPANY_NAMES), 2 + r.below(9998))
             };
             let n = norm_text(&name);
-            if !self.used_company.contains(&n) && !self.taken.contains(&n) && n != key {
+            if free(self, &n) {
                 self.used_company.insert(n);
                 return name;
             }
         }
-        unreachable!()
+        // Случайные свободные не находятся — названия с номером от 10 000 по порядку (общий курсор: каждое
+        // проверяется один раз за прогон), свободное найдётся всегда.
+        let (_, mut c) = self.seq_cursor.get(shape).copied().unwrap_or((0, 0));
+        loop {
+            let len = COMPANY_NAMES.len() as u64;
+            let name = format!("{} {}", COMPANY_NAMES[(c % len) as usize], 10_000 + c / len);
+            c += 1;
+            let n = norm_text(&name);
+            if free(self, &n) {
+                self.seq_cursor.insert(shape.to_string(), (0, c));
+                self.used_company.insert(n);
+                return name;
+            }
+        }
     }
 
     // ------------------------------------------------ прочее
@@ -1960,7 +2251,23 @@ impl Faker {
             }
             self.enter_group(&link);
             if let Some((kind, _, label)) = parse_kind_key(&e.kind_key) {
-                let number = matches!(kind, Kind::Inn | Kind::Snils | Kind::Passport | Kind::Account);
+                // Настоящие значения ключа — чьи-то данные, хоть их и нет в этой книге: новый фейк не должен
+                // с ними совпасть (номера ключа так же попадают в `real_digits`).
+                if matches!(
+                    kind,
+                    Kind::FullName | Kind::LastName | Kind::FirstName | Kind::MiddleName | Kind::Email | Kind::Address | Kind::Company
+                ) {
+                    let real = strip_id_suffix(&e.real);
+                    if kind == Kind::Company {
+                        self.taken.insert(company_key(real));
+                    }
+                    if kind == Kind::Email {
+                        // В ячейке может быть несколько адресов через «;».
+                        self.taken.extend(real.split([';', ',', '\n']).map(norm_text).filter(|x| !x.is_empty()));
+                    }
+                    self.taken.insert(norm_text(real));
+                }
+                let number =matches!(kind, Kind::Inn | Kind::Snils | Kind::Passport | Kind::Account);
                 let short = number && short_code(&digits_of(&e.real));
                 // Ключ версий до 0.3: короткий код получал ID на место своих цифр («Дог1» → «Дог1») —
                 // такую запись не восстанавливаем, код получит новый фейк.
@@ -1999,7 +2306,7 @@ impl Faker {
                         // «Иванов И.И.» в новом файле привяжется к полному ФИО из ключа.
                         self.prepare_people(std::iter::once(e.real.as_str()));
                         if e.id.is_none() {
-                            self.used_person.insert(e.fake.clone(), self.person_owner(&norm_text(strip_id_suffix(&e.real))));
+                            self.used_person.insert(norm_text(&e.fake), self.person_owner(&norm_text(strip_id_suffix(&e.real))));
                         }
                     }
                     Kind::Company => {
@@ -2012,7 +2319,7 @@ impl Faker {
                                 self.company_text.entry(rn.trim().to_string()).or_insert_with(|| (fname.clone(), None));
                             }
                             if e.id.is_none() {
-                                self.used_person.insert(fname.clone(), self.person_owner(&norm_text(&rn)));
+                                self.used_person.insert(norm_text(&fname), self.person_owner(&norm_text(&rn)));
                             }
                         } else if !fp.is_empty() || !fname.is_empty() {
                             self.used_company.insert(norm_text(&fname));
@@ -2329,6 +2636,81 @@ mod tests {
             assert!(c.starts_with(starts) && c.ends_with(ends), "{orig} → {c}");
             for w in ["(М)", "Филиал", "№5", "Москва", "Тверь", "Склад", "Восход"] {
                 assert!(!c.contains(w), "{orig} → {c}: осталось «{w}»");
+            }
+        }
+    }
+
+    /// Свободных адресов нет (курсор у конца словарей, случайная попытка занята): 0.5 после 10 000 попыток
+    /// отдавал занятый фейк, 0.6 — тот же адрес с корпусом, и ни одного занятого.
+    #[test]
+    fn address_exhausted_gets_korpus() {
+        let a = faker().new_address("ул. Тестовая, 1", "ул. тестовая, 1");
+        let mut f = faker();
+        let span = (CITIES.len() * STREETS.len() * 999) as u64;
+        f.seq_cursor.insert("addr|false|false".into(), (0, span - 1));
+        f.used_address.insert(norm_text(&a), "чужой".into());
+        f.used_address.insert(norm_text("г. Рязань, ул. Цветочная, д. 999"), "чужой".into());
+        // Следующий по порядку — реальный адрес из книги: тоже пропускается.
+        f.taken.insert(norm_text("г. Москва, ул. Ленина, д. 1, корп. 2"));
+        assert_eq!(f.new_address("ул. Тестовая, 1", "ул. тестовая, 1"), "г. Москва, ул. Ленина, д. 2, корп. 2");
+    }
+
+    /// ФИО, которое не разобрать: все сочетания словарей заняты — следующее по порядку с номером тёзки.
+    #[test]
+    fn fallback_person_exhausted_gets_number() {
+        let a = faker().fallback_person("x1 тест", false);
+        let mut f = faker();
+        let span = (SURNAMES.len() * MALE.len() * PATR_STEMS.len()) as u64;
+        f.seq_cursor.insert("person|fallback".into(), (0, span - 1));
+        f.used_person.insert(norm_text(&a), "чужой".into());
+        let last = format!("{} {} {}ич", SURNAMES[SURNAMES.len() - 1], MALE[MALE.len() - 1], PATR_STEMS[PATR_STEMS.len() - 1]);
+        f.used_person.insert(norm_text(&last), "чужой".into());
+        let b = f.fallback_person("x1 тест", false);
+        assert_eq!(b, format!("{} {} {}ич 2", SURNAMES[0], MALE[0], PATR_STEMS[0]));
+        assert_eq!(f.fallback_person("x1 тест", false), b, "тот же человек — тот же фейк");
+        let c = f.fallback_person("x2 тест", false);
+        assert_ne!(norm_text(&c), norm_text(&b));
+    }
+
+    #[test]
+    fn company_and_email_exhausted() {
+        let a = faker().new_company_name("тест");
+        let mut f = faker();
+        f.seq_cursor.insert("company".into(), (0, 0));
+        f.used_company.insert(norm_text(&a));
+        f.taken.insert(norm_text(&format!("{} 10000", COMPANY_NAMES[0])));
+        assert_eq!(f.new_company_name("тест"), format!("{} 10000", COMPANY_NAMES[1]));
+
+        let e = faker().new_email("ivan@corp.ru", false);
+        let local = e.split('@').next().unwrap().trim_end_matches(|c: char| c.is_ascii_digit()).to_string();
+        let mut f = faker();
+        for n in 10..10_000 {
+            f.used_email.insert(format!("{local}{n}@example.com"));
+        }
+        f.taken.insert(format!("{local}10000@example.com"));
+        assert_eq!(f.new_email("ivan@corp.ru", false), format!("{local}10001@example.com"));
+        // Реальный адрес из книги фейком не становится.
+        let mut g = faker();
+        g.taken.insert(e.clone());
+        assert_ne!(g.new_email("ivan@corp.ru", false), e);
+    }
+
+    /// 3000 разных «Имя Отчество» одного пола: сочетаний словарей 2400 — остальным номер тёзки, небольшой,
+    /// и все фейки разные.
+    #[test]
+    fn namesakes_numbered() {
+        let mut f = faker();
+        let mut r = rule(Kind::FullName);
+        r.with_id = false;
+        let reals: Vec<String> =
+            (0..3000).map(|i| format!("{} {}{}ич", MALE[i % 60], PATR_STEMS[i / 60 % 40], if i >= 2400 { "ов" } else { "" })).collect();
+        let fakes: Vec<String> = reals.iter().map(|x| f.fake(&r, x, false)).collect();
+        let uniq: HashSet<String> = fakes.iter().map(|y| norm_text(y)).collect();
+        assert_eq!(uniq.len(), reals.len());
+        assert!(fakes.iter().any(|y| y.ends_with(" 2")), "{:?}", &fakes[2900..]);
+        for y in &fakes {
+            if let Some(n) = y.rsplit(' ').next().and_then(|t| t.parse::<u32>().ok()) {
+                assert!(n < 10, "{y}");
             }
         }
     }
