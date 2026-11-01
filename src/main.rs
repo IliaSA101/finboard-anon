@@ -2293,4 +2293,44 @@ mod tests {
         let names: Vec<String> = excel_files_in(&d).iter().map(|p| p.strip_prefix(&d).unwrap().to_string_lossy().replace('\\', "/")).collect();
         assert_eq!(names, ["a.xlsx", "sub/b.xlsx"]);
     }
+
+    /// Ссылка, названная как книга («архив.xlsx» — точка соединения на чужую папку; так же выглядит
+    /// символическая ссылка на файл): не папка и не книга этой папки — в список не попадает.
+    #[cfg(windows)]
+    #[test]
+    fn folder_skips_link_named_like_book() {
+        let d = temp_dir("junction_named");
+        let other = temp_dir("junction_named_other");
+        std::fs::write(d.join("a.xlsx"), b"x").unwrap();
+        std::fs::write(other.join("чужой.xlsx"), b"x").unwrap();
+        let st = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(d.join("архив.xlsx")).arg(&other).output().unwrap();
+        assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+        let names: Vec<String> = excel_files_in(&d).iter().map(|p| p.strip_prefix(&d).unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["a.xlsx"]);
+    }
+
+    /// Вторая папка, брошенная в окно, пока первая ещё открывается: просьба подождать, а файлы первой — в списке.
+    /// Без проверки второе открытие подменяло первое, и файлы первой папки молча терялись.
+    #[test]
+    fn second_open_while_opening_is_refused() {
+        let a = temp_dir("bg_first");
+        let b = temp_dir("bg_second");
+        for n in ["a", "b", "c"] {
+            std::fs::copy(sample(), a.join(format!("{n}.xlsx"))).unwrap();
+        }
+        std::fs::copy(sample(), b.join("z.xlsx")).unwrap();
+        let mut app = App::blank();
+        let mut s = Screen::new();
+        app.open_files_bg(vec![a.clone()], false, &s.ctx);
+        app.open_files_bg(vec![b.clone()], false, &s.ctx);
+        assert!(app.status_err && app.status.starts_with("Дождитесь"), "{}", app.status);
+        let t0 = Instant::now();
+        while app.opening.is_some() {
+            assert!(t0.elapsed() < Duration::from_secs(60), "открытие не закончилось: {}", app.status);
+            s.frame(&mut app, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let names: Vec<String> = app.docs.iter().map(|d| file_name(&d.path)).collect();
+        assert_eq!(names, ["a.xlsx", "b.xlsx", "c.xlsx"], "{}", app.status);
+    }
 }

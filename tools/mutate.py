@@ -59,7 +59,7 @@ MUTANTS = [
      'ошибки и логические значения в колонке правила заменяются'),
     ('src/fake.rs', '                        self.prepare_people(std::iter::once(e.real.as_str()));', '',
      'после загрузки ключа инициалы не связываются с полным ФИО'),
-    ('src/fake.rs', 'while self.used_person.get(&fake).is_some_and(|owner| *owner != id_norm) || taken(&fake, self) {', 'while false {',
+    ('src/fake.rs', 'while self.used_person.get(&fake).is_some_and(|owner| *owner != me) || taken(&fake, self) {', 'while false {',
      'без ID разные люди получают один фейк'),
     ('src/fake.rs', '                            self.used_company.insert(norm_text(&fname));', '',
      'организации из ключа совпадают с новыми'),
@@ -107,7 +107,7 @@ MUTANTS = [
      'время около полуночи превращается в «T24:00:00»'),
 
     # --- несколько файлов, организации, ИНН
-    ('src/fake.rs', '        let key = norm_text(&name);\n        let (pre, post) = (form_only', '        let key = norm_text(orig);\n        let (pre, post) = (form_only',
+    ('src/fake.rs', '        let bare = norm_text(&name);', '        let bare = norm_text(orig);',
      'организация в разных написаниях («ООО «Ромашка»», «Ромашка») получает разные фейки'),
     ('src/fake.rs', "for (a, b) in [('«', '»'), ('\"', '\"'), ('“', '”'), ('„', '“')] {", "for (a, b) in [('«', '»')] {",
      'название в обычных кавычках («ООО \"Ромашка\"») не узнаётся'),
@@ -117,17 +117,17 @@ MUTANTS = [
      'один ИНН в разном виде («77 07 083893», «ИНН: …») получает разные фейки'),
     ('src/fake.rs', '                            self.digits.entry(d).or_insert(fd);', '',
      'ИНН без ID из ключа не восстанавливается — в следующем файле другой фейк'),
-    ('src/fake.rs', '                            self.company.entry(norm_text(&rn)).or_insert(base);', '                            let _ = base;',
+    ('src/fake.rs', 'self.company.entry(format!("{form}|{}", norm_text(&rn))).or_insert(base);', 'let _ = base;',
      'организация из ключа в другом написании получает новый фейк'),
-    ('src/fake.rs', '        let s = if is_ip(&pre, &post) {', '        let s = if false {',
+    ('src/fake.rs', '        let ip = is_ip(&pre, &post);', '        let ip = false;',
      'ИП-контрагент и тот же человек в колонке ФИО — разные фейки'),
     ('src/fake.rs', '                            self.register_person(&rn, &fname);', '',
      'ИП из ключа и тот же человек в другом файле — разные фейки'),
     ('src/fake.rs', '            tail.replace_range(0..1, "9");', '',
      'номер счёта-число превращается в текст (ведущий ноль)'),
-    ('src/fake.rs', 'format!("9900{body}")', 'format!("0000{body}")',
+    ('src/fake.rs', '_ if n < 64 => format!("9900{}"', '_ if n < 64 => format!("0000{}"',
      'ИНН-число превращается в текст (ведущие нули), ВПР по ИНН ломается'),
-    ('src/anon.rs', '    for e in &faker.entries {\n        maps.strings.entry', '    for e in faker.entries.iter().take(0) {\n        maps.strings.entry',
+    ('src/anon.rs', '    for e in entries {\n        maps.strings.entry', '    for e in entries.into_iter().take(0) {\n        maps.strings.entry',
      'значение из другого файла (ИНН в колонке без правила) не заменяется'),
     ('src/anon.rs', '    if !has_f && (t.is_empty() || t == "n") && v.len() >= 9 {', '    if false {',
      'длинное число (ИНН, телефон) в колонке без правила остаётся'),
@@ -139,7 +139,7 @@ MUTANTS = [
      'проверка не видит в файле значения других файлов и ключа'),
     ('src/anon.rs', '        if k.exists() && !batch.key_in', '        if false && !batch.key_in',
      'прогон без загрузки ключа затирает общий ключ папки'),
-    ('src/anon.rs', '            while !used.insert(out.to_string_lossy().to_lowercase()) {', '            while false {',
+    ('src/anon.rs', 'while !used.insert(out.to_string_lossy().to_lowercase()) {', 'while false {',
      'одноимённые файлы из разных папок затирают друг друга в папке результатов'),
     ('src/anon.rs', '[shared_key_path(input), legacy_key_path(input)]', '[legacy_key_path(input), shared_key_path(input)]',
      'старый ключ файла важнее общего ключа папки'),
@@ -161,9 +161,9 @@ MUTANTS = [
      'сдвиг даты из ключа не восстанавливается'),
     ('src/fake.rs', '                                    self.emails.entry(r.to_lowercase()).or_insert_with(|| f.clone());', '',
      'email из ключа в другом регистре — новый фейк'),
-    ('src/fake.rs', '                                        self.phones.entry(phone_key(&dr)).or_insert_with(|| phone_key(&df));', '',
+    ('src/fake.rs', '                                        self.phones.entry(kr).or_insert(kf);', '',
      'телефон из ключа в другом формате — новый фейк'),
-    ('src/fake.rs', '                        self.addresses.entry(norm_text(strip_id_suffix(&e.real))).or_insert(fake_core);', '                        let _ = fake_core;',
+    ('src/fake.rs', '                        self.addresses.entry(norm).or_insert(fake_core);', '                        let _ = (norm, fake_core);',
      'адрес из ключа в другом написании — новый фейк'),
     ('src/fake.rs', '        if self.known_fakes.contains(original) {', '        if false {',
      'повторный прогон по результату с ключом обезличивает фейки второй раз'),
@@ -193,7 +193,7 @@ MUTANTS = [
      'ИНН в кэше формулы (ВПР из справочника) остаётся'),
     ('src/anon.rs', '        Some(k) => shared_key_path(k),', '        Some(_) => shared_key_path(first_input),',
      'ключ второй папки устаревает: новые записи уходят в ключ первой'),
-    ('src/bin/cli.rs', '    let found = find_key(&first);', '    let found = Some(shared_key_path(&first)).filter(|k| k.exists());',
+    ('src/bin/cli.rs', 'let found = if no_key { None } else { find_key(&first) };', 'let found = if no_key { None } else { Some(shared_key_path(&first)).filter(|k| k.exists()) };',
      'консоль не подхватывает старый ключ файла'),
     ('src/anon.rs', 'b"fileSharing" if clean_meta =>', 'b"fileSharing" if false =>',
      'служебное поле: имя пользователя в fileSharing остаётся'),
@@ -230,7 +230,7 @@ MUTANTS = [
     ('src/anon.rs', 'let low = s.to_ascii_lowercase();', 'let low = s.to_string();',
      'служебные пути: путь профиля в другом регистре остаётся'),
     # 0.2: доработки по тестам клиента
-    ('src/anon.rs', '.filter(|m| word_bounded(data, m.start(), m.end()))', '',
+    ('src/anon.rs', '.filter(|m| mine(m.start()) && word_bounded(data, m.start(), m.end()))', '.filter(|m| mine(m.start()))',
      '0.2 проверка: «Фирма1» внутри «Фирма13» — ложная тревога'),
     ('src/anon.rs', '!(alnum(m.chars().next()) && alnum(prev)) && ', '',
      '0.2 проверка: «Фирма1» внутри «ТоргФирма1» — ложная тревога'),
@@ -244,7 +244,7 @@ MUTANTS = [
      '0.2 имена пользователей SharePoint остаются'),
     ('src/anon.rs', '(b"AccountId", "0")', '(b"AccountIdX", "0")',
      '0.2 номера пользователей SharePoint остаются'),
-    ('src/anon.rs', '                pending = decode_utf16(&pending[2..], be).map(String::into_bytes).unwrap_or(pending);', '',
+    ('src/anon.rs', '                pending = String::from_utf16_lossy(&units).into_bytes();', '                let _ = units;',
      '0.2 проверка не видит утечки в частях UTF-16'),
     ('src/anon.rs', 'let (pre, post) = id.map(|id| faker.id_affixes(id)).unwrap_or_default();', 'let (pre, post): (String, String) = Default::default();',
      '0.2 организация внутри фразы без ID'),
@@ -299,7 +299,7 @@ MUTANTS = [
      '0.3 короткий код из 4 цифр остаётся сам собой'),
     ('src/fake.rs', "                if id < 100_000 { format!(\"9{id:05}\") } else { format!(\"9{id}\") }", "                id.to_string()",
      '0.3 «Дог1» → «Дог1»: ID на месте цифр'),
-    ('src/fake.rs', "            let id = self.id_for(\"code\", &norm_text(orig));", "            let id = self.id_for(\"code\", &digits_of(orig));",
+    ('src/fake.rs', "let id = self.id_for(\"code\", &norm);", "let id = self.id_for(\"code\", &digits_of(orig));",
      '0.3 «Дог1» и «Счет1» — один ID'),
     ('src/fake.rs', "                if short && digits_of(&e.fake).len() == digits_of(&e.real).len() {\n                    continue;", "                if false {\n                    continue;",
      '0.3 старый ключ возвращает «Дог1» → «Дог1»'),
@@ -311,9 +311,9 @@ MUTANTS = [
      '0.3 правило короче таблицы — без предупреждения'),
     ('src/anon.rs', "                if !v.formula {\n                    for (ri, _)", "                if true {\n                    for (ri, _)",
      '0.3 формула под правилом считается данными'),
-    ('src/anon.rs', "            let texts = if para.is_match(data) { paragraph_texts(data) } else { Vec::new() };", "            let texts: Vec<String> = Vec::new();",
+    ('src/anon.rs', "            let texts = if whole && para.is_match(data) { paragraph_texts(data) } else { Vec::new() };", "            let texts: Vec<String> = Vec::new();",
      '0.3 проверка: текст, разрезанный форматированием, не склеивается'),
-    ('src/anon.rs', "digit_runs(&text).into_iter().filter(|(a, b)| b - a >= min_digits)", "digit_runs(&text).into_iter().filter(|(a, b)| b - a > min_digits)",
+    ('src/anon.rs', "                    if b - a < min_digits {", "                    if b - a <= min_digits {",
      '0.3 проверка: номер ровно минимальной длины пропускается'),
     ('src/anon.rs', "            Some(rd) => f_tag.stream_find_iter(rd).next().transpose()?.is_some(),", "            Some(_) => false,",
      '0.3 формулы на листах не видны (производные значения)'),
@@ -399,7 +399,7 @@ MUTANTS = [
      '0.4 ход: объём не оценён — полоса стоит на нуле'),
     ('src/anon.rs', "if rs.iter().any(|r| r.sheet == s.name) { 4 } else { 3 }", "if rs.iter().any(|r| r.sheet == s.name) { 3 } else { 3 }",
      '0.4 ход: сбор значений не в оценке — полоса упирается в 99 % раньше'),
-    ('src/anon.rs', "None if name.ends_with(\".xml\") || name.ends_with(\".rels\") || name.ends_with(\".vml\") => total += size,", "None if false => total += size,",
+    ('src/anon.rs', "None if name.ends_with(\".xml\") || name.ends_with(\".rels\") || name.ends_with(\".vml\") => total = total.saturating_add(size),", "None if false => total = total.saturating_add(size),",
      '0.4 ход: общие строки и прочие части не в оценке'),
     ('src/anon.rs', "BufReader::with_capacity(1 << 16, crate::xlsx::counted(zip.by_index(i)?)),", "BufReader::with_capacity(1 << 16, zip.by_index(i)?),",
      '0.4 ход: запись листов не учитывается'),
@@ -413,7 +413,7 @@ MUTANTS = [
      '0.4 ход: до оценки объёма полоса полная'),
     ('src/anon.rs', "by_real.retain(|real, kinds| kinds.len() >= 2 && real.chars().count() >= 3);", "by_real.retain(|_, kinds| kinds.len() >= 2);",
      '0.4 разные типы: короткие пометки («НД») посчитаны'),
-    ('src/anon.rs', "if kinds.iter().all(|k| parse_kind_key(k).is_some_and(|(k, _, _)| k == Kind::Text)) {", "if kinds.iter().any(|k| parse_kind_key(k).is_some_and(|(k, _, _)| k == Kind::Text)) {",
+    ('src/anon.rs', "!ks.iter().all(|k| parse_kind_key(k).is_some_and(|(k, _, _)| k == Kind::Text))", "!ks.iter().any(|k| parse_kind_key(k).is_some_and(|(k, _, _)| k == Kind::Text))",
      '0.4 разные типы: «Шаблон» и «ФИО» с общими людьми — без предупреждения'),
     ('src/anon.rs', "            here.insert(r.kind_key());\n", "",
      '0.4 разные типы: ключ назван без ключа'),
@@ -435,19 +435,158 @@ MUTANTS = [
      '0.4 организация: пробел после формы теряется («ОООПрогресс»)'),
     ('src/fake.rs', "    let lead = if part.starts_with(char::is_whitespace) { \" \" } else { \"\" };", "    let lead = \"\";",
      '0.4 организация: пробел перед формой теряется («Прогресс ООО»)'),
+    # 0.5: «Связь», разные фейки, журнал без реальных значений, запись файлов и ключа
+    ('src/profile.rs', ".filter(|c| !matches!(c, '@' | '[' | ']') && !c.is_control())", ".filter(|c| !c.is_control())",
+     '0.5 связь: «@» и скобки в имени связи ломают ключ типа'),
+    ('src/profile.rs', "        if !link.is_empty() {\n            s.push('@');", "        if true {\n            s.push('@');",
+     '0.5 связь: «@» и у общей связи — ключи не те, что в 0.4'),
+    ('src/profile.rs', "if !head.is_empty() && !link.contains(']') =>", "if !head.is_empty() =>",
+     '0.5 связь: «@» в подписи шаблона принят за связь'),
+    ('src/profile.rs', "    let key = split_link(key).0;\n", "",
+     '0.5 связь: ключ типа со связью не разбирается'),
+    ('src/fake.rs', 'self.s.salt = if g.is_empty() { self.base_salt.clone() } else { format!("{}@{g}", self.base_salt) };', 'self.s.salt = self.base_salt.clone();',
+     '0.5 связь: соль связи не учитывается'),
+    ('src/fake.rs', 'let mut next = self.groups.remove(g).unwrap_or_default();', 'let mut next = GroupMaps::default();',
+     '0.5 связь: словари связи теряются при переключении'),
+    ('src/fake.rs', '        std::mem::swap(&mut self.date_shift, &mut m.date_shift);\n', '',
+     '0.5 связь: сдвиг дат общий для всех связей'),
+    ('src/fake.rs', '        std::mem::swap(&mut self.company_text, &mut m.company_text);\n', '',
+     '0.5 связь: организация внутри текста — фейк первой встреченной связи, а не общей'),
+    ('src/fake.rs', 'let link = split_link(&e.kind_key).1.to_string();', 'let link = String::new();',
+     '0.5 связь: запись ключа со связью восстанавливается в общую'),
+    ('src/fake.rs', "    pub fn set_link_order<'a>(&mut self, links: impl IntoIterator<Item = &'a str>) {\n        for l in links {", "    pub fn set_link_order<'a>(&mut self, links: impl IntoIterator<Item = &'a str>) {\n        for l in links.into_iter().take(0) {",
+     '0.5 связь: номер в тексте — фейк связи, встреченной первой в данных, а не в правилах'),
+    ('src/fake.rs', 'std::iter::once("")\n            .chain(self.link_order.iter().map(String::as_str))', 'self.link_order.iter().map(String::as_str)\n            .chain(std::iter::once(""))',
+     '0.5 связь: номер в тексте — фейк связи, а не общей'),
+    ('src/fake.rs', 'let owner = self.person_owner(&format!("{space}:{real}"));', 'let owner = format!("{space}:{real}");',
+     '0.5 связь: номер в другой связи забирает чужой фейк'),
+    ('src/fake.rs', '                Some(o) => *o == owner,', '                Some(_) => true,',
+     '0.5 номера: чужой занятый фейк выдаётся второму номеру'),
+    ('src/fake.rs', '                None => !self.is_real_number(&cand),', '                None => true,',
+     '0.5 номера: фейк совпадает с настоящим номером'),
+    ('src/fake.rs', '        if d.len() >= 5 {\n            self.real_digits.insert(phone_key(&d));', '        if d.len() > 5 {\n            self.real_digits.insert(phone_key(&d));',
+     '0.5 номера: пятизначный настоящий номер не защищён'),
+    ('src/anon.rs', '    faker.note_reals(all().map(|(_, it)| it.1.as_str()));\n', '',
+     '0.5 номера: фейк совпадает с настоящим номером-числом ниже в колонке'),
+    ('src/fake.rs', '            if number_like(s) {\n                self.note_real(s);\n            }', '',
+     '0.5 номера: фейк совпадает с номером в колонке без правила'),
+    ('src/anon.rs', '    faker.prepare_companies(all().filter(|(r, _)| r.kind == Kind::Company).map(|(_, it)| it.1.as_str()));\n', '',
+     '0.5 организации: «Вектор» выше «ООО «Вектор»» — разные фейки'),
+    ('src/fake.rs', 'if let Some(f) = self.forms.get(name).filter(|f| f.len() == 1).and_then(|f| f.iter().next()) {', 'if let Some(f) = self.forms.get(name).and_then(|f| f.iter().next()) {',
+     '0.5 организации: «Ромашка» без формы приписана одному из двух юрлиц'),
+    ('src/fake.rs', 'let key = if ip { bare.clone() } else { self.company_identity(&form, &bare) };', 'let key = bare.clone();',
+     '0.5 организации: ООО и АО с одним названием — одна организация'),
+    ('src/fake.rs', 'self.company.entry(format!("{form}|{}", norm_text(&rn))).or_insert(base);', 'self.company.entry(format!("|{}", norm_text(&rn))).or_insert(base);',
+     '0.5 ключ: ООО и АО с одним названием из ключа — один фейк'),
+    ('src/fake.rs', 'let d = if kind == Kind::Inn && matches!(d.len(), 9 | 11) && fd.len() == d.len() + 1 { format!("0{d}") } else { d };', 'let d = d;',
+     '0.5 ключ: ИНН-число без нуля из ключа не заменяется внутри текста'),
+    ('src/fake.rs', '                            self.issued.entry(fd.clone()).or_insert(me);\n', '',
+     '0.5 ключ: фейк номера из ключа выдаётся новому номеру'),
+    ('src/fake.rs', '                                        self.issued.entry(kf.clone()).or_insert(me);\n', '',
+     '0.5 ключ: фейк телефона из ключа выдаётся новому телефону'),
+    ('src/fake.rs', '                            self.issued_codes.entry(norm_text(&e.fake)).or_insert(me);\n', '',
+     '0.5 ключ: фейк короткого кода из ключа выдаётся новому коду'),
+    ('src/fake.rs', '                        self.used_address.entry(norm_text(&fake_core)).or_insert(me);\n', '',
+     '0.5 ключ: фейк адреса из ключа выдаётся новому адресу'),
+    ('src/fake.rs', '(s.len() <= width).then(', '(s.len() < width).then(',
+     '0.5 номера: ID во всю ширину номера не виден'),
+    ('src/fake.rs', 'let free = self.issued_codes.get(&k).map_or(!self.taken.contains(&k), |o| *o == me);', 'let free = true;',
+     '0.5 коды: два кода получают один фейк'),
+    ('src/fake.rs', 'map_or(k != norm && !self.taken.contains(&k), |o| *o == me)', 'map_or(k != norm, |o| *o == me)',
+     '0.5 адреса: фейк совпадает с адресом из книги'),
+    ('src/fake.rs', 'if o != 0 && !self.groups.values().any(|g| g.date_shift.get(&d) == Some(&o)) {', 'if o != 0 {',
+     '0.5 связь: одна дата в разных связях сдвинута одинаково'),
+    ('src/anon.rs', '    if rank.len() > 1 {\n        let rule_rank', '    if false {\n        let rule_rank',
+     '0.5 связь: вне разметки — фейк связи, встреченной первой в данных'),
+    ('src/anon.rs', '    entries.sort_by_key(|e| link_rank(split_link(&e.kind_key).1));\n', '',
+     '0.5 связь: значение только из ключа вне разметки — фейк не общей связи'),
+    ('src/anon.rs', 'let mut rank = HashMap::from([(String::new(), 0)]);', 'let mut rank: HashMap<String, usize> = HashMap::new();',
+     '0.5 связь: общая связь не первая вне разметки'),
+    ('src/anon.rs', '        maps.digits.entry(real.to_string()).or_insert_with(|| fake.to_string());', '        maps.digits.insert(real.to_string(), fake.to_string());',
+     '0.5 связь: номер в тексте — фейк последней связи'),
+    ('src/anon.rs', 'maps.phones.entry(real.to_string()).or_insert_with(|| fake.to_string());', 'maps.phones.insert(real.to_string(), fake.to_string());',
+     '0.5 связь: телефон в тексте — фейк последней связи'),
+    ('src/anon.rs', '    link_overlaps(&mut plans, &faker);\n', '',
+     '0.5 связь: без строки о разных фейках вне разметки'),
+    ('src/anon.rs', 'if parse_kind_key(&e.kind_key).is_some_and(|(k, _, _)| matches!(k, Kind::Clear | Kind::Keep)) {', 'if false {',
+     '0.5 связь: «Очистить» со связью — ложная строка о разных фейках'),
+    ('src/anon.rs', 'by_link.entry(split_link(k).1).or_default().push(*k);', 'by_link.entry("").or_default().push(*k);',
+     '0.5 разные типы: разные связи считаются конфликтом'),
+    ('src/anon.rs', '            if !bad.contains(r.link_name().as_str()) {\n                continue;', '            if false {\n                continue;',
+     '0.5 разные типы: названы колонки другой связи'),
+    ('src/anon.rs', 'let link = if r.link_name().is_empty() { String::new() } else { format!(", связь «{}»", r.link.trim()) };', 'let link = String::new();',
+     '0.5 отчёт: связь правила не названа'),
+    ('src/anon.rs', 'for s in k.samples.iter().map(|s| mask_sample(s)) {', 'for s in k.samples.iter().cloned() {',
+     '0.5 журнал: найденные реальные значения как есть'),
+    ('src/anon.rs', '                    if !shown.contains(&s) {\n                        shown.push(s);', '                    if true {\n                        shown.push(s);',
+     '0.5 журнал: одинаковые маски повторяются'),
+    ('src/anon.rs', 'faker.entries.len() - key_entries));', 'faker.entries.len()));',
+     '0.5 журнал: новые значения считаются вместе с ключом'),
+    ('src/anon.rs', 'let _key_lock = batch.key_out.as_deref().map(keyfile::lock).transpose()?;', 'let _key_lock: Option<keyfile::KeyLock> = None;',
+     '0.5 замок: второй запуск на том же ключе не останавливается'),
+    ('src/anon.rs', 'let _key_lock = batch.key_out.as_deref().map(keyfile::lock).transpose()?;', 'let _ = batch.key_out.as_deref().map(keyfile::lock).transpose()?;',
+     '0.5 замок снимается сразу, а не в конце прогона'),
+    ('src/keyfile.rs', 'h.host == host_name() && h.pid != std::process::id() && !process_alive(h.pid)', 'h.host == host_name() && h.pid != std::process::id()',
+     '0.5 замок: замок идущего запуска считается брошенным'),
+    ('src/keyfile.rs', 'h.host == host_name() && h.pid != std::process::id() && !process_alive(h.pid)', 'h.pid != std::process::id() && !process_alive(h.pid)',
+     '0.5 замок: замок с другого компьютера снимается по номеру процесса здесь'),
+    ('src/keyfile.rs', 'h.host == host_name() && h.pid != std::process::id() && !process_alive(h.pid)', 'false',
+     '0.5 замок: замок завершившегося процесса не снимается'),
+    ('src/keyfile.rs', '.is_some_and(|a| a > Duration::from_secs(60))', '.is_some_and(|_| true)',
+     '0.5 замок: недописанный замок считается брошенным'),
+    ('src/keyfile.rs', '.is_some_and(|a| a > Duration::from_secs(60))', '.is_some_and(|_| false)',
+     '0.5 замок: испорченный старый замок не снимается никогда'),
+    ('src/anon.rs', 'if CANCEL.with(|c| c.borrow().as_ref().is_some_and(|f| f.load(', 'if false && CANCEL.with(|c| c.borrow().as_ref().is_some_and(|f| f.load(',
+     '0.5 отмена: обработка не прерывается'),
+    ('src/anon.rs', 'let _tmp_guard = RemoveOnDrop(&tmps);', 'let _ = RemoveOnDrop(&tmps);',
+     '0.5 запись: временные файлы остаются после сбоя'),
+    ('src/anon.rs', 'let mut busy: Vec<String> = batch.files.iter().filter(|f| !replaceable(&f.output))', 'let mut busy: Vec<String> = batch.files.iter().filter(|_| false)',
+     '0.5 запись: открытый в Excel результат обнаруживается на середине — часть пакета записана'),
+    ('src/anon.rs', 'if let Some(k) = batch.key_out.as_deref().filter(|k| !replaceable(k)) {', 'if let Some(k) = batch.key_out.as_deref().filter(|_| false) {',
+     '0.5 запись: ключ открыт в Excel — ошибка посреди записи, копия ключа'),
+    ('src/anon.rs', 'o.access_mode(DELETE | GENERIC_WRITE);', 'o.access_mode(GENERIC_WRITE);',
+     '0.5 запись: файл, который нельзя заменить, не обнаружен заранее'),
+    ('src/anon.rs', 'if keyfile::stamp(k) != key_stamp {', 'if false {',
+     '0.5 запись: ключ, изменённый другим запуском, затирается'),
+    ('src/anon.rs', 'keyfile::write(k, &faker.entries).context("файлы не записаны")?;', 'let _ = keyfile::write(k, &faker.entries);',
+     '0.5 запись: ключ не записался, а результаты встали на место'),
+    ('src/anon.rs', '    if let (Some(x), Some(y)) = (file_id(a), file_id(b)) {\n        return x == y;\n    }', '',
+     '0.5 запись: жёсткая ссылка на исходный не узнаётся'),
+    ('src/anon.rs', '    order.sort_by_cached_key(|&i| (inputs[i].to_string_lossy().to_lowercase(), inputs[i].clone()));\n', '',
+     '0.5 пакет: номер «_2» зависит от порядка файлов'),
+    ('src/bin/cli.rs', 'let found = if no_key { None } else { find_key(&first) };', 'let found = find_key(&first);',
+     '0.5 консоль: --no-key загружает найденный ключ'),
+    ('src/bin/cli.rs', 'if no_key && (key.is_some() || load_key.is_some()) {', 'if false {',
+     '0.5 консоль: --no-key вместе с --load-key молча выбирает одно'),
+    ('src/main.rs', '            if ft.is_symlink() {\n                continue;\n            }', '',
+     '0.5 папка: ссылка с именем книги попадает в список'),
+    ('src/main.rs', '            if !self.closing {\n                self.close_ask = true;', '            if true {\n                self.close_ask = true;',
+     '0.5 окно: вопрос о закрытии повторяется после «Прервать»'),
+    ('src/main.rs', 'if self.closing && self.job.is_none() {', 'if self.closing {',
+     '0.5 окно: окно закрывается, не дождавшись удаления временных файлов'),
+    ('src/main.rs', '            c.store(true, Ordering::Relaxed);', '',
+     '0.5 окно: «Прервать» не поднимает флаг отмены'),
+    ('src/main.rs', '            self.cancel = None;\n            let took', '            let took',
+     '0.5 окно: флаг отмены прошлой обработки остаётся'),
+    ('src/main.rs', '        if self.opening.is_some() {\n            self.set_status("Дождитесь', '        if false {\n            self.set_status("Дождитесь',
+     '0.5 окно: второе открытие во время первого теряет файлы'),
+    ('src/main.rs', '                    if loaded.is_empty() {', '                    if false {',
+     '0.5 окно: пустая папка без сообщения'),
+    ('src/main.rs', '                        if !matches!(r.kind, Kind::Clear | Kind::Keep) {', '                        if true {',
+     '0.5 окно: поле «Связь» у «Очистить»'),
 ]
 
 
 COPY = ['src', 'tests', 'assets', 'samples', 'build.rs', 'Cargo.toml', 'Cargo.lock']
-TIMEOUT = 300  # обычный прогон ~20 с; дольше — мутант зациклил или замедлил код
+TIMEOUT = 900  # обычный прогон 1–3 мин (на занятой машине — до 5); дольше — мутант зациклил или замедлил код
 
 
-def cargo_test(cwd):
+def cargo_test(cwd, timeout=TIMEOUT):
     """cargo test без --no-fail-fast: стоп на первом упавшем тестовом файле. (код, вывод, зависло?)"""
     p = subprocess.Popen(['cargo', 'test'], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          text=True, encoding='utf-8', errors='replace')
     try:
-        out, err = p.communicate(timeout=TIMEOUT)
+        out, err = p.communicate(timeout=timeout)
         return p.returncode, out, err, False
     except subprocess.TimeoutExpired:
         subprocess.run(['taskkill', '/PID', str(p.pid), '/T', '/F'], capture_output=True)
@@ -472,10 +611,30 @@ def make_worker(n):
     if not (w / 'target').exists() and (ROOT / 'target' / 'debug').exists():
         shutil.copytree(ROOT / 'target' / 'debug', w / 'target' / 'debug',
                         ignore=shutil.ignore_patterns('incremental', 'mutate'))
-    code, out, err, hung = cargo_test(w)
+    for attempt in range(3):
+        # Первая сборка копии (4 сразу, на занятой машине) бывает долгой — таймаут больше, чем у мутанта.
+        code, out, err, hung = cargo_test(w, timeout=2 * TIMEOUT)
+        if code == 0:
+            break
+        # Антивирус не дал запустить свежий exe или файл «занят» — ещё раз; настоящая поломка повторится.
+        why = 'не уложились по времени' if hung else (env_flake(out, err) or ([l for l in err.splitlines() if l.strip()][-1:] or [''])[0])
+        print(f'Копия {w.name}: тесты не прошли (попытка {attempt + 1}): {why[:200]}')
     if code != 0:
         sys.exit(f'Исходный код не проходит тесты в копии {w} — мутации бессмысленны.\n{out[-2000:]}{err[-2000:]}')
     return w
+
+
+BLOCKED = []  # мутанты, чей прогон повторялся из-за помехи антивируса
+
+
+def env_flake(out, err):
+    """Похоже на помеху антивируса, а не на упавший тест: тестовый exe не запустился, или файл «занят» /
+    «отказано в доступе» (os error 32 / 5). Строка с причиной; пусто — помехи не видно."""
+    for l in err.splitlines() + out.splitlines():
+        if ('could not execute process' in l or '(os error 32)' in l or '(os error 5)' in l
+                or 'Access is denied' in l or 'Отказано в доступе' in l):
+            return l.strip()[:200]
+    return ''
 
 
 def run_mutant(w, mutant):
@@ -486,7 +645,16 @@ def run_mutant(w, mutant):
         return '??', f'место для мутации не найдено ({path})'
     f.write_text(src.replace(old, new), encoding='utf-8')
     try:
-        code, out, err, hung = cargo_test(w)
+        # Антивирус иногда не даёт запустить только что собранный тестовый exe («файл занят», «отказано
+        # в доступе»): это не убийство мутанта — прогон повторяется.
+        # Помеха случайна и при повторе уходит; падение от мутанта повторяется — после трёх повторов
+        # оно засчитывается как обычно.
+        for attempt in range(4):
+            code, out, err, hung = cargo_test(w)
+            if code == 0 or hung or attempt == 3 or not env_flake(out, err):
+                break
+            BLOCKED.append(what)
+            time.sleep(3)
     finally:
         f.write_text(src, encoding='utf-8')
     if hung:
@@ -494,7 +662,12 @@ def run_mutant(w, mutant):
     if code == 0:
         return 'ЖИВ', ''
     failed = [l.split()[1] for l in out.splitlines() if l.startswith('test ') and l.endswith('FAILED')]
-    return 'убит', ', '.join(failed) if failed else 'не компилируется' if 'could not compile' in err else 'прогон упал'
+    if failed:
+        return 'убит', ', '.join(failed)
+    if 'could not compile' in err:
+        return 'убит', 'не компилируется'
+    last = [l.strip() for l in err.splitlines() if l.strip()][-1:] or ['']
+    return 'убит', 'прогон упал: ' + last[0][:200]
 
 
 def main():
@@ -528,6 +701,8 @@ def main():
             if verdict != 'убит':
                 survived.append(m[3])
             print(f'[{i}/{len(todo)}] {verdict:4}  {m[3]}' + (f'  ← {reason}' if reason else ''))
+    if BLOCKED:
+        print(f'\nПовторных прогонов из-за помехи (файл занят / отказано в доступе): {len(BLOCKED)} — {sorted(set(BLOCKED))}')
     print(f'\nМутантов: {len(todo)}, выжило: {len(survived)}, время: {(time.time() - start) / 60:.1f} мин')
     sys.exit(1 if survived else 0)
 
