@@ -144,7 +144,6 @@ fn rule(kind: Kind, with_id: bool, link: &str) -> Rule {
 /// все 60 мужских имён словаря генератора встречаются среди настоящих — свободного имени нет, и фейк
 /// становится своим же настоящим именем («Иван» → «Иван»); остальные — чужими настоящими.
 #[test]
-#[ignore = "находка A6-4: «Имя» без ID — фейк равен своему настоящему, когда все имена словаря реальны"]
 fn a04_first_name_fake_equals_own_when_dictionary_exhausted() {
     let r = rule(Kind::FirstName, false, "");
     let reals: Vec<String> = MALE.iter().map(|s| s.to_string()).chain(["Ринат", "Азат", "Тагир"].iter().map(|s| s.to_string())).collect();
@@ -171,7 +170,6 @@ fn a04_first_name_fake_equals_own_when_dictionary_exhausted() {
 /// значение той же колонки (оно само получает «Должность 1»). ВПР по результату склеит не те строки,
 /// а ячейка «Должность 2» вне разметки (другой лист) останется настоящей и совпадёт с чужим фейком.
 #[test]
-#[ignore = "находка A6-5: фейк «Шаблона» может совпасть с настоящим значением"]
 fn a05_template_fake_equals_other_real() {
     let mut f = Faker::new(&settings());
     let mut r = rule(Kind::Text, false, "");
@@ -190,7 +188,6 @@ fn a05_template_fake_equals_other_real() {
 /// выбранный раньше, совпадает с настоящим адресом/телефоном из такой ячейки. Ключ (`load_entries`) адреса
 /// по «;» делит — прогон нет. Значение-«ловушка» строится как фейк первого значения у того же генератора.
 #[test]
-#[ignore = "находка A6-6: настоящий email/телефон из ячейки с несколькими значениями не занят для фейков"]
 fn a06_multi_value_cell_reals_not_taken() {
     let mut bad = Vec::new();
     for kind in [Kind::Email, Kind::Phone] {

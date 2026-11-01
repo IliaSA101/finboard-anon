@@ -328,6 +328,140 @@ fn patr_key(lower: &str) -> String {
     lower.to_string()
 }
 
+/// Запасные имена фейков: когда все имена словаря уже выданы другим или встречаются в данных. Пока словарь
+/// не исчерпан, они не выдаются — фейки те же, что прежде.
+const RESERVE_MALE: &[&str] = &[
+    "Аристарх", "Вениамин", "Герман", "Гордей", "Демьян", "Елисей", "Емельян", "Ефим", "Игнат", "Иннокентий",
+    "Ипполит", "Казимир", "Лаврентий", "Макар", "Мирон", "Назар", "Нестор", "Остап", "Платон", "Прохор",
+    "Родион", "Савелий", "Тарас", "Тихон", "Трофим", "Феликс", "Харитон", "Эмиль", "Яков", "Богдан",
+    "Давид", "Альберт", "Артур", "Марат", "Рустам", "Ринат", "Тагир", "Ильдар", "Айдар", "Эрик",
+];
+
+const RESERVE_FEMALE: &[&str] = &[
+    "Агата", "Агния", "Аделина", "Ангелина", "Алиса", "Василина", "Виолетта", "Владислава", "Дарина", "Евдокия",
+    "Есения", "Зинаида", "Изабелла", "Камила", "Клавдия", "Лада", "Лиана", "Лия", "Майя", "Мила",
+    "Мирослава", "Ника", "Римма", "Серафима", "Стефания", "Эвелина", "Эмилия", "Эмма", "Ярослава", "Фаина",
+    "Устинья", "Капитолина", "Нонна", "Динара", "Зарина", "Эльмира", "Гульнара", "Айгуль", "Алсу", "Белла",
+];
+
+/// Запасные основы отчеств — после всех `PATR_STEMS`.
+const RESERVE_PATR: &[&str] = &[
+    "Арсеньев", "Артёмов", "Богданов", "Валентинов", "Вениаминов", "Владиславов", "Всеволодов", "Германов",
+    "Глебов", "Гордеев", "Даниилов", "Давидов", "Ефимов", "Захаров", "Игнатов", "Макаров", "Марков", "Матвеев",
+    "Миронов", "Назаров", "Платонов", "Прохоров", "Родионов", "Ростиславов", "Русланов", "Савельев",
+    "Святославов", "Семёнов", "Тарасов", "Тимофеев", "Тихонов", "Трофимов", "Филиппов", "Эмильев", "Ярославов",
+    "Альбертов", "Артуров", "Маратов", "Ринатов", "Рустамов",
+];
+
+/// Отчество фейка по номеру: сначала `PATR_STEMS`, затем `RESERVE_PATR`, затем основы словаря с номером
+/// тёзки через дефис («Иванович-2»): так кончиться отчества не могут.
+fn patr_text(i: usize, female: bool) -> String {
+    let (np, nr) = (PATR_STEMS.len(), RESERVE_PATR.len());
+    let end = if female { "на" } else { "ич" };
+    if i < np {
+        format!("{}{end}", PATR_STEMS[i])
+    } else if i < np + nr {
+        format!("{}{end}", RESERVE_PATR[i - np])
+    } else {
+        let k = i - np - nr;
+        format!("{}{end}-{}", PATR_STEMS[k % np], 2 + k / np)
+    }
+}
+
+/// Номер фейкового отчества (обратное к `patr_text`) — для ключа прошлых запусков.
+fn patr_index(fake: &str) -> Option<usize> {
+    let lower = norm_word(fake);
+    let (base, n) = match lower.rsplit_once('-') {
+        Some((b, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => (b.to_string(), n.parse::<usize>().ok().filter(|n| *n >= 2)?),
+        _ => (lower, 0),
+    };
+    let fk = patr_key(&base);
+    let (np, nr) = (PATR_STEMS.len(), RESERVE_PATR.len());
+    let pos = PATR_STEMS.iter().position(|s| norm_word(s) == fk);
+    if n >= 2 {
+        return pos.map(|p| np + nr + (n - 2) * np + p);
+    }
+    pos.or_else(|| RESERVE_PATR.iter().position(|s| norm_word(s) == fk).map(|p| np + p))
+}
+
+/// Слова словарей в виде для сравнения (`norm_word`): подбор свободного слова — сотни сравнений на значение.
+struct DictNorms {
+    surnames: Vec<String>,
+    /// Женские формы фамилий.
+    surnames_fem: Vec<String>,
+    male: Vec<String>,
+    female: Vec<String>,
+    reserve_male: Vec<String>,
+    reserve_female: Vec<String>,
+}
+
+fn dict_norms() -> &'static DictNorms {
+    static S: OnceLock<DictNorms> = OnceLock::new();
+    S.get_or_init(|| {
+        let n = |l: &[&str]| l.iter().map(|w| norm_word(w)).collect::<Vec<_>>();
+        DictNorms {
+            surnames: n(SURNAMES),
+            surnames_fem: SURNAMES.iter().map(|w| norm_word(&feminize(w))).collect(),
+            male: n(MALE),
+            female: n(FEMALE),
+            reserve_male: n(RESERVE_MALE),
+            reserve_female: n(RESERVE_FEMALE),
+        }
+    })
+}
+
+/// Знак маски того же вида, что `c`: 0 — цифра, 1 — латиница, 2 — кириллица; `None` — знак остаётся как есть.
+fn mask_char(c: char) -> Option<u8> {
+    if c.is_ascii_digit() {
+        Some(0)
+    } else if c.is_ascii_alphabetic() {
+        Some(1)
+    } else if ('а'..='я').contains(&c.to_lowercase().next().unwrap_or(c)) || c == 'ё' || c == 'Ё' {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Вариант маски `attempt` (0 — прежняя маска, как до 0.6.1) с `extra` лишними знаками того же вида после
+/// последней буквы или цифры.
+fn mask_variant(salt: &str, orig: &str, attempt: u32, extra: usize) -> String {
+    const CYR: &[char] = &['а', 'б', 'в', 'г', 'д', 'е', 'ж', 'з', 'и', 'к', 'л', 'м', 'н', 'о', 'п', 'р', 'с', 'т', 'у', 'ф', 'х', 'ц', 'ч', 'ш', 'э', 'ю', 'я'];
+    let (a, e) = (attempt.to_string(), extra.to_string());
+    let mut r = if attempt == 0 && extra == 0 { Rng::new(&[salt, "mask", orig]) } else { Rng::new(&[salt, "mask", orig, &a, &e]) };
+    let mut first_digit = true;
+    let mut one = |c: char, r: &mut Rng| match mask_char(c) {
+        Some(0) => {
+            let nz = first_digit && c != '0';
+            first_digit = false;
+            let d = if nz { 1 + r.below(9) } else { r.below(10) };
+            (b'0' + d as u8) as char
+        }
+        Some(1) => {
+            let l = (b'a' + r.below(26) as u8) as char;
+            if c.is_ascii_uppercase() { l.to_ascii_uppercase() } else { l }
+        }
+        Some(_) => {
+            let l = CYR[r.below(CYR.len())];
+            if c.is_uppercase() { l.to_uppercase().next().unwrap_or(l) } else { l }
+        }
+        None => c,
+    };
+    let last = orig.char_indices().filter(|(_, c)| mask_char(*c).is_some()).last().map(|(i, _)| i);
+    let mut out = String::with_capacity(orig.len() + extra * 2);
+    for (i, c) in orig.char_indices() {
+        out.push(one(c, &mut r));
+        if Some(i) == last {
+            for _ in 0..extra {
+                // Лишний знак — как последний, но строчный: «7» → «71», «А1» → «Б37».
+                let like = if c.is_uppercase() { c.to_lowercase().next().unwrap_or(c) } else { c };
+                out.push(one(like, &mut r));
+            }
+        }
+    }
+    out
+}
+
 /// Название организации на части: (до названия, название, после).
 /// «ООО «Ромашка»» → («ООО «», «Ромашка», «»»); «Общество с ограниченной ответственностью "Ромашка"» — так же;
 /// «Ромашка, ООО» → («», «Ромашка», «, ООО»); «ИП Козлов О.П.» → («ИП », «Козлов О.П.», «»).
@@ -833,6 +967,10 @@ pub struct Faker {
     widened_now: bool,
     /// Значения, чей фейк длиннее настоящего: свободных номеров той же длины не хватило.
     widened: HashSet<String>,
+    /// Выданные фейки «Шаблона» («должность 3», без регистра): другому значению не достаются.
+    used_text: HashSet<String>,
+    /// Выданные маски (без регистра) → чьё значение («m:» + значение, + «@связь»).
+    used_mask: HashMap<String, String>,
 }
 
 /// Словари «реальное → фейк» (и «реальное → ID») одной связи. У каждой связи свои: этим связи и
@@ -956,6 +1094,8 @@ impl Faker {
             seq_issued: HashMap::new(),
             widened_now: false,
             widened: HashSet::new(),
+            used_text: HashSet::new(),
+            used_mask: HashMap::new(),
         }
     }
 
@@ -985,6 +1125,17 @@ impl Faker {
     }
 
     fn note_real(&mut self, s: &str) {
+        self.note_one(s);
+        // Несколько email, телефонов, ФИО в одной ячейке — через «;», «,» или перенос строки, как их делит
+        // `map_multi`: каждое — тоже реальное значение, фейк другого значения не должен с ним совпасть.
+        if s.contains([';', ',', '\n']) {
+            for part in s.split([';', ',', '\n']).map(str::trim).filter(|p| !p.is_empty()) {
+                self.note_one(part);
+            }
+        }
+    }
+
+    fn note_one(&mut self, s: &str) {
         let d = digits_of(s);
         if d.len() >= 5 {
             self.real_digits.insert(phone_key(&d));
@@ -993,12 +1144,13 @@ impl Faker {
         // Текст прогона — тоже реальные значения: фейк адреса, ФИО, организации не должен совпасть ни с одним,
         // даже если строки нет среди общих строк книги (ячейка inlineStr — например, результат прошлого
         // обезличивания, — или результат формулы). Строка из общих уже здесь — второй раз не разбирается.
-        if !number_like(s) {
-            let n = norm_text(s);
-            if !self.taken.contains(&n) {
+        // Номер — тоже: короткий («7», «12») цифрами не запоминается, а маска другого значения не должна его дать.
+        let n = norm_text(s);
+        if !self.taken.contains(&n) {
+            if !number_like(s) {
                 self.taken.insert(company_key(s));
-                self.taken.insert(n);
             }
+            self.taken.insert(n);
         }
     }
 
@@ -1192,11 +1344,7 @@ impl Faker {
             Kind::BirthDate => self.fake_date(original, numeric),
             Kind::Company => self.fake_company(original, w),
             Kind::Mask => self.mask(original),
-            Kind::Text => {
-                let label = rule.label_or_default().to_string();
-                let id = self.id_for(&format!("text:{label}"), &norm_text(original));
-                format!("{label} {id}")
-            }
+            Kind::Text => self.fake_text(rule.label_or_default(), original),
             Kind::Clear => String::new(),
             // Защищённые области в замены не попадают (collect их пропускает).
             Kind::Keep => original.to_string(),
@@ -1251,35 +1399,42 @@ impl Faker {
 
     // ------------------------------------------------ части ФИО
 
+    /// Свободное слово словаря `list` (`norms` — его слова в виде `norm_word`, `reject` — по номеру слова):
+    /// сорок случайных попыток, затем по кругу.
     fn pick_unique(
         list: &[&'static str],
+        norms: &[String],
         used: &HashSet<String>,
         avoid: &str,
         r: &mut Rng,
-        reject: &dyn Fn(&str) -> bool,
+        reject: &dyn Fn(usize) -> bool,
     ) -> Option<&'static str> {
-        let ok = |c: &str| {
-            let n = norm_word(c);
-            !used.contains(&n) && n != avoid && !reject(c)
+        let ok = |i: usize| {
+            let n = &norms[i];
+            !used.contains(n) && n != avoid && !reject(i)
         };
         for _ in 0..40 {
-            let c = r.pick(list);
-            if ok(c) {
-                return Some(c);
+            let i = r.below(list.len());
+            if ok(i) {
+                return Some(list[i]);
             }
         }
         let start = r.below(list.len());
-        (0..list.len()).map(|i| list[(start + i) % list.len()]).find(|c| ok(c))
+        (0..list.len()).map(|i| (start + i) % list.len()).find(|&i| ok(i)).map(|i| list[i])
     }
 
     /// Придуманная фамилия, когда словарные кончились. Случайных попыток — с запасом; когда свободных почти
     /// нет, придуманные перебираются по порядку (общий курсор: каждая проверяется один раз за прогон), после
     /// трёхсложных — четырёхсложные и длиннее: свободная найдётся всегда.
-    fn synth_surname(&mut self, r: &mut Rng) -> String {
+    fn synth_surname(&mut self, r: &mut Rng, avoid: &str) -> String {
         const C: &[&str] = &["б", "в", "г", "д", "з", "к", "л", "м", "н", "п", "р", "с", "т", "ф", "х", "ч", "ш"];
         const V: &[&str] = &["а", "е", "и", "о", "у"];
         const E: &[&str] = &["ов", "ев", "ин", "ский"];
-        let free = |f: &Faker, s: &str| !f.used_surname.contains(&norm_word(s)) && !f.taken.contains(&norm_word(s));
+        // Не своя (`avoid` — своя в мужской форме) и не строка книги ни в мужской, ни в женской форме.
+        let free = |f: &Faker, s: &str| {
+            let n = norm_word(s);
+            !f.used_surname.contains(&n) && !f.taken.contains(&n) && !f.taken.contains(&norm_word(&feminize(s))) && n != avoid
+        };
         let shape = "surname";
         let tries = if self.seq_cursor.contains_key(shape) { RANDOM_TRIES_SPENT } else { 10_000 };
         for _ in 0..tries {
@@ -1328,10 +1483,11 @@ impl Faker {
             None => {
                 let mut r = Rng::new(&[&self.s.salt, "sur", &base_key]);
                 let taken = &self.taken;
-                let reject = |c: &str| taken.contains(&norm_word(c)) || taken.contains(&norm_word(&feminize(c)));
-                let f = match Self::pick_unique(SURNAMES, &self.used_surname, &base_key, &mut r, &reject) {
+                let d = dict_norms();
+                let reject = |i: usize| taken.contains(&d.surnames[i]) || taken.contains(&d.surnames_fem[i]);
+                let f = match Self::pick_unique(SURNAMES, &d.surnames, &self.used_surname, &base_key, &mut r, &reject) {
                     Some(f) => f.to_string(),
-                    None => self.synth_surname(&mut r),
+                    None => self.synth_surname(&mut r, &base_key),
                 };
                 self.used_surname.insert(norm_word(&f));
                 self.surname.insert(base_key, f.clone());
@@ -1350,20 +1506,20 @@ impl Faker {
                 let list = if female { FEMALE } else { MALE };
                 let mut r = Rng::new(&[&self.s.salt, "first", &key, if female { "f" } else { "m" }]);
                 let taken = &self.taken;
-                let own_or_taken = |c: &str| norm_word(c) == key || taken.contains(&norm_word(c));
-                // Имён в словаре меньше, чем разных имён в данных: имя повторится у разных людей (ФИО различат
-                // фамилия, отчество, а без ID — проверка в `fake_person`), но не станет своим настоящим
-                // и не совпадёт с другой строкой книги.
-                let f = Self::pick_unique(list, &self.used_first[g], &key, &mut r, &|c: &str| taken.contains(&norm_word(c)))
-                    .unwrap_or_else(|| {
-                        let c = r.pick(list);
-                        if !own_or_taken(c) {
-                            return c;
-                        }
-                        let start = r.below(list.len());
-                        (0..list.len()).map(|i| list[(start + i) % list.len()]).find(|c| !own_or_taken(c)).unwrap_or(c)
-                    })
-                    .to_string();
+                let d = dict_norms();
+                let (norms, reserve, reserve_norms) =
+                    if female { (&d.female, RESERVE_FEMALE, &d.reserve_female) } else { (&d.male, RESERVE_MALE, &d.reserve_male) };
+                // Имён в словаре меньше, чем разных имён в данных: когда словарь исчерпан (имена выданы другим
+                // или встречаются в данных), — запасные имена, затем имена словаря с номером тёзки через дефис
+                // («Иван-2»). Фейк имени никогда не равен своему настоящему, другой строке книги или фейку
+                // другого имени: без ID колонка «Имя» иначе склеила бы разных людей.
+                let used = &self.used_first[g];
+                let picked = Self::pick_unique(list, norms, used, &key, &mut r, &|i| taken.contains(&norms[i]))
+                    .or_else(|| Self::pick_unique(reserve, reserve_norms, used, &key, &mut r, &|i| taken.contains(&reserve_norms[i])));
+                let f = match picked {
+                    Some(c) => c.to_string(),
+                    None => self.numbered_first(&key, female),
+                };
                 self.used_first[g].insert(norm_word(&f));
                 self.first[g].insert(key, f.clone());
                 f
@@ -1380,25 +1536,58 @@ impl Faker {
                 let mut r = Rng::new(&[&self.s.salt, "patr", &key]);
                 let n = PATR_STEMS.len();
                 let start = r.below(n);
-                let own_or_taken = |i: usize| {
-                    let st = PATR_STEMS[i];
-                    norm_word(st) == key
-                        || self.taken.contains(&norm_word(&format!("{st}ич")))
-                        || self.taken.contains(&norm_word(&format!("{st}на")))
+                let own_or_taken = |f: &Faker, i: usize| {
+                    let (m, w) = (patr_text(i, false), patr_text(i, true));
+                    patr_key(&norm_word(&m)) == key || f.taken.contains(&norm_word(&m)) || f.taken.contains(&norm_word(&w))
                 };
-                // Свободные кончились — отчество повторится у разных людей, но не своё настоящее и не строка книги.
-                let i = (0..n)
-                    .map(|k| (start + k) % n)
-                    .find(|i| !self.used_patr.contains(i) && !own_or_taken(*i))
-                    .or_else(|| (0..n).map(|k| (start + k) % n).find(|i| !own_or_taken(*i)))
-                    .unwrap_or(start);
+                let free = |f: &Faker, i: usize| !f.used_patr.contains(&i) && !own_or_taken(f, i);
+                // Свободные основы словаря кончились — запасные, затем основы словаря с номером тёзки («Иванович-2»):
+                // фейк отчества не равен ни своему настоящему, ни строке книги, ни фейку другого отчества.
+                let found = (0..n).map(|k| (start + k) % n).find(|&i| free(self, i)).or_else(|| {
+                    let nr = RESERVE_PATR.len();
+                    let start = r.below(nr);
+                    (0..nr).map(|k| n + (start + k) % nr).find(|&i| free(self, i))
+                });
+                let i = match found {
+                    Some(i) => i,
+                    None => {
+                        let shape = "patr#numbered";
+                        let base = n + RESERVE_PATR.len();
+                        let (_, mut c) = self.seq_cursor.get(shape).copied().unwrap_or((0, 0));
+                        loop {
+                            let i = base + c as usize;
+                            c += 1;
+                            if free(self, i) {
+                                self.seq_cursor.insert(shape.to_string(), (0, c));
+                                break i;
+                            }
+                        }
+                    }
+                };
                 self.used_patr.insert(i);
                 self.patr.insert(key, i);
                 i
             }
         };
-        let out = format!("{}{}", PATR_STEMS[idx], if female { "на" } else { "ич" });
-        apply_case(tok, &out)
+        apply_case(tok, &patr_text(idx, female))
+    }
+
+    /// Имя словаря с номером тёзки через дефис («Иван-2», «Анна-3»): запасных имён тоже не хватило. По порядку,
+    /// общий курсор на пол: всё до него занято навсегда, каждый вариант проверяется один раз за прогон.
+    fn numbered_first(&mut self, key: &str, female: bool) -> String {
+        let (list, g) = if female { (FEMALE, 1) } else { (MALE, 0) };
+        let shape = format!("first#{g}#numbered");
+        let (_, mut c) = self.seq_cursor.get(&shape).copied().unwrap_or((0, 0));
+        loop {
+            let i = c as usize;
+            c += 1;
+            let f = format!("{}-{}", list[i % list.len()], 2 + i / list.len());
+            let n = norm_word(&f);
+            if !self.used_first[g].contains(&n) && !self.taken.contains(&n) && n != key {
+                self.seq_cursor.insert(shape, (0, c));
+                return f;
+            }
+        }
     }
 
     fn fake_person(&mut self, original: &str, with_id: bool) -> String {
@@ -2168,6 +2357,30 @@ impl Faker {
 
     // ------------------------------------------------ прочее
 
+    /// «Шаблон»: подпись и номер. Номер, при котором «подпись N» — строка книги, настоящее значение прогона или
+    /// ключа либо фейк другого значения (подпись другого правила в другом регистре), пропускается. Значение,
+    /// у которого номер уже есть (из ключа прошлых запусков или раньше в этом прогоне), получает прежний фейк.
+    fn fake_text(&mut self, label: &str, original: &str) -> String {
+        let ns = format!("text:{label}");
+        let norm = norm_text(original);
+        if self.ids.get(&ns).is_some_and(|m| m.contains_key(&norm)) {
+            let id = self.id_for(&ns, &norm);
+            return format!("{label} {id}");
+        }
+        loop {
+            let next = self.next_id.get(&ns).copied().unwrap_or(1);
+            let k = norm_text(&format!("{label} {next}"));
+            if !self.taken.contains(&k) && !self.used_text.contains(&k) && k != norm {
+                break;
+            }
+            self.next_id.insert(ns.clone(), next + 1);
+        }
+        let id = self.id_for(&ns, &norm);
+        let fake = format!("{label} {id}");
+        self.used_text.insert(norm_text(&fake));
+        fake
+    }
+
     fn fake_date(&mut self, orig: &str, numeric: bool) -> String {
         let day = date_day(orig, numeric);
         let offset = match day.and_then(|d| self.date_shift.get(&d)) {
@@ -2204,32 +2417,42 @@ impl Faker {
                 return if nv.fract() == 0.0 { format!("{}", nv as i64) } else { format!("{nv}") };
             }
         }
-        shift_text_date(orig.trim(), offset).unwrap_or_else(|| self.mask(orig))
+        match shift_text_date(orig.trim(), offset) {
+            Some(s) => s,
+            None => self.mask(orig),
+        }
     }
 
-    /// Случайные символы того же вида: цифра → цифра, кириллица → кириллица и т.д.
-    fn mask(&self, orig: &str) -> String {
-        const CYR: &[char] = &['а', 'б', 'в', 'г', 'д', 'е', 'ж', 'з', 'и', 'к', 'л', 'м', 'н', 'о', 'п', 'р', 'с', 'т', 'у', 'ф', 'х', 'ц', 'ч', 'ш', 'э', 'ю', 'я'];
-        let mut r = Rng::new(&[&self.s.salt, "mask", orig]);
-        let mut first_digit = true;
-        orig.chars()
-            .map(|c| {
-                if c.is_ascii_digit() {
-                    let nz = first_digit && c != '0';
-                    first_digit = false;
-                    let d = if nz { 1 + r.below(9) } else { r.below(10) };
-                    (b'0' + d as u8) as char
-                } else if c.is_ascii_alphabetic() {
-                    let l = (b'a' + r.below(26) as u8) as char;
-                    if c.is_ascii_uppercase() { l.to_ascii_uppercase() } else { l }
-                } else if ('а'..='я').contains(&c.to_lowercase().next().unwrap_or(c)) || c == 'ё' || c == 'Ё' {
-                    let l = CYR[r.below(CYR.len())];
-                    if c.is_uppercase() { l.to_uppercase().next().unwrap_or(l) } else { l }
-                } else {
-                    c
+    /// Случайные символы того же вида: цифра → цифра, кириллица → кириллица и т.д. Маска не равна ни своему
+    /// значению, ни строке книги, ни настоящему значению прогона или ключа, ни маске другого значения: короткие
+    /// значения («7», «А1») иначе нередко получали бы себя или чужое. Первый вариант — прежний; занят — следующий,
+    /// детерминированно; все варианты той же длины заняты — маска на символ длиннее.
+    fn mask(&mut self, orig: &str) -> String {
+        if !orig.chars().any(|c| mask_char(c).is_some()) {
+            // Ни букв, ни цифр («—», «-») — скрывать нечего.
+            return orig.to_string();
+        }
+        let me = self.person_owner(&format!("m:{orig}"));
+        let own = norm_text(orig);
+        let free = |f: &Faker, m: &str| {
+            let k = norm_text(m);
+            let d = digits_of(m);
+            k != own
+                && !f.taken.contains(&k)
+                && !(number_like(m) && d.len() >= 5 && f.is_real_number(&d))
+                && f.used_mask.get(&k).map_or(true, |o| *o == me)
+        };
+        let salt = self.s.salt.clone();
+        for extra in 0usize.. {
+            for attempt in 0..64u32 {
+                let m = mask_variant(&salt, orig, attempt, extra);
+                if free(self, &m) {
+                    self.used_mask.entry(norm_text(&m)).or_insert(me);
+                    return m;
                 }
-            })
-            .collect()
+            }
+        }
+        unreachable!()
     }
 
     // ------------------------------------------------ загрузка ключа прошлых запусков
@@ -2255,7 +2478,15 @@ impl Faker {
                 // с ними совпасть (номера ключа так же попадают в `real_digits`).
                 if matches!(
                     kind,
-                    Kind::FullName | Kind::LastName | Kind::FirstName | Kind::MiddleName | Kind::Email | Kind::Address | Kind::Company
+                    Kind::FullName
+                        | Kind::LastName
+                        | Kind::FirstName
+                        | Kind::MiddleName
+                        | Kind::Email
+                        | Kind::Address
+                        | Kind::Company
+                        | Kind::Text
+                        | Kind::Mask
                 ) {
                     let real = strip_id_suffix(&e.real);
                     if kind == Kind::Company {
@@ -2367,6 +2598,12 @@ impl Faker {
                         // В ячейке может быть несколько значений через «;» — сопоставляем попарно.
                         let split = |s: &str| s.split([';', ',', '\n']).map(|x| x.trim().to_string()).collect::<Vec<_>>();
                         let (rs, fs) = (split(&e.real), split(&e.fake));
+                        if kind == Kind::Phone {
+                            // Каждый настоящий номер ячейки — реальный, даже если фейков в ключе не столько же.
+                            for d in rs.iter().map(|r| digits_of(r)).filter(|d| d.len() >= 5) {
+                                self.real_digits.insert(phone_key(&d));
+                            }
+                        }
                         if rs.len() == fs.len() {
                             for (r, f) in rs.iter().zip(&fs).filter(|(r, _)| !r.is_empty()) {
                                 if kind == Kind::Email {
@@ -2395,6 +2632,14 @@ impl Faker {
                         let me = self.person_owner(&norm);
                         self.used_address.entry(norm_text(&fake_core)).or_insert(me);
                         self.addresses.entry(norm).or_insert(fake_core);
+                    }
+                    // Фейки «Шаблона» и маски из ключа заняты: новому значению не достанутся.
+                    Kind::Text => {
+                        self.used_text.insert(norm_text(&e.fake));
+                    }
+                    Kind::Mask => {
+                        let me = self.person_owner(&format!("m:{}", e.real));
+                        self.used_mask.entry(norm_text(&e.fake)).or_insert(me);
                     }
                     Kind::BirthDate => {
                         if let (Some(r), Some(f)) = (date_day(&e.real, false), date_day(&e.fake, false)) {
@@ -2429,8 +2674,7 @@ impl Faker {
                 self.first[g].entry(norm_word(real)).or_insert(fake);
             }
             Role::Patr => {
-                let fk = patr_key(&norm_word(&fake));
-                if let Some(i) = PATR_STEMS.iter().position(|s| norm_word(s) == fk) {
+                if let Some(i) = patr_index(&fake) {
                     self.used_patr.insert(i);
                     self.patr.entry(patr_key(&norm_word(real))).or_insert(i);
                 }
@@ -2440,12 +2684,14 @@ impl Faker {
     }
 
     fn register_person(&mut self, real: &str, fake: &str) {
-        let (Some(pr), Some(pf)) = (parse_person(real), parse_person(fake)) else { return };
-        if pr.toks.len() != pf.toks.len() {
+        let Some(pr) = parse_person(real) else { return };
+        // Фейк — по словам, а не разбором: имя или отчество с номером тёзки («Иван-2») разбор ФИО не принимает.
+        let ft: Vec<&str> = fake.split_whitespace().collect();
+        if pr.toks.len() != ft.len() {
             return;
         }
         for i in 0..pr.toks.len() {
-            self.register_token(pr.roles[i], &pr.toks[i], &pf.toks[i], pr.female);
+            self.register_token(pr.roles[i], &pr.toks[i], ft[i], pr.female);
         }
     }
 
@@ -2695,8 +2941,9 @@ mod tests {
         assert_ne!(g.new_email("ivan@corp.ru", false), e);
     }
 
-    /// 3000 разных «Имя Отчество» одного пола: сочетаний словарей 2400 — остальным номер тёзки, небольшой,
-    /// и все фейки разные.
+    /// 3000 разных «Имя Отчество» одного пола: сочетаний словарей 2400, все фейки разные, номер (если нужен) —
+    /// небольшой. С 0.6.1 разные отчества не получают одного фейка (запасные основы, «Иванович-2») — и номер
+    /// тёзки здесь не нужен.
     #[test]
     fn namesakes_numbered() {
         let mut f = faker();
@@ -2707,9 +2954,8 @@ mod tests {
         let fakes: Vec<String> = reals.iter().map(|x| f.fake(&r, x, false)).collect();
         let uniq: HashSet<String> = fakes.iter().map(|y| norm_text(y)).collect();
         assert_eq!(uniq.len(), reals.len());
-        assert!(fakes.iter().any(|y| y.ends_with(" 2")), "{:?}", &fakes[2900..]);
         for y in &fakes {
-            if let Some(n) = y.rsplit(' ').next().and_then(|t| t.parse::<u32>().ok()) {
+            if let Some(n) = y.rsplit([' ', '-']).next().and_then(|t| t.parse::<u32>().ok()) {
                 assert!(n < 10, "{y}");
             }
         }

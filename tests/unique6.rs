@@ -294,3 +294,188 @@ fn u05_people_case_insensitive() {
         assert_eq!(norm_text(&again), norm_text(y), "«{x}»: другой регистр — другой фейк");
     }
 }
+
+// ---------------------------------------------------------------- 0.6.1: остальные виды правил без ID
+
+/// Имена того же вида, что настоящие (мужские на «-ат», женские на «-ина»): вместе со словарными их больше,
+/// чем имён в словарях генератора, — колонки «Имя», «Отчество» без ID исчерпывают словари.
+fn syllables() -> Vec<String> {
+    let mut out = Vec::new();
+    for a in ["Б", "В", "Г", "Д", "З", "Л", "М", "Н", "Р", "С", "Т"] {
+        for v in ["а", "о", "у", "и"] {
+            for c in ["р", "н", "л", "м", "д", "с"] {
+                out.push(format!("{a}{v}{c}"));
+            }
+        }
+    }
+    out
+}
+
+fn dedup(v: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    v.into_iter().filter(|s| seen.insert(norm_text(s))).collect()
+}
+
+fn first_names() -> Vec<String> {
+    let syl = syllables();
+    dedup(
+        MALE.iter()
+            .chain(FEMALE)
+            .chain(MORE_MALE)
+            .map(|s| s.to_string())
+            .chain(syl.iter().map(|s| format!("{s}ат")))
+            .chain(syl.iter().map(|s| format!("{s}ина"))),
+    )
+}
+
+fn middle_names() -> Vec<String> {
+    let stems = dedup(
+        PATR.iter()
+            .map(|s| s.to_string())
+            .chain(MORE_MALE.iter().chain(MALE).map(|m| format!("{m}ов")))
+            .chain(syllables().iter().map(|s| format!("{s}атов"))),
+    );
+    stems.iter().flat_map(|s| [format!("{s}ич"), format!("{s}на")]).collect()
+}
+
+/// Фамилии того же вида, что придумывает генератор, когда словарные кончились («Бабаков»); у трёх четвертей —
+/// только женская форма («Бабакова»): мужской формы среди строк книги нет.
+fn last_names() -> Vec<String> {
+    const C: &[&str] = &["б", "в", "г", "д", "з", "к", "л", "м", "н", "п", "р", "с", "т", "ф", "х", "ч", "ш"];
+    const V: &[&str] = &["а", "е", "и", "о", "у"];
+    let mut out: Vec<String> = SUR.iter().map(|s| s.to_string()).collect();
+    let mut k = 0usize;
+    'outer: for a in C {
+        for v in V {
+            for b in C {
+                for u in V {
+                    for c in &C[..4] {
+                        let base = format!("{}{v}{b}{u}{c}ов", a.to_uppercase());
+                        out.push(if k % 4 == 0 { base } else { format!("{base}а") });
+                        k += 1;
+                        if k == 24_000 {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    dedup(out)
+}
+
+/// Колонки «Фамилия», «Имя», «Отчество» без ID при исчерпанных словарях (в двух связях, затем с ключом):
+/// фейк не равен ни своему, ни чужому настоящему значению (прогона и ключа), разные значения — разные фейки,
+/// тот же ключ — те же фейки. До 0.6.1 «Имя» и «Отчество» при исчерпании словаря повторяли чужой фейк или
+/// давали своё настоящее, а придуманная фамилия в женской форме совпадала с настоящей.
+#[test]
+fn u06_name_parts_without_id_unique() {
+    for (kind, reals) in [(Kind::FirstName, first_names()), (Kind::MiddleName, middle_names()), (Kind::LastName, last_names())] {
+        distinct(&reals);
+        let what = format!("{kind:?}");
+        let rules = [rule(kind, ""), rule(kind, "контрагент")];
+        let a = run(&mut Faker::new(&settings("части")), &rules, &reals);
+        check(&what, &reals, &a, &HashSet::new(), &HashSet::new());
+        assert!(a == run(&mut Faker::new(&settings("части")), &rules, &reals), "{what}: второй прогон дал другие фейки");
+        // Половина — прошлый запуск, половина — новые значения с его ключом.
+        let old: Vec<String> = reals.iter().step_by(2).cloned().collect();
+        let new: Vec<String> = reals.iter().skip(1).step_by(2).cloned().collect();
+        let mut first = Faker::new(&settings("части"));
+        run(&mut first, &rules, &old);
+        let key: Vec<KeyEntry> = first.entries.clone();
+        let key_fakes: HashSet<String> = key.iter().map(|e| norm_text(&e.fake)).collect();
+        let old_reals: HashSet<String> = old.iter().map(|x| norm_text(x)).collect();
+        let go = || {
+            let mut f = Faker::new(&settings("части"));
+            f.load_entries(key.clone());
+            run(&mut f, &rules, &new)
+        };
+        let b = go();
+        check(&format!("{what} с ключом"), &new, &b, &old_reals, &key_fakes);
+        assert!(b == go(), "{what}: тот же ключ — другие фейки");
+    }
+}
+
+/// Имя и отчество с номером тёзки («Иван-2») — те же в полном ФИО, что в отдельных колонках, и после ключа.
+#[test]
+fn u07_numbered_name_parts_consistent_with_full_name() {
+    let firsts: Vec<String> = first_names().into_iter().filter(|n| !n.ends_with('а') && !n.ends_with('я')).collect();
+    let middles: Vec<String> = middle_names().into_iter().filter(|n| n.ends_with("ич")).collect();
+    let (fr, mr, full) = (rule(Kind::FirstName, ""), rule(Kind::MiddleName, ""), rule(Kind::FullName, ""));
+    let people: Vec<String> =
+        firsts.iter().zip(middles.iter().cycle()).enumerate().map(|(i, (f, m))| format!("{} {f} {m}", SUR[i % SUR.len()])).collect();
+    let all: Vec<String> = firsts.iter().chain(&middles).chain(&people).cloned().collect();
+    let mut f = Faker::new(&settings("согласие"));
+    f.prepare_people(people.iter().map(String::as_str));
+    f.note_reals(all.iter().map(String::as_str));
+    let mut cols: HashMap<String, String> = HashMap::new();
+    for x in &firsts {
+        cols.insert(x.clone(), f.fake(&fr, x, false));
+    }
+    for x in &middles {
+        cols.insert(x.clone(), f.fake(&mr, x, false));
+    }
+    assert!(cols.values().filter(|y| y.contains('-')).count() > 100, "словари не исчерпаны — проверка ни о чём");
+    let mut same = 0;
+    for p in &people {
+        let y = f.fake(&full, p, false);
+        let (rt, ft): (Vec<&str>, Vec<&str>) = (p.split(' ').collect(), y.split(' ').collect());
+        if ft.len() == 3 && ft[1] == cols[rt[1]] && ft[2] == cols[rt[2]] {
+            same += 1;
+        }
+    }
+    // Полное ФИО меняет имя или отчество, только чтобы не совпасть с чужим ФИО, — здесь почти никогда.
+    assert!(same * 10 >= people.len() * 9, "имя и отчество в полном ФИО разошлись с колонками: совпало {same} из {}", people.len());
+    // Ключ восстанавливает имя и отчество с номером — даже ключ только из полных ФИО: в новом ФИО — те же,
+    // что в колонках.
+    let mut g = Faker::new(&settings("согласие"));
+    g.load_entries(f.entries.iter().filter(|e| e.kind_key == full.kind_key()).cloned().collect());
+    let numbered: Vec<&String> = firsts.iter().filter(|x| cols[x.as_str()].contains('-')).take(20).collect();
+    assert!(!numbered.is_empty());
+    for (i, x) in numbered.into_iter().enumerate() {
+        let m = &middles[i];
+        let y = g.fake(&full, &format!("Новиков {x} {m}"), false);
+        let ft: Vec<&str> = y.split(' ').collect();
+        assert_eq!(ft[1..], [cols[x.as_str()].as_str(), cols[m.as_str()].as_str()], "«{x} {m}»: в ключе «{}» «{}», в новом ФИО «{y}»", cols[x.as_str()], cols[m.as_str()]);
+    }
+}
+
+/// «Шаблон» и «Маска» при плотных данных: среди настоящих — «Должность 1»…«Должность 300», все одно- и двузначные
+/// числа, однобуквенные значения; две подписи «Шаблона» различаются только регистром. Фейк не равен ни одному
+/// настоящему, разные значения — разные фейки; с ключом — то же, значения из ключа — прежние фейки, тот же
+/// ключ — те же фейки.
+#[test]
+fn u08_text_and_mask_without_id_unique() {
+    let text: Vec<String> = (1..=300).map(|i| format!("Должность {i}")).chain((1..=300).map(|i| format!("Менеджер отдела {i}"))).collect();
+    let mut masks: Vec<String> = (0..100).map(|i| i.to_string()).collect();
+    masks.extend(["А", "Б", "В", "Г"].iter().flat_map(|a| (0..10).map(move |d| format!("{a}{d}"))));
+    masks.extend((0..26u8).map(|c| ((b'a' + c) as char).to_string()));
+    let (mut t1, mut t2) = (rule(Kind::Text, ""), rule(Kind::Text, ""));
+    t1.label = "Должность".into();
+    t2.label = "должность".into();
+    for (what, reals, rules) in [("Шаблон", text, vec![t1, t2]), ("Маска", masks, vec![rule(Kind::Mask, ""), rule(Kind::Mask, "контрагент")])] {
+        distinct(&reals);
+        let a = run(&mut Faker::new(&settings("шаблон")), &rules, &reals);
+        check(what, &reals, &a, &HashSet::new(), &HashSet::new());
+        let old: Vec<String> = reals.iter().step_by(2).cloned().collect();
+        let new: Vec<String> = reals.iter().skip(1).step_by(2).cloned().collect();
+        // Прошлый запуск видел и новые значения (в книге, вне разметки): значение, равное фейку с номером из ключа,
+        // считается уже обезличенным и не меняется — так задумано, это не предмет проверки.
+        let mut first = Faker::new(&settings("шаблон"));
+        first.note_reals(reals.iter().map(String::as_str));
+        let old_fakes = run(&mut first, &rules, &old);
+        let key: Vec<KeyEntry> = first.entries.clone();
+        let key_fakes: HashSet<String> = key.iter().map(|e| norm_text(&e.fake)).collect();
+        let old_reals: HashSet<String> = old.iter().map(|x| norm_text(x)).collect();
+        let with_key = |xs: &[String]| {
+            let mut f = Faker::new(&settings("шаблон"));
+            f.load_entries(key.clone());
+            run(&mut f, &rules, xs)
+        };
+        assert!(with_key(&old) == old_fakes, "{what}: значения из ключа получили другие фейки");
+        // В новой книге — только новые значения: прошлые настоящие известны лишь из ключа.
+        let b = with_key(&new);
+        check(&format!("{what} с ключом"), &new, &b, &old_reals, &key_fakes);
+        assert!(b == with_key(&new), "{what}: тот же ключ — другие фейки");
+    }
+}
