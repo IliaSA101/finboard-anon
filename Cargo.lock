@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "finboard-anon"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
