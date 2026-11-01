@@ -33,6 +33,8 @@ pub struct Job {
 pub struct Leak {
     pub part: String,
     pub count: usize,
+    /// Найденные реальные значения как есть — для проверок. В журнал и окно не выводятся:
+    /// `Report::summary` показывает их через `mask_sample`.
     pub samples: Vec<String>,
 }
 
@@ -151,8 +153,15 @@ impl Report {
             );
         } else {
             l.push("Проверка обезличенного файла: в нём ещё встречаются реальные значения:".into());
+            // Журнал пересылают — реальные значения в нём только намёком: где искать и сколько.
             for k in &self.leaks {
-                l.push(format!("  {} — {} вхожд., например: {}", k.part, k.count, k.samples.join(" | ")));
+                let mut shown: Vec<String> = Vec::new();
+                for s in k.samples.iter().map(|s| mask_sample(s)) {
+                    if !shown.contains(&s) {
+                        shown.push(s);
+                    }
+                }
+                l.push(format!("  {} — {} вхожд., например: {}", k.part, k.count, shown.join(" | ")));
             }
             l.push("  Обычно это текст формул, заголовки, имена листов или колонки, не попавшие в правила.".into());
             if !self.unchecked.is_empty() {
@@ -161,6 +170,24 @@ impl Report {
         }
         l
     }
+}
+
+/// Найденное реальное значение для журнала — так, чтобы его можно было узнать, но не прочитать:
+/// текст — первая буква каждого слова («Иванов Иван» → «И*** И***»), номер — две последние цифры
+/// («7707083893» → «*** 93»).
+pub fn mask_sample(s: &str) -> String {
+    if !s.chars().any(char::is_alphabetic) {
+        let d: Vec<char> = s.chars().filter(|c| c.is_ascii_digit()).collect();
+        let tail: String = d[d.len().saturating_sub(2)..].iter().collect();
+        return if d.len() > 2 { format!("*** {tail}") } else { "***".into() };
+    }
+    s.split_whitespace()
+        .map(|w| match w.chars().find(|c| c.is_alphabetic()) {
+            Some(c) => format!("{c}***"),
+            None => "***".into(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Значения, которые заменяются везде, где встречаются целиком: общие строки, кэш формул,
@@ -479,7 +506,8 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
     if batch.key_in.is_some() {
         log(format!("Загружен ключ: {key_entries} записей"));
     }
-    log(format!("Уникальных значений: {}", faker.entries.len() - key_entries));
+    // Записи ключа уже есть — считаются только новые: с ключом на 2000 строк и тем же файлом здесь 0.
+    log(format!("Новых значений (нет в ключе): {}", faker.entries.len() - key_entries));
 
     // Папки результатов — до записи: сбой на середине пакета оставил бы часть файлов без ключа.
     for f in &batch.files {
@@ -1254,6 +1282,8 @@ pub fn plan_batch(
     }
     let all = || plans.iter().zip(rules).flat_map(|(p, r)| p.items.iter().map(move |it| (&r[it.0], it)));
     faker.prepare_people(all().filter(|(r, _)| r.kind == Kind::FullName).map(|(_, it)| it.1.as_str()));
+    faker.prepare_companies(all().filter(|(r, _)| r.kind == Kind::Company).map(|(_, it)| it.1.as_str()));
+    faker.note_reals(all().map(|(_, it)| it.1.as_str()));
     let todo: Vec<(&Rule, &String, bool)> = all().map(|(r, it)| (r, &it.1, it.2)).collect();
     for (r, original, numeric) in todo {
         faker.fake(r, original, numeric);

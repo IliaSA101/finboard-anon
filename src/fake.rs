@@ -145,14 +145,42 @@ fn fill_digits(orig: &str, new_digits: &str) -> String {
         .collect()
 }
 
-/// ID с ведущими нулями до ширины `width` (если ID длиннее — берутся последние цифры).
-fn pad_id(id: u32, width: usize) -> String {
+/// ID с ведущими нулями до ширины `width`. Не помещается — `None`: обрезать нельзя, ID 100001 и ID 1
+/// дали бы один и тот же номер, и два контрагента слились бы в один.
+fn fit_id(id: u32, width: usize) -> Option<String> {
     let s = id.to_string();
-    if s.len() >= width {
-        s[s.len() - width..].to_string()
+    (s.len() <= width).then(|| format!("{s:0>width$}"))
+}
+
+/// Номер, похожий на число: цифры и знаки записи номера («+7 (916) 123-45-67», «77 07 083893»).
+fn number_like(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_digit() || " -()+./".contains(c))
+}
+
+/// ИНН с контрольными цифрами: 9 цифр → 10-значный ИНН, 10 цифр → 12-значный.
+fn inn_with_check(body: &str) -> String {
+    let mut v: Vec<u32> = body.chars().map(|c| c.to_digit(10).unwrap_or(0)).collect();
+    if v.len() == 9 {
+        v.push(Faker::check_digit(&v, &[2, 4, 10, 3, 5, 9, 4, 6, 8]));
     } else {
-        format!("{}{}", "0".repeat(width - s.len()), s)
+        v.push(Faker::check_digit(&v, &[7, 2, 4, 10, 3, 5, 9, 4, 6, 8]));
+        v.push(Faker::check_digit(&v, &[3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8]));
     }
+    v.iter().map(|x| char::from_digit(*x, 10).unwrap()).collect()
+}
+
+/// СНИЛС с контрольным числом: 9 цифр номера → 11 цифр.
+fn snils_with_check(base: &str) -> String {
+    let sum: u32 = base.chars().enumerate().map(|(i, c)| c.to_digit(10).unwrap_or(0) * (9 - i as u32)).sum();
+    let check = match sum {
+        s if s < 100 => s,
+        100 | 101 => 0,
+        s => {
+            let m = s % 101;
+            if m == 100 { 0 } else { m }
+        }
+    };
+    format!("{base}{check:02}")
 }
 
 fn translit(s: &str) -> String {
@@ -315,6 +343,57 @@ fn form_only(part: &str) -> String {
 /// Ключ организации: название без формы и кавычек, без регистра.
 pub fn company_key(s: &str) -> String {
     norm_text(&split_company(strip_id_suffix(s)).1)
+}
+
+/// Организационно-правовая форма по словам до и после названия, сокращением: «Общество с ограниченной
+/// ответственностью» — «ООО», «Акционерное общество» — «АО». Пусто — формы нет.
+pub fn company_form(pre: &str, post: &str) -> String {
+    let words: Vec<String> = pre
+        .split_whitespace()
+        .chain(post.split_whitespace())
+        .map(|w| w.trim_matches(|c: char| !c.is_alphabetic()).to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if let Some(w) = words.iter().map(|w| w.to_uppercase()).find(|w| LEGAL_FORMS.contains(&w.as_str())) {
+        return w;
+    }
+    let has = |x: &str| words.iter().any(|w| w == x);
+    let form = if has("ответственностью") {
+        if has("товарищество") { "ТОО" } else { "ООО" }
+    } else if has("акционерное") {
+        if has("непубличное") {
+            "НАО"
+        } else if has("публичное") {
+            "ПАО"
+        } else if has("закрытое") {
+            "ЗАО"
+        } else if has("открытое") {
+            "ОАО"
+        } else {
+            "АО"
+        }
+    } else if has("унитарное") {
+        if has("федеральное") {
+            "ФГУП"
+        } else if has("муниципальное") {
+            "МУП"
+        } else {
+            "ГУП"
+        }
+    } else if has("некоммерческая") {
+        if has("автономная") { "АНО" } else { "НКО" }
+    } else if has("предприниматель") {
+        "ИП"
+    } else {
+        ""
+    };
+    form.to_string()
+}
+
+/// Форма и название без регистра — без учёта других значений: «ООО «Ромашка»» → («ООО», «ромашка»).
+fn company_parts(s: &str) -> (String, String) {
+    let (pre, name, post) = split_company(strip_id_suffix(s));
+    (company_form(&pre, &post), norm_text(&name))
 }
 
 /// Индивидуальный предприниматель: «ИП Козлов Олег Петрович» — это человек.
@@ -633,6 +712,18 @@ pub struct Faker {
     taken: HashSet<String>,
     people: HashMap<(String, char, char), HashSet<String>>,
     full_by_norm: HashMap<String, String>,
+    /// Выданные фейковые цифры номеров и телефонов (телефон — 10 цифр без 8/+7) → чьи они:
+    /// «n:» + цифры номера, «p:» + 10 цифр телефона (+ «@связь»). Общие для всех связей:
+    /// разные реальные номера — разные фейки, и один номер в разных связях — тоже.
+    issued: HashMap<String, String>,
+    /// Цифры реальных номеров прогона и ключа: фейк не должен совпасть ни с одним из них.
+    real_digits: HashSet<String>,
+    /// Короткие коды: фейк («дог912345») → чей код («дог1», + «@связь»).
+    issued_codes: HashMap<String, String>,
+    /// Адреса без ID: фейк → чей адрес (+ «@связь»).
+    used_address: HashMap<String, String>,
+    /// С какими формами встречается название: «ромашка» → {«ООО», «АО»}. Свойство данных, общее для связей.
+    forms: HashMap<String, HashSet<String>>,
     /// Связь, чьи словари сейчас в полях выше (пусто — общая).
     group: String,
     /// Словари остальных связей, пока работа идёт с другой.
@@ -751,6 +842,11 @@ impl Faker {
             taken: HashSet::new(),
             people: HashMap::new(),
             full_by_norm: HashMap::new(),
+            issued: HashMap::new(),
+            real_digits: HashSet::new(),
+            issued_codes: HashMap::new(),
+            used_address: HashMap::new(),
+            forms: HashMap::new(),
             group: String::new(),
             groups: HashMap::new(),
             link_order: Vec::new(),
@@ -764,7 +860,103 @@ impl Faker {
             self.taken.insert(norm_text(s));
             // «ООО «Вектор»» в книге — фейковой организации «Вектор» быть не должно.
             self.taken.insert(company_key(s));
+            if number_like(s) {
+                self.note_real(s);
+            }
         }
+    }
+
+    /// Значения прогона до выбора фейков: фейковый номер не должен совпасть ни с одним реальным номером —
+    /// иначе при замене внутри текста он заменился бы ещё раз, а в данных совпал бы с другим контрагентом.
+    pub fn note_reals<'a>(&mut self, originals: impl IntoIterator<Item = &'a str>) {
+        for o in originals {
+            self.note_real(o);
+        }
+    }
+
+    fn note_real(&mut self, s: &str) {
+        let d = digits_of(s);
+        if d.len() >= 5 {
+            self.real_digits.insert(phone_key(&d));
+            self.real_digits.insert(d);
+        }
+    }
+
+    /// Формы организаций — до выбора фейков. «Ромашка» без формы — та же организация, что «ООО «Ромашка»»,
+    /// если с другой формой это название в данных не встречается; «ООО «Ромашка»» и «АО «Ромашка»» — разные
+    /// юрлица, и тогда «Ромашка» без формы — отдельная организация: какое из двух имелось в виду, не угадать.
+    pub fn prepare_companies<'a>(&mut self, originals: impl IntoIterator<Item = &'a str>) {
+        for o in originals {
+            let (pre, name, post) = split_company(strip_id_suffix(o));
+            if is_ip(&form_only(&pre), &form_only(&post)) {
+                continue;
+            }
+            let form = company_form(&pre, &post);
+            if !form.is_empty() {
+                self.forms.entry(norm_text(&name)).or_default().insert(form);
+            }
+        }
+        // Из ключа прошлых запусков: название без формы, записанное отдельно, — та же организация,
+        // что и с единственной формой: тот же фейк и тот же ID. В каждой связи — в её словарях.
+        let single: Vec<(String, String)> =
+            self.forms.iter().filter(|(_, f)| f.len() == 1).filter_map(|(n, f)| Some((n.clone(), f.iter().next()?.clone()))).collect();
+        let alias = |company: &mut HashMap<String, String>, ids: &mut HashMap<String, HashMap<String, u32>>| {
+            for (name, form) in &single {
+                let (from, to) = (format!("|{name}"), format!("{form}|{name}"));
+                if let Some(f) = company.get(&from).cloned() {
+                    company.entry(to.clone()).or_insert(f);
+                }
+                if let Some(m) = ids.get_mut("company") {
+                    if let Some(&id) = m.get(&from) {
+                        m.entry(to).or_insert(id);
+                    }
+                }
+            }
+        };
+        alias(&mut self.company, &mut self.ids);
+        for g in self.groups.values_mut() {
+            alias(&mut g.company, &mut g.ids);
+        }
+    }
+
+    /// Ключ организации с формой: «ООО|ромашка». Без формы — с единственной формой этого названия в данных.
+    fn company_identity(&self, form: &str, name: &str) -> String {
+        if form.is_empty() {
+            if let Some(f) = self.forms.get(name).filter(|f| f.len() == 1).and_then(|f| f.iter().next()) {
+                return format!("{f}|{name}");
+            }
+        }
+        format!("{form}|{name}")
+    }
+
+    /// Цифры номера, свои для каждого реального значения. `gen(0)` — прежний фейк (с ID — номер по ID);
+    /// если он уже выдан другому значению или совпал с реальным номером — следующая попытка, детерминированно.
+    /// Пространство исчерпано (короткий номер, тысячи значений) — первый вариант: совпадение неизбежно.
+    fn issue(&mut self, space: char, real: &str, mut gen: impl FnMut(u32) -> String) -> String {
+        // Владелец — номер и связь: тот же номер в другой связи — другой контрагент, свой фейк.
+        let owner = self.person_owner(&format!("{space}:{real}"));
+        self.real_digits.insert(real.to_string());
+        let key = |c: &str| if space == 'p' { phone_key(c) } else { c.to_string() };
+        let first = gen(0);
+        let mut cand = first.clone();
+        for n in 1..=20_000 {
+            let free = match self.issued.get(&key(&cand)) {
+                Some(o) => *o == owner,
+                None => !self.is_real_number(&cand),
+            };
+            if free {
+                break;
+            }
+            cand = if n == 20_000 { first.clone() } else { gen(n) };
+        }
+        self.issued.entry(key(&cand)).or_insert(owner);
+        cand
+    }
+
+    fn is_real_number(&self, d: &str) -> bool {
+        let k = phone_key(d);
+        // Общий набор всех связей: реальные номера ключа и прогона попадают сюда при загрузке и выдаче.
+        self.real_digits.contains(d) || self.real_digits.contains(&k)
     }
 
     /// Организации: название как в данных → фейковое название (без формы) и ID.
@@ -1230,13 +1422,21 @@ impl Faker {
             (first.to_string(), n - 1)
         };
         let tail_len = if body_len == 10 { 7 } else { body_len };
-        let tail = if with_id {
-            pad_id(self.id_for("phone", &key), tail_len)
+        // С ID — номер по ID: «900 000-00-01»; ID шире семи цифр занимает и код «00»: «901 000-00-00» — ID 10000000.
+        let id_body = if with_id {
+            let id = self.id_for("phone", &key);
+            if body_len == 10 { fit_id(id, 9).map(|t| format!("9{t}")) } else { fit_id(id, tail_len) }
         } else {
-            r.digits(tail_len, false)
+            None
         };
-        let body = if body_len == 10 { format!("900{tail}") } else { tail };
-        let out = format!("{prefix}{body}");
+        let out = self.issue('p', &key, |n| {
+            let body = match (&id_body, n) {
+                (Some(b), 0) => b.clone(),
+                _ if body_len == 10 => format!("900{}", r.digits(tail_len, false)),
+                _ => r.digits(tail_len, false),
+            };
+            format!("{prefix}{body}")
+        });
         self.phones.insert(key, phone_key(&out));
         fill_digits(orig, &out)
     }
@@ -1284,17 +1484,19 @@ impl Faker {
         }
         let mut r = Rng::new(&[&self.s.salt, "inn", &d]);
         let body_len = if d.len() == 10 { 5 } else { 6 };
-        let body = if with_id { pad_id(self.id_for("inn", &d), body_len) } else { r.digits(body_len, false) };
         // «99 00 …»: налоговой инспекции с кодом 00 нет — настоящего такого ИНН не бывает.
+        // ID шире пяти (шести) цифр занимает и код инспекции: «99 01 00001 …» — ID 100001, а не второй ID 1.
+        let id_body = if with_id { fit_id(self.id_for("inn", &d), body_len + 2) } else { None };
         // Без ведущих нулей: ИНН-число остаётся числом (ВПР по ИНН не ломается).
-        let mut v: Vec<u32> = format!("9900{body}").chars().map(|c| c.to_digit(10).unwrap()).collect();
-        if d.len() == 10 {
-            v.push(Self::check_digit(&v, &[2, 4, 10, 3, 5, 9, 4, 6, 8]));
-        } else {
-            v.push(Self::check_digit(&v, &[7, 2, 4, 10, 3, 5, 9, 4, 6, 8]));
-            v.push(Self::check_digit(&v, &[3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8]));
-        }
-        let s: String = v.iter().map(|x| char::from_digit(*x, 10).unwrap()).collect();
+        let s = self.issue('n', &d, |n| {
+            let body = match (&id_body, n) {
+                (Some(b), 0) => format!("99{b}"),
+                // Пять цифр — сто тысяч номеров; когда они заняты — шире, с кодом инспекции.
+                _ if n < 64 => format!("9900{}", r.digits(body_len, false)),
+                _ => format!("99{}", r.digits(body_len + 2, false)),
+            };
+            inn_with_check(&body)
+        });
         fill_digits(orig, &s)
     }
 
@@ -1304,21 +1506,17 @@ impl Faker {
             return self.fake_account(orig, with_id);
         }
         let mut r = Rng::new(&[&self.s.salt, "snils", &d]);
-        let base = if with_id {
-            format!("{:09}", 100_000_000 + self.id_for("snils", &d) % 900_000_000)
+        let id_base = if with_id {
+            let id = self.id_for("snils", &d);
+            (id < 900_000_000).then(|| format!("{:09}", 100_000_000 + id))
         } else {
-            r.digits(9, true)
+            None
         };
-        let sum: u32 = base.chars().enumerate().map(|(i, c)| c.to_digit(10).unwrap() * (9 - i as u32)).sum();
-        let check = match sum {
-            s if s < 100 => s,
-            100 | 101 => 0,
-            s => {
-                let m = s % 101;
-                if m == 100 { 0 } else { m }
-            }
-        };
-        fill_digits(orig, &format!("{base}{check:02}"))
+        let s = self.issue('n', &d, |n| match (&id_base, n) {
+            (Some(b), 0) => snils_with_check(b),
+            _ => snils_with_check(&r.digits(9, true)),
+        });
+        fill_digits(orig, &s)
     }
 
     fn fake_passport(&mut self, orig: &str, with_id: bool) -> String {
@@ -1327,7 +1525,12 @@ impl Faker {
             return self.fake_account(orig, with_id);
         }
         let mut r = Rng::new(&[&self.s.salt, "passport", &d]);
-        let s = if with_id { format!("9900{}", pad_id(self.id_for("passport", &d), 6)) } else { format!("99{}", r.digits(8, false)) };
+        // «99 00 000001»; ID шире шести цифр занимает и вторую пару: «99 01 000000» — ID 1000000.
+        let id_body = if with_id { fit_id(self.id_for("passport", &d), 8) } else { None };
+        let s = self.issue('n', &d, |n| match (&id_body, n) {
+            (Some(b), 0) => format!("99{b}"),
+            _ => format!("99{}", r.digits(8, false)),
+        });
         fill_digits(orig, &s)
     }
 
@@ -1339,23 +1542,50 @@ impl Faker {
         if short_code(&d) {
             // Шесть цифр на «9»: фейк длиннее любого короткого кода и не совпадёт ни с одним настоящим.
             // ID — по всему коду: «Дог1» и «Счет1» — разные вещи.
-            let tail = if with_id {
-                let id = self.id_for("code", &norm_text(orig));
+            let norm = norm_text(orig);
+            let id_tail = with_id.then(|| {
+                let id = self.id_for("code", &norm);
                 if id < 100_000 { format!("9{id:05}") } else { format!("9{id}") }
-            } else {
-                format!("9{}", Rng::new(&[&self.s.salt, "code", &norm_text(orig)]).digits(5, false))
-            };
-            return replace_digit_run(orig, &tail);
+            });
+            // Без ID — случайные пять цифр: среди сотен кодов они совпадут, поэтому занятый фейк не выдаётся
+            // другому коду, берётся следующий вариант.
+            let mut r = Rng::new(&[&self.s.salt, "code", &norm]);
+            let me = self.person_owner(&norm);
+            for n in 0..=20_000u32 {
+                let tail = match (&id_tail, n) {
+                    (Some(t), 0) => t.clone(),
+                    _ if n < 1000 => format!("9{}", r.digits(5, false)),
+                    _ => format!("9{}", r.digits(7, false)),
+                };
+                let out = replace_digit_run(orig, &tail);
+                let k = norm_text(&out);
+                let free = self.issued_codes.get(&k).map_or(!self.taken.contains(&k), |o| *o == me);
+                if free || n == 20_000 {
+                    self.issued_codes.entry(k).or_insert(me);
+                    return out;
+                }
+            }
+            unreachable!()
         }
         let keep = if d.len() >= 12 { 4 } else { 0 };
         let rest = d.len() - keep;
+        let lead = keep == 0 && !d.starts_with('0');
         let mut r = Rng::new(&[&self.s.salt, "account", &d]);
-        let mut tail = if with_id { pad_id(self.id_for("account", &d), rest) } else { r.digits(rest, keep == 0 && !d.starts_with('0')) };
-        if keep == 0 && !d.starts_with('0') && tail.starts_with('0') && tail.len() > 1 {
-            // Номер без ведущего нуля — и фейк без него, иначе число станет текстом.
-            tail.replace_range(0..1, "9");
-        }
-        fill_digits(orig, &format!("{}{}", &d[..keep], tail))
+        let id_tail = if with_id { fit_id(self.id_for("account", &d), rest) } else { None };
+        let head = d[..keep].to_string();
+        let s = self.issue('n', &d, |n| {
+            let mut tail = match (&id_tail, n) {
+                (Some(t), 0) => t.clone(),
+                _ => r.digits(rest, lead),
+            };
+            if lead && tail.starts_with('0') && tail.len() > 1 {
+                // Номер без ведущего нуля — и фейк без него, иначе число станет текстом.
+                // (ID 7 и ID 90007 так дают одно «90007» — второй получит другой номер.)
+                tail.replace_range(0..1, "9");
+            }
+            format!("{head}{tail}")
+        });
+        fill_digits(orig, &s)
     }
 
     fn fake_address(&mut self, orig: &str, with_id: bool) -> String {
@@ -1378,23 +1608,44 @@ impl Faker {
 
     fn new_address(&mut self, orig: &str, norm: &str) -> String {
         let mut r = Rng::new(&[&self.s.salt, "addr", norm]);
-        let mut s = String::new();
         let first = orig.split([',', ' ']).next().unwrap_or("");
-        if first.len() == 6 && first.chars().all(|c| c.is_ascii_digit()) {
-            s.push_str(&format!("{}, ", 100000 + r.below(900000)));
+        let index = first.len() == 6 && first.chars().all(|c| c.is_ascii_digit());
+        // Разные адреса — разные фейки: без ID адрес — единственное, что их различает.
+        // Занятый фейк (чужой или настоящий адрес из книги) — следующий вариант, детерминированно.
+        let me = self.person_owner(norm);
+        for n in 0..=10_000u32 {
+            let mut s = String::new();
+            if index {
+                s.push_str(&format!("{}, ", 100000 + r.below(900000)));
+            }
+            let (city, street) = (r.pick(CITIES), r.pick(STREETS));
+            let house = 1 + r.below(if n < 100 { 120 } else { 999 });
+            s.push_str(&format!("г. {city}, ул. {street}, д. {house}"));
+            if norm.contains("кв") {
+                s.push_str(&format!(", кв. {}", 1 + r.below(250)));
+            }
+            let k = norm_text(&s);
+            let free = self.used_address.get(&k).map_or(k != norm && !self.taken.contains(&k), |o| *o == me);
+            if free || n == 10_000 {
+                self.used_address.entry(k).or_insert(me);
+                return s;
+            }
         }
-        s.push_str(&format!("г. {}, ул. {}, д. {}", r.pick(CITIES), r.pick(STREETS), 1 + r.below(120)));
-        if norm.contains("кв") {
-            s.push_str(&format!(", кв. {}", 1 + r.below(250)));
-        }
-        s
+        unreachable!()
     }
 
     fn fake_company(&mut self, orig: &str, with_id: bool) -> String {
         let (pre, name, post) = split_company(strip_id_suffix(orig));
-        let key = norm_text(&name);
+        let bare = norm_text(&name);
+        let form = company_form(&pre, &post);
         let (pre, post) = (form_only(&pre), form_only(&post));
-        let s = if is_ip(&pre, &post) {
+        let ip = is_ip(&pre, &post);
+        if !ip && !form.is_empty() {
+            self.forms.entry(bare.clone()).or_default().insert(form.clone());
+        }
+        // «ООО «Ромашка»» и «АО «Ромашка»» — разные юрлица: ключ — с формой.
+        let key = if ip { bare.clone() } else { self.company_identity(&form, &bare) };
+        let s = if ip {
             // ИП — это человек: то же фейковое ФИО, что и в колонке ФИО.
             let p = self.fake_person(&name, false);
             if name.chars().count() >= 4 {
@@ -1404,19 +1655,29 @@ impl Faker {
             }
             format!("{pre}{p}")
         } else {
-            let fake = match self.company.get(&key) {
-                Some(f) => f.clone(),
-                None => {
-                    let f = self.new_company_name(&key);
-                    self.company.insert(key.clone(), f.clone());
-                    f
-                }
-            };
+            let fake = self.company_fake(&key, &bare);
             let fake = apply_case(&name, &fake);
             if name.chars().count() >= 3 {
                 // Название в любом написании и внутри текста получает тот же ID, что и в колонке.
                 let id = with_id.then(|| self.peek_id("company", &key));
-                self.company_text.entry(name.trim().to_string()).or_insert_with(|| (fake.clone(), id));
+                let ambiguous = self.forms.get(&bare).is_some_and(|f| f.len() >= 2);
+                if !ambiguous {
+                    self.company_text.entry(name.trim().to_string()).or_insert_with(|| (fake.clone(), id));
+                } else if form.is_empty() {
+                    // Само название без формы — эта, отдельная организация.
+                    self.company_text.insert(name.trim().to_string(), (fake.clone(), id));
+                } else {
+                    // Название одно, юрлица разные: внутри текста «Ромашка» без формы — организация без формы
+                    // (какое из юрлиц имелось в виду, не угадать), «АО «Ромашка»» с формой — своё.
+                    let bare_key = format!("|{bare}");
+                    let other = apply_case(&name, &self.company_fake(&bare_key, &bare));
+                    let other_id = self.ids.get("company").and_then(|m| m.get(&bare_key)).copied();
+                    self.company_text.entry(name.trim().to_string()).or_insert((other, other_id));
+                    let written = strip_id_suffix(orig).trim().to_string();
+                    if written != name.trim() {
+                        self.company_text.entry(written).or_insert_with(|| (format!("{pre}{fake}{post}"), id));
+                    }
+                }
             }
             format!("{pre}{fake}{post}")
         };
@@ -1428,24 +1689,38 @@ impl Faker {
         }
     }
 
+    /// Фейковое название организации по ключу с формой. Выбор — по названию без формы: у «Ромашки» без
+    /// второй формы фейк тот же, что в версиях до 0.5; у второго юрлица с тем же названием первый вариант
+    /// занят — оно получает другой.
+    fn company_fake(&mut self, key: &str, bare: &str) -> String {
+        if let Some(f) = self.company.get(key) {
+            return f.clone();
+        }
+        let f = self.new_company_name(bare);
+        self.company.insert(key.to_string(), f.clone());
+        f
+    }
+
     fn new_company_name(&mut self, key: &str) -> String {
         let mut r = Rng::new(&[&self.s.salt, "company", key]);
-        let mut name = String::new();
-        for attempt in 0..400 {
-            name = if attempt < 20 {
+        // Попытки не кончаются, пока название не свободно: номер в конце растёт, и свободное найдётся всегда.
+        for attempt in 0u32.. {
+            let name = if attempt < 20 {
                 r.pick(COMPANY_NAMES).to_string()
             } else if attempt < 150 {
                 format!("{} {}", r.pick(COMPANY_NAMES), r.pick(COMPANY_SUFFIXES))
-            } else {
+            } else if attempt < 400 {
                 format!("{} {}", r.pick(COMPANY_NAMES), 2 + r.below(9998))
+            } else {
+                format!("{} {}", r.pick(COMPANY_NAMES), 10_000 + attempt)
             };
             let n = norm_text(&name);
             if !self.used_company.contains(&n) && !self.taken.contains(&n) && n != key {
-                break;
+                self.used_company.insert(n);
+                return name;
             }
         }
-        self.used_company.insert(norm_text(&name));
-        name
+        unreachable!()
     }
 
     // ------------------------------------------------ прочее
@@ -1539,8 +1814,15 @@ impl Faker {
                     let norm = match kind {
                         _ if short => norm_text(&e.real),
                         Kind::Phone => phone_key(&e.real),
-                        Kind::Inn | Kind::Snils | Kind::Passport | Kind::Account => digits_of(&e.real),
-                        Kind::Company => company_key(&e.real),
+                        Kind::Inn | Kind::Snils | Kind::Passport | Kind::Account => {
+                            let (d, fd) = (digits_of(&e.real), digits_of(&e.fake));
+                            if kind == Kind::Inn && matches!(d.len(), 9 | 11) && fd.len() == d.len() + 1 { format!("0{d}") } else { d }
+                        }
+                        Kind::Company => {
+                            let (form, name) = company_parts(&e.real);
+                            let (rp, _, rpost) = split_company(strip_id_suffix(&e.real));
+                            if is_ip(&form_only(&rp), &form_only(&rpost)) { name } else { format!("{form}|{name}") }
+                        }
                         Kind::Email => e.real.trim().to_lowercase(),
                         _ => norm_text(&e.real),
                     };
@@ -1578,7 +1860,11 @@ impl Faker {
                             self.used_company.insert(norm_text(&fname));
                             // Фейк записан в ключ ЗАГЛАВНЫМИ (исходник был заглавными) — для другого написания нужен обычный вид.
                             let base = if fname.chars().any(char::is_lowercase) { fname.clone() } else { title_case(&fname) };
-                            self.company.entry(norm_text(&rn)).or_insert(base);
+                            let form = company_form(&rp, &rpost);
+                            if !form.is_empty() {
+                                self.forms.entry(norm_text(&rn)).or_default().insert(form.clone());
+                            }
+                            self.company.entry(format!("{form}|{}", norm_text(&rn))).or_insert(base);
                             if rn.chars().count() >= 3 {
                                 self.company_text.entry(rn.trim().to_string()).or_insert((fname, e.id));
                             }
@@ -1586,8 +1872,22 @@ impl Faker {
                     }
                     Kind::Inn | Kind::Snils | Kind::Passport | Kind::Account => {
                         let (d, fd) = (digits_of(&e.real), digits_of(&e.fake));
-                        if d.len() >= 9 && d.len() == fd.len() {
-                            self.digits.entry(d).or_insert(fd);
+                        // ИНН числом без ведущего нуля (274062111) получил фейк по 0274062111.
+                        let d = if kind == Kind::Inn && matches!(d.len(), 9 | 11) && fd.len() == d.len() + 1 { format!("0{d}") } else { d };
+                        if d.len() >= 5 {
+                            self.real_digits.insert(d.clone());
+                        }
+                        if short {
+                            // Короткий код: занятый фейк не выдаётся новому коду.
+                            let me = self.person_owner(&norm_text(&e.real));
+                            self.issued_codes.entry(norm_text(&e.fake)).or_insert(me);
+                        } else if d.len() == fd.len() {
+                            // Фейки ключа заняты: новый номер их не получит.
+                            let me = self.person_owner(&format!("n:{d}"));
+                            self.issued.entry(fd.clone()).or_insert(me);
+                            if d.len() >= 9 {
+                                self.digits.entry(d).or_insert(fd);
+                            }
                         }
                     }
                     Kind::LastName | Kind::FirstName | Kind::MiddleName => {
@@ -1606,7 +1906,11 @@ impl Faker {
                                 } else {
                                     let (dr, df) = (digits_of(r), digits_of(f));
                                     if dr.len() == df.len() && dr.len() >= 5 {
-                                        self.phones.entry(phone_key(&dr)).or_insert_with(|| phone_key(&df));
+                                        let (kr, kf) = (phone_key(&dr), phone_key(&df));
+                                        self.real_digits.insert(kr.clone());
+                                        let me = self.person_owner(&format!("p:{kr}"));
+                                        self.issued.entry(kf.clone()).or_insert(me);
+                                        self.phones.entry(kr).or_insert(kf);
                                     }
                                 }
                             }
@@ -1614,7 +1918,10 @@ impl Faker {
                     }
                     Kind::Address => {
                         let fake_core = e.id.map_or(e.fake.clone(), |id| self.strip_id(&e.fake, id));
-                        self.addresses.entry(norm_text(strip_id_suffix(&e.real))).or_insert(fake_core);
+                        let norm = norm_text(strip_id_suffix(&e.real));
+                        let me = self.person_owner(&norm);
+                        self.used_address.entry(norm_text(&fake_core)).or_insert(me);
+                        self.addresses.entry(norm).or_insert(fake_core);
                     }
                     Kind::BirthDate => {
                         if let (Some(r), Some(f)) = (date_day(&e.real, false), date_day(&e.fake, false)) {
