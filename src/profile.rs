@@ -425,18 +425,24 @@ pub fn norm_words(s: &str) -> String {
         .join(" ")
 }
 
-/// Похоже ли на персональные данные само по себе, без сравнения со значениями: ФИО, номер, email,
-/// организация с формой («ООО «Ромашка»», «ИП Петров»). Возвращает, на что похоже, — для пояснения.
-/// Обычные заголовки («Ответственный», «Покупатель группа», «Остаток на 01.10.2024») — нет.
+/// Похоже ли на персональные данные само по себе, без сравнения со значениями. Проверяются части текста
+/// в любом его месте: строку-карточку над таблицей пишут по-разному — «Ответственный: Сидоров Семён Семёнович»,
+/// «СИДОРОВ С.С. (менеджер)», «e-mail: ivanov@corp.ru», «Тел. +7 916 123 45 67».
+/// - email — слово с «@» (буквы или цифры по обе стороны);
+/// - номер — пять цифр и больше подряд в одном слове или десять и больше в одной группе через пробелы, скобки,
+///   дефисы, точки, при любой подписи рядом; даты и годы не в счёт;
+/// - организация — форма собственности («ООО», «ИП»…) и за ней название;
+/// - ФИО — два-три слова подряд, без учёта регистра и знаков препинания по краям слов (`person_window`).
+///
+/// Возвращает, на что похоже, — для пояснения. Обычные заголовки («Ответственный», «Покупатель группа»,
+/// «Остаток на 01.10.2024», «Сумма, руб.») — нет.
 pub fn looks_personal(s: &str) -> Option<&'static str> {
     let t = s.trim();
     if t.is_empty() {
         return None;
     }
-    if let Some((a, b)) = t.split_once('@') {
-        if !a.trim().is_empty() && !a.contains(char::is_whitespace) && b.contains('.') && !b.contains(char::is_whitespace) {
-            return Some("похоже на email");
-        }
+    if has_email(t) {
+        return Some("похоже на email");
     }
     if looks_number(t) {
         return Some("похоже на номер");
@@ -450,18 +456,47 @@ pub fn looks_personal(s: &str) -> Option<&'static str> {
     None
 }
 
-/// Номер: пять цифр и больше подряд в одном слове (даты «01.10.2024» и годы «2024-2025» не в счёт)
-/// или десять цифр и больше во всём тексте почти без букв (телефон с пробелами).
+/// Слово с «@», и по обе стороны от неё — буквы или цифры.
+fn has_email(t: &str) -> bool {
+    t.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '<' | '>' | '(' | ')' | '[' | ']' | '«' | '»' | '"' | '\''))
+        .filter_map(|w| w.split_once('@'))
+        .any(|(a, b)| a.chars().any(char::is_alphanumeric) && b.chars().any(char::is_alphanumeric))
+}
+
+/// Дата: «01.10.2024», «1.10.24», «2024.10.01», «01/10/2024», «2024-10-01», «01-10-2024».
+fn is_date(w: &str) -> bool {
+    let w = w.trim_matches(|c: char| !c.is_ascii_digit());
+    let lens = |sep: char| -> Option<Vec<usize>> {
+        let p: Vec<&str> = w.split(sep).collect();
+        (p.len() == 3 && p.iter().all(|x| !x.is_empty() && x.chars().all(|c| c.is_ascii_digit()))).then(|| p.iter().map(|x| x.len()).collect())
+    };
+    let dmy = |l: &[usize]| l[0] <= 2 && l[1] <= 2 && matches!(l[2], 2 | 4);
+    let ymd = |l: &[usize]| l[0] == 4 && l[1] <= 2 && l[2] <= 2;
+    lens('.').is_some_and(|l| dmy(&l) || ymd(&l))
+        || lens('/').is_some_and(|l| dmy(&l))
+        || lens('-').is_some_and(|l| ymd(&l) || (l[0] <= 2 && l[1] <= 2 && l[2] == 4))
+}
+
+/// Год: «2024», «2024г.».
+fn is_year(w: &str) -> bool {
+    let w = w.trim_matches(|c: char| !c.is_ascii_digit());
+    w.len() == 4 && w.chars().all(|c| c.is_ascii_digit()) && (w.starts_with("19") || w.starts_with("20"))
+}
+
+/// Дата, год или период из них: «01.10.2024», «2024-2025», «01.01.2024–31.12.2024».
+fn is_period(w: &str) -> bool {
+    if is_date(w) || is_year(w) {
+        return true;
+    }
+    let p: Vec<&str> = w.split(['-', '–', '—', '/']).collect();
+    p.len() == 2 && p.iter().all(|x| is_date(x) || is_year(x))
+}
+
+/// Номер: пять цифр и больше подряд в одном слове («7707083893», «ИНН/КПП: 5029290277», «8(916)1234567»)
+/// или десять и больше в одной группе цифр через пробелы, скобки, дефисы, точки («Тел. +7 916 123 45 67»).
+/// Даты, годы и периоды из них не в счёт.
 fn looks_number(t: &str) -> bool {
-    let date = |w: &str| {
-        let p: Vec<&str> = w.trim_matches(|c: char| !c.is_ascii_digit()).split('.').collect();
-        p.len() == 3 && p.iter().all(|x| !x.is_empty() && x.len() <= 4 && x.chars().all(|c| c.is_ascii_digit()))
-    };
-    let years = |w: &str| {
-        let p: Vec<&str> = w.split(['-', '–', '—']).collect();
-        p.len() == 2 && p.iter().all(|x| x.len() == 4 && x.chars().all(|c| c.is_ascii_digit()) && (x.starts_with("19") || x.starts_with("20")))
-    };
-    let long = t.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '/' | '№')).filter(|w| !date(w) && !years(w)).any(|w| {
+    let long = t.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '/' | '№')).filter(|w| !is_period(w)).any(|w| {
         let mut run = 0;
         let mut best = 0;
         for c in w.chars() {
@@ -474,35 +509,124 @@ fn looks_number(t: &str) -> bool {
         }
         best >= 5
     });
-    let digits = t.chars().filter(|c| c.is_ascii_digit()).count();
-    let letters = t.chars().filter(|c| c.is_alphabetic()).count();
-    long || (digits >= 10 && letters < 3)
+    if long {
+        return true;
+    }
+    // Группа цифр через разделители: даты и годы её разрывают, буквы и прочие знаки — тоже.
+    let masked: Vec<&str> = t.split_whitespace().map(|w| if is_period(w) { "|" } else { w }).collect();
+    let (mut digits, mut seps, mut best) = (0, 0, 0);
+    for c in masked.join(" ").chars() {
+        if c.is_ascii_digit() {
+            digits += 1;
+            seps = 0;
+            best = best.max(digits);
+        } else if matches!(c, ' ' | '-' | '(' | ')' | '+' | '.' | '–' | '—' | '/' | '\u{a0}') {
+            seps += 1;
+            if seps > 3 {
+                digits = 0;
+            }
+        } else {
+            digits = 0;
+            seps = 0;
+        }
+    }
+    best >= 10
 }
 
-/// Организация с формой собственности: «ООО «Ромашка»», «ИП Петров И.И.», «АО Вектор».
+/// Организация: форма собственности и за ней название в любом месте текста — «ООО «Ромашка»»,
+/// «Покупатель: ИП Петров И.И.», «Контакт:ООО «Ромашка»», «ао вектор» (весь текст строчными).
+/// «Доля ООО в выручке», «Форма (ООО/ИП)», «ООО, Регион» — нет.
 fn looks_company(t: &str) -> bool {
-    let words: Vec<&str> = t.split_whitespace().map(|w| w.trim_matches(|c: char| !c.is_alphanumeric())).filter(|w| !w.is_empty()).collect();
-    words.len() >= 2 && crate::names::LEGAL_FORMS.contains(&words[0])
+    use crate::names::LEGAL_FORMS;
+    let lower_text = !t.chars().any(char::is_uppercase);
+    // Слова без знаков по краям; перед словом стояла кавычка; перед словом запятая или точка с запятой —
+    // это уже не название после формы.
+    let mut words: Vec<(String, bool, bool)> = Vec::new();
+    let (mut cur, mut quoted, mut broken) = (String::new(), false, false);
+    let mut flush = |cur: &mut String, quoted: &mut bool, broken: &mut bool| {
+        let w = cur.trim_matches(|c: char| !c.is_alphanumeric());
+        if !w.is_empty() {
+            words.push((w.to_string(), *quoted, *broken));
+            (*quoted, *broken) = (false, false);
+        }
+        cur.clear();
+    };
+    for c in t.chars() {
+        if matches!(c, '«' | '»' | '"' | '“' | '”' | '„' | '\'') {
+            flush(&mut cur, &mut quoted, &mut broken);
+            quoted = true;
+        } else if matches!(c, ',' | ';') {
+            flush(&mut cur, &mut quoted, &mut broken);
+            broken = true;
+        } else if c.is_whitespace() || matches!(c, ':' | '(' | ')' | '[' | ']' | '/') {
+            flush(&mut cur, &mut quoted, &mut broken);
+        } else {
+            cur.push(c);
+        }
+    }
+    flush(&mut cur, &mut quoted, &mut broken);
+    let form = |w: &str| LEGAL_FORMS.contains(&w) || (lower_text && LEGAL_FORMS.iter().any(|f| f.to_lowercase() == w));
+    words.windows(2).any(|p| {
+        let (next, q, broken) = (&p[1].0, p[1].1, p[1].2);
+        form(&p[0].0)
+            && !broken
+            && !LEGAL_FORMS.iter().any(|f| f.to_lowercase() == next.to_lowercase())
+            && (q || lower_text || next.starts_with(|c: char| c.is_uppercase() || c.is_ascii_digit()))
+    })
 }
 
-/// ФИО: два-три слова с большой буквы (или инициалы «И.И.»), и хотя бы одно — известное имя, отчество
-/// («…вич», «…вна») или фамилия рядом с инициалами. «Отдел Кадров», «Покупатель группа» — не ФИО.
+/// Слова текста для поиска ФИО: буквы, цифры и дефисы; точка после одной буквы — инициал («С.С.» — «С.», «С.»).
+/// Остальные знаки препинания — границы слов.
+fn person_words(t: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let flush = |cur: &mut String, out: &mut Vec<String>| {
+        let w = cur.trim_matches('-');
+        if !w.is_empty() {
+            out.push(w.to_string());
+        }
+        cur.clear();
+    };
+    for c in t.chars() {
+        if c.is_alphanumeric() || c == '-' {
+            cur.push(c);
+        } else if c == '.' && cur.chars().count() == 1 && cur.chars().all(char::is_alphabetic) {
+            cur.push('.');
+            flush(&mut cur, &mut out);
+        } else {
+            flush(&mut cur, &mut out);
+        }
+    }
+    flush(&mut cur, &mut out);
+    out
+}
+
+/// ФИО — два-три слова подряд в любом месте текста (`person_window`).
 fn looks_person(t: &str) -> bool {
-    let words: Vec<&str> = t.split_whitespace().collect();
-    if !(2..=3).contains(&words.len()) {
-        return false;
-    }
+    let words = person_words(t);
+    let lower_text = !t.chars().any(char::is_uppercase);
+    (0..words.len()).any(|i| (2..=3).any(|k| i + k <= words.len() && person_window(&words[i..i + k], lower_text)))
+}
+
+/// Похожи ли слова подряд на ФИО. Слова — кириллица (или инициалы «И.»), не все инициалы.
+/// Слова с большой буквы или ЗАГЛАВНЫМИ: хотя бы одно — известное имя или отчество («…вич», «…вна»),
+/// или фамилия рядом с инициалами, или все — фамилии и хотя бы одна из справочника. Иначе (строчными,
+/// вперемешку) — нужны два узнанных слова: имя, отчество, фамилия из справочника — или фамилия из справочника
+/// с инициалами. «Отдел Кадров», «Покупатель группа», «остаток товаров» — не ФИО.
+fn person_window(words: &[String], lower_text: bool) -> bool {
     let initials = |w: &str| {
-        let letters: Vec<char> = w.chars().filter(|c| *c != '.').collect();
-        w.contains('.') && !letters.is_empty() && letters.len() <= 2 && letters.iter().all(|c| c.is_uppercase())
+        let cs: Vec<char> = w.chars().collect();
+        cs.len() == 2 && cs[1] == '.' && is_cyrillic(cs[0]) && (cs[0].is_uppercase() || lower_text)
     };
-    let capital = |w: &str| {
-        let mut cs = w.chars();
-        cs.next().is_some_and(|c| c.is_uppercase() && is_cyrillic(c)) && cs.all(|c| (c.is_alphabetic() && is_cyrillic(c)) || c == '-')
-    };
-    if !words.iter().all(|w| capital(w) || initials(w)) || words.iter().all(|w| initials(w)) {
+    let word = |w: &str| w.chars().filter(|c| c.is_alphabetic()).count() >= 2 && w.chars().all(|c| is_cyrillic(c) || c == '-');
+    if !words.iter().all(|w| initials(w) || word(w)) || words.iter().all(|w| initials(w)) {
         return false;
     }
+    // С большой буквы («Петрова-Водкина») или ЗАГЛАВНЫМИ.
+    let capital = |w: &str| {
+        let cs: Vec<char> = w.chars().collect();
+        cs[0].is_uppercase() && (cs.iter().all(|c| !c.is_lowercase()) || (1..cs.len()).all(|i| !cs[i].is_uppercase() || cs[i - 1] == '-'))
+    };
     let title = |w: &str| {
         let lower = w.to_lowercase().replace('ё', "е");
         let mut cs = lower.chars();
@@ -522,11 +646,14 @@ fn looks_person(t: &str) -> bool {
         known_surname(w) || ["ов", "ев", "ёв", "ин", "ын", "ова", "ева", "ёва", "ина", "ына", "ский", "ская", "цкий", "цкая"].iter().any(|e| l.ends_with(e))
     };
     let full: Vec<String> = words.iter().filter(|w| !initials(w)).map(|w| title(w)).collect();
-    let has_initials = words.iter().any(|w| initials(w));
-    // Есть имя или отчество; фамилия с инициалами; или все слова — фамилии, и хотя бы одна из справочника.
-    full.iter().any(|w| name(w) || patronymic(w))
-        || (has_initials && full.iter().any(|w| surname(w)))
-        || (full.len() >= 2 && full.iter().any(|w| known_surname(w)) && full.iter().all(|w| surname(w)))
+    let has_initials = full.len() < words.len();
+    if words.iter().filter(|w| !initials(w)).all(|w| capital(w)) {
+        full.iter().any(|w| name(w) || patronymic(w))
+            || (has_initials && full.iter().any(|w| surname(w)))
+            || (full.len() >= 2 && full.iter().any(|w| known_surname(w)) && full.iter().all(|w| surname(w)))
+    } else {
+        full.iter().filter(|w| name(w) || patronymic(w) || known_surname(w)).count() >= 2 || (has_initials && full.iter().any(|w| known_surname(w)))
+    }
 }
 
 fn is_cyrillic(c: char) -> bool {
@@ -545,17 +672,22 @@ pub struct Suspects {
     /// Где нашлось совпадение (первое) — для пояснения; `None` — не совпал.
     pub found: Vec<Option<String>>,
     longest: usize,
+    /// Букв и цифр в самом длинном кандидате: значение, где их больше, — заведомо не он и не его часть.
+    /// Отсев без разбора значения на слова: значений под правилами бывают миллионы.
+    most_alnum: usize,
 }
 
 impl Suspects {
     pub fn new<'a>(candidates: impl IntoIterator<Item = &'a str>) -> Suspects {
         let mut grams: std::collections::HashMap<String, Vec<(usize, bool)>> = Default::default();
         let mut longest = 0;
+        let mut most_alnum = 0;
         let mut n = 0;
         for (i, c) in candidates.into_iter().enumerate() {
             n = i + 1;
             let norm = norm_words(c);
             longest = longest.max(norm.len());
+            most_alnum = most_alnum.max(norm.chars().filter(|c| *c != ' ').count());
             let words: Vec<&str> = norm.split(' ').filter(|w| !w.is_empty()).collect();
             // Длинный текст — части не длиннее 16 слов (значения короче), целиком — всегда.
             for a in 0..words.len() {
@@ -574,7 +706,7 @@ impl Suspects {
                 grams.entry(norm.clone()).or_default().push((i, true));
             }
         }
-        Suspects { grams, found: vec![None; n], longest }
+        Suspects { grams, found: vec![None; n], longest, most_alnum }
     }
 
     /// Сверяет одно значение; `place` — где оно (записывается при первом совпадении); `partial` — искать и частью
@@ -582,6 +714,10 @@ impl Suspects {
     pub fn check(&mut self, value: &str, place: &str, partial: bool) {
         // Значение длиннее любого кандидата с запасом на знаки препинания — заведомо не его часть.
         if self.grams.is_empty() || value.len() > self.longest * 2 + 64 {
+            return;
+        }
+        // Нижний регистр не уменьшает число букв: у значения их не меньше, чем здесь.
+        if value.chars().filter(|c| c.is_alphanumeric()).count() > self.most_alnum {
             return;
         }
         if let Some(hits) = self.grams.get(&norm_words(value)) {
@@ -639,6 +775,18 @@ pub fn partial_kind(k: Kind) -> bool {
 /// или похожие на данные сами по себе. Строки для журнала — без самих значений (журнал пересылают), только
 /// маской «И*** И***». Имена листов не меняются: правила профиля должны находить свои листы.
 pub fn rule_risks<'a>(rules: &[Rule], values: impl IntoIterator<Item = (&'a str, &'a str, Option<Kind>)>) -> Vec<Vec<String>> {
+    rule_risks_detail(rules, values).into_iter().map(|r| r.lines).collect()
+}
+
+/// Риск одного правила (`rule_risks`): строки для журнала и попало ли в них имя листа — тогда во всех строках
+/// журнала оно пишется маской (`anon::mask_names`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RuleRisk {
+    pub sheet: bool,
+    pub lines: Vec<String>,
+}
+
+pub fn rule_risks_detail<'a>(rules: &[Rule], values: impl IntoIterator<Item = (&'a str, &'a str, Option<Kind>)>) -> Vec<RuleRisk> {
     let labels = |r: &Rule| !r.label.trim().is_empty();
     let mut cands: Vec<&str> = Vec::new();
     for r in rules {
@@ -662,7 +810,8 @@ pub fn rule_risks<'a>(rules: &[Rule], values: impl IntoIterator<Item = (&'a str,
     let mut i = 0;
     for r in rules {
         let mut mine = Vec::new();
-        if let Some(why) = reason(i, &r.sheet) {
+        let sheet = reason(i, &r.sheet);
+        if let Some(why) = &sheet {
             mine.push(format!(
                 "в профиле имя листа «{}» похоже на данные ({why}) — перед пересылкой профиля переименуйте лист или не пересылайте профиль; в обезличенном файле имя листа тоже остаётся как есть",
                 crate::anon::mask_sample(&r.sheet)
@@ -685,7 +834,7 @@ pub fn rule_risks<'a>(rules: &[Rule], values: impl IntoIterator<Item = (&'a str,
             }
             i += 1;
         }
-        out.push(mine);
+        out.push(RuleRisk { sheet: sheet.is_some(), lines: mine });
     }
     out
 }
@@ -712,7 +861,21 @@ mod tests {
         for s in ["Иванов Иван Иванович", "Сидорова Анна", "Петров И.И.", "ИВАНОВ ИВАН", "ООО «Ромашка»", "ИП Петров", "7707083893", "ИНН/КПП: 5029290277", "+7 (916) 111-22-33", "ivanov@mail.ru", "Смирнов Козлов"] {
             assert!(looks_personal(s).is_some(), "{s}");
         }
-        for s in ["Ответственный", "Покупатель группа", "Отдел Кадров", "Остаток на 01.10.2024", "Выручка 2024-2025", "Период: 2024 г.", "ФИО Сотрудника", "Сумма, руб.", "Лист1", "Должность", "ООО", "Номер Договора", "Продажи по менеджерам"] {
+        // Части текста: подпись, знаки по краям, регистр (A6-1).
+        for s in [
+            "Ответственный: Сидоров Семён Семёнович",
+            "Сидоров Семён Семёнович,",
+            "Руководитель Сидоров С.С.",
+            "СИДОРОВ СЕМЁН СЕМЁНОВИЧ (менеджер)",
+            "сидоров семён семёнович",
+            "e-mail: sidorov.boss@corp.ru",
+            "Тел. +7 916 123 45 67",
+            "Контакт:ООО «Ромашка»",
+            "Покупатель: ИП Петров",
+        ] {
+            assert!(looks_personal(s).is_some(), "{s}");
+        }
+        for s in ["Ответственный", "Покупатель группа", "Отдел Кадров", "Остаток на 01.10.2024", "Выручка 2024-2025", "Период: 2024 г.", "ФИО Сотрудника", "Сумма, руб.", "Лист1", "Должность", "ООО", "Номер Договора", "Продажи по менеджерам", "Период 01.01.2024 - 31.12.2024", "Доля ООО в выручке", "Форма (ООО/ИП)", "в т.ч. НДС", "сумма остатков, шт."] {
             assert!(looks_personal(s).is_none(), "{s}");
         }
     }
