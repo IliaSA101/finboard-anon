@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::names::*;
-use crate::profile::{parse_kind_key, split_link, Kind, Rule, Settings};
+use crate::profile::{link_name, parse_kind_key, split_link, Kind, Rule, Settings};
 
 // ---------------------------------------------------------------- RNG
 
@@ -138,12 +138,52 @@ fn apply_case(orig: &str, fake: &str) -> String {
 }
 
 /// Подставляет новые цифры на места цифр оригинала, сохраняя скобки, дефисы, пробелы.
+/// Фейк длиннее оригинала (свободных номеров той же длины не осталось) — лишние цифры встают сразу
+/// за последней цифрой: «1-0000» → «1-00000».
 fn fill_digits(orig: &str, new_digits: &str) -> String {
+    let total = orig.chars().filter(char::is_ascii_digit).count();
     let mut it = new_digits.chars();
-    orig.chars()
-        .map(|c| if c.is_ascii_digit() { it.next().unwrap_or('0') } else { c })
-        .collect()
+    let mut seen = 0;
+    let mut out = String::with_capacity(orig.len() + new_digits.len());
+    for c in orig.chars() {
+        if c.is_ascii_digit() {
+            out.push(it.next().unwrap_or('0'));
+            seen += 1;
+            if seen == total {
+                out.extend(&mut it);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
+
+/// `c`-й по порядку номер из `width` цифр (`nonzero` — без ведущего нуля); `None` — номера этой длины кончились.
+fn nth_digits(c: u64, width: usize, nonzero: bool) -> Option<String> {
+    if width == 0 {
+        return None;
+    }
+    if nonzero {
+        let w = width - 1;
+        let (first, tail) = match 10u64.checked_pow(w as u32) {
+            Some(span) => (c / span, c % span),
+            None => (0, c),
+        };
+        (first < 9).then(|| format!("{}{tail:0w$}", first + 1))
+    } else {
+        let fits = 10u64.checked_pow(width as u32).map_or(true, |span| c < span);
+        fits.then(|| format!("{c:0width$}"))
+    }
+}
+
+/// Случайных попыток выбрать свободный фейк номера, прежде чем перебирать номера по порядку. Пока свободных
+/// много, хватает одной-двух — фейк тот же, что и прежде; когда их почти не осталось, тысячи случайных попыток
+/// на каждое значение стоили минут, а последняя всё равно совпадала с чужим номером.
+const RANDOM_TRIES: u32 = 256;
+/// То же для номеров того вида, где перебор по порядку уже понадобился: свободных почти нет, случайные
+/// попытки — пустая трата. Одна — первый вариант (с ID — номер по ID), если он ещё свободен.
+const RANDOM_TRIES_SPENT: u32 = 1;
 
 /// ID с ведущими нулями до ширины `width`. Не помещается — `None`: обрезать нельзя, ID 100001 и ID 1
 /// дали бы один и тот же номер, и два контрагента слились бы в один.
@@ -732,6 +772,17 @@ pub struct Faker {
     link_order: Vec<String>,
     /// Соль запуска; у непустой связи к ней добавляется «@связь».
     base_salt: String,
+    /// Перебор номеров по порядку (свободные случайные кончились): вид номера → (сколько цифр добавлено,
+    /// следующий номер). Всё до курсора занято навсегда — реальными номерами или выданными фейками, поэтому
+    /// перебор не возвращается назад и на весь прогон проходит каждый номер не больше одного раза.
+    seq_cursor: HashMap<String, (usize, u64)>,
+    /// Фейки, выданные перебором: владелец (как в `issued`) → фейк и длиннее ли он настоящего. Тот же номер
+    /// в другом написании получает тот же фейк.
+    seq_issued: HashMap<String, (String, bool)>,
+    /// Фейк текущего значения длиннее настоящего.
+    widened_now: bool,
+    /// Значения, чей фейк длиннее настоящего: свободных номеров той же длины не хватило.
+    widened: HashSet<String>,
 }
 
 /// Словари «реальное → фейк» (и «реальное → ID») одной связи. У каждой связи свои: этим связи и
@@ -851,7 +902,16 @@ impl Faker {
             groups: HashMap::new(),
             link_order: Vec::new(),
             base_salt: settings.salt.clone(),
+            seq_cursor: HashMap::new(),
+            seq_issued: HashMap::new(),
+            widened_now: false,
+            widened: HashSet::new(),
         }
+    }
+
+    /// Получило ли значение фейк длиннее настоящего (свободных номеров той же длины не хватило).
+    pub fn is_widened(&self, original: &str) -> bool {
+        self.widened.contains(original)
     }
 
     /// Строки книги, с которыми фейки не должны совпадать.
@@ -931,26 +991,64 @@ impl Faker {
 
     /// Цифры номера, свои для каждого реального значения. `gen(0)` — прежний фейк (с ID — номер по ID);
     /// если он уже выдан другому значению или совпал с реальным номером — следующая попытка, детерминированно.
-    /// Пространство исчерпано (короткий номер, тысячи значений) — первый вариант: совпадение неизбежно.
-    fn issue(&mut self, space: char, real: &str, mut gen: impl FnMut(u32) -> String) -> String {
+    ///
+    /// Свободных почти не осталось (короткие номера, тысячи значений: пять цифр «10000»–«19999» — это все
+    /// номера на «1»), и случайные попытки кончились — номера вида `shape` перебираются по порядку: `seq(0, c)` —
+    /// `c`-й номер той же длины, `seq(k, c)` — на `k` цифр длиннее (`None` — номера этой длины кончились).
+    /// Фейк никогда не совпадает ни с реальным номером, ни с фейком другого номера; перебор продолжается с того
+    /// места, где остановился, — на весь прогон каждый номер проверяется не больше одного раза.
+    fn issue(
+        &mut self,
+        space: char,
+        shape: &str,
+        real: &str,
+        mut gen: impl FnMut(u32) -> String,
+        seq: impl Fn(usize, u64) -> Option<String>,
+    ) -> String {
         // Владелец — номер и связь: тот же номер в другой связи — другой контрагент, свой фейк.
         let owner = self.person_owner(&format!("{space}:{real}"));
         self.real_digits.insert(real.to_string());
         let key = |c: &str| if space == 'p' { phone_key(c) } else { c.to_string() };
-        let first = gen(0);
-        let mut cand = first.clone();
-        for n in 1..=20_000 {
-            let free = match self.issued.get(&key(&cand)) {
-                Some(o) => *o == owner,
-                None => !self.is_real_number(&cand),
-            };
-            if free {
-                break;
+        let shape = format!("{space}{shape}");
+        let tries = if self.seq_cursor.contains_key(&shape) { RANDOM_TRIES_SPENT } else { RANDOM_TRIES };
+        for n in 0..tries {
+            let cand = gen(n);
+            let k = key(&cand);
+            if self.number_free(&k, &cand, &owner) {
+                self.issued.entry(k).or_insert(owner);
+                return cand;
             }
-            cand = if n == 20_000 { first.clone() } else { gen(n) };
         }
-        self.issued.entry(key(&cand)).or_insert(owner);
-        cand
+        if let Some((cand, widened)) = self.seq_issued.get(&owner) {
+            self.widened_now |= *widened;
+            return cand.clone();
+        }
+        let (mut extra, mut c) = self.seq_cursor.get(&shape).copied().unwrap_or((0, 0));
+        loop {
+            let Some(cand) = seq(extra, c) else {
+                extra += 1;
+                c = 0;
+                continue;
+            };
+            c += 1;
+            let k = key(&cand);
+            if self.number_free(&k, &cand, &owner) {
+                self.seq_cursor.insert(shape, (extra, c));
+                self.issued.entry(k).or_insert_with(|| owner.clone());
+                self.widened_now |= extra > 0;
+                self.seq_issued.insert(owner, (cand.clone(), extra > 0));
+                return cand;
+            }
+        }
+    }
+
+    /// Свободен ли фейковый номер `cand` (`k` — его ключ в `issued`) для владельца: не выдан другому
+    /// и не совпадает с реальным номером.
+    fn number_free(&self, k: &str, cand: &str, owner: &str) -> bool {
+        match self.issued.get(k) {
+            Some(o) => o == owner,
+            None => !self.is_real_number(cand),
+        }
     }
 
     fn is_real_number(&self, d: &str) -> bool {
@@ -1022,6 +1120,7 @@ impl Faker {
         }
         self.enter_group(&rule.link_name());
         self.last_id = None;
+        self.widened_now = false;
         let w = rule.with_id_effective();
         let out = match rule.kind {
             Kind::FullName => self.fake_person(original, w),
@@ -1042,6 +1141,9 @@ impl Faker {
             // Защищённые области в замены не попадают (collect их пропускает).
             Kind::Keep => original.to_string(),
         };
+        if self.widened_now {
+            self.widened.insert(original.to_string());
+        }
         self.entries.push(KeyEntry { kind_key: key.0.clone(), id: self.last_id, real: original.to_string(), fake: out.clone() });
         self.cache.insert(key, self.entries.len() - 1);
         out
@@ -1410,7 +1512,9 @@ impl Faker {
         let key = phone_key(&d);
         if let Some(fk) = self.phones.get(&key).cloned() {
             self.last_id = self.ids.get("phone").and_then(|m| m.get(&key)).copied();
-            let digits = if n == 11 && (first == '7' || first == '8') { format!("{first}{fk}") } else { fk };
+            // Фейк длиннее настоящего (номера той же длины кончились) хранится со своей 8/+7.
+            self.widened_now |= fk.len() != key.len();
+            let digits = if n == 11 && (first == '7' || first == '8') && fk.len() == 10 { format!("{first}{fk}") } else { fk };
             return fill_digits(orig, &digits);
         }
         let mut r = Rng::new(&[&self.s.salt, "phone", &key]);
@@ -1429,14 +1533,18 @@ impl Faker {
         } else {
             None
         };
-        let out = self.issue('p', &key, |n| {
+        // По порядку: «900» + семь цифр (у коротких — первая цифра и остальные), затем на цифру длиннее.
+        let head = if body_len == 10 { format!("{prefix}900") } else { prefix.clone() };
+        let shape = format!("|{head}|{tail_len}");
+        let gen = |n: u32| {
             let body = match (&id_body, n) {
                 (Some(b), 0) => b.clone(),
                 _ if body_len == 10 => format!("900{}", r.digits(tail_len, false)),
                 _ => r.digits(tail_len, false),
             };
             format!("{prefix}{body}")
-        });
+        };
+        let out = self.issue('p', &shape, &key, gen, |extra, c| Some(format!("{head}{}", nth_digits(c, tail_len + extra, false)?)));
         self.phones.insert(key, phone_key(&out));
         fill_digits(orig, &out)
     }
@@ -1488,7 +1596,7 @@ impl Faker {
         // ID шире пяти (шести) цифр занимает и код инспекции: «99 01 00001 …» — ID 100001, а не второй ID 1.
         let id_body = if with_id { fit_id(self.id_for("inn", &d), body_len + 2) } else { None };
         // Без ведущих нулей: ИНН-число остаётся числом (ВПР по ИНН не ломается).
-        let s = self.issue('n', &d, |n| {
+        let gen = |n: u32| {
             let body = match (&id_body, n) {
                 (Some(b), 0) => format!("99{b}"),
                 // Пять цифр — сто тысяч номеров; когда они заняты — шире, с кодом инспекции.
@@ -1496,7 +1604,10 @@ impl Faker {
                 _ => format!("99{}", r.digits(body_len + 2, false)),
             };
             inn_with_check(&body)
-        });
+        };
+        // По порядку — «99» и номер с кодом инспекции; когда кончатся и они, десятизначный ИНН станет двенадцатизначным.
+        let seq = |extra: usize, c: u64| Some(inn_with_check(&format!("99{}", nth_digits(c, body_len + 2 + extra, false)?)));
+        let s = self.issue('n', &format!("inn{body_len}"), &d, gen, seq);
         fill_digits(orig, &s)
     }
 
@@ -1512,10 +1623,13 @@ impl Faker {
         } else {
             None
         };
-        let s = self.issue('n', &d, |n| match (&id_base, n) {
+        let gen = |n: u32| match (&id_base, n) {
             (Some(b), 0) => snils_with_check(b),
             _ => snils_with_check(&r.digits(9, true)),
-        });
+        };
+        // Контрольное число СНИЛС считается только по девяти цифрам: более длинный номер — без него.
+        let seq = |extra: usize, c: u64| if extra == 0 { nth_digits(c, 9, true).map(|b| snils_with_check(&b)) } else { nth_digits(c, 11 + extra, true) };
+        let s = self.issue('n', "snils", &d, gen, seq);
         fill_digits(orig, &s)
     }
 
@@ -1527,10 +1641,12 @@ impl Faker {
         let mut r = Rng::new(&[&self.s.salt, "passport", &d]);
         // «99 00 000001»; ID шире шести цифр занимает и вторую пару: «99 01 000000» — ID 1000000.
         let id_body = if with_id { fit_id(self.id_for("passport", &d), 8) } else { None };
-        let s = self.issue('n', &d, |n| match (&id_body, n) {
+        let gen = |n: u32| match (&id_body, n) {
             (Some(b), 0) => format!("99{b}"),
             _ => format!("99{}", r.digits(8, false)),
-        });
+        };
+        let seq = |extra: usize, c: u64| Some(format!("99{}", nth_digits(c, 8 + extra, false)?));
+        let s = self.issue('n', "passport", &d, gen, seq);
         fill_digits(orig, &s)
     }
 
@@ -1551,7 +1667,18 @@ impl Faker {
             // другому коду, берётся следующий вариант.
             let mut r = Rng::new(&[&self.s.salt, "code", &norm]);
             let me = self.person_owner(&norm);
-            for n in 0..=20_000u32 {
+            // Свободен: не выдан другому коду, не строка книги и (код из одних цифр) не реальный номер.
+            let free = |f: &Faker, out: &str, k: &str, me: &str| {
+                f.issued_codes.get(k).map_or_else(
+                    || !f.taken.contains(k) && !(number_like(out) && f.is_real_number(&digits_of(out))),
+                    |o| o == me,
+                )
+            };
+            // Коды одного вида («Дог…», «А-…/…») делят одни номера: когда свободных случайных нет — по порядку.
+            let shape = format!("code|{}", norm_text(&replace_digit_run(orig, "#")));
+            let spent = self.seq_cursor.contains_key(&shape);
+            let tries = if spent { RANDOM_TRIES_SPENT } else { 1100 };
+            for n in 0..tries {
                 let tail = match (&id_tail, n) {
                     (Some(t), 0) => t.clone(),
                     _ if n < 1000 => format!("9{}", r.digits(5, false)),
@@ -1559,13 +1686,36 @@ impl Faker {
                 };
                 let out = replace_digit_run(orig, &tail);
                 let k = norm_text(&out);
-                let free = self.issued_codes.get(&k).map_or(!self.taken.contains(&k), |o| *o == me);
-                if free || n == 20_000 {
+                if free(self, &out, &k, &me) {
                     self.issued_codes.entry(k).or_insert(me);
                     return out;
                 }
             }
-            unreachable!()
+            // Тот же код в другом написании («ДОГ1» и «Дог1») — тот же фейк.
+            let memo = format!("code:{me}");
+            if let Some((tail, _)) = self.seq_issued.get(&memo) {
+                return replace_digit_run(orig, tail);
+            }
+            // Пять цифр на «9», затем семь, восемь… Всё до курсора занято навсегда — назад перебор не идёт.
+            let (mut extra, mut c) = self.seq_cursor.get(&shape).copied().unwrap_or((0, 0));
+            loop {
+                let width = if extra == 0 { 5 } else { 6 + extra };
+                let Some(digits) = nth_digits(c, width, false) else {
+                    extra += 1;
+                    c = 0;
+                    continue;
+                };
+                c += 1;
+                let tail = format!("9{digits}");
+                let out = replace_digit_run(orig, &tail);
+                let k = norm_text(&out);
+                if free(self, &out, &k, &me) {
+                    self.seq_cursor.insert(shape, (extra, c));
+                    self.issued_codes.entry(k).or_insert(me);
+                    self.seq_issued.insert(memo, (tail, false));
+                    return out;
+                }
+            }
         }
         let keep = if d.len() >= 12 { 4 } else { 0 };
         let rest = d.len() - keep;
@@ -1573,7 +1723,7 @@ impl Faker {
         let mut r = Rng::new(&[&self.s.salt, "account", &d]);
         let id_tail = if with_id { fit_id(self.id_for("account", &d), rest) } else { None };
         let head = d[..keep].to_string();
-        let s = self.issue('n', &d, |n| {
+        let gen = |n: u32| {
             let mut tail = match (&id_tail, n) {
                 (Some(t), 0) => t.clone(),
                 _ => r.digits(rest, lead),
@@ -1584,7 +1734,9 @@ impl Faker {
                 tail.replace_range(0..1, "9");
             }
             format!("{head}{tail}")
-        });
+        };
+        let seq = |extra: usize, c: u64| Some(format!("{head}{}", nth_digits(c, rest + extra, lead)?));
+        let s = self.issue('n', &format!("account|{head}|{rest}|{lead}"), &d, gen, seq);
         fill_digits(orig, &s)
     }
 
@@ -1793,13 +1945,19 @@ impl Faker {
 
     /// Восстанавливает соответствия из ключа: те же люди получат те же ID и фейки.
     pub fn load_entries(&mut self, entries: Vec<KeyEntry>) {
-        for e in entries {
+        for mut e in entries {
+            // Запись со связью («ФИО@контрагент») восстанавливает словари только этой связи. Связь — в том же
+            // виде, что у правил (`link_name`): ключ, поправленный вручную («ФИО@Контрагент»), иначе разводил бы
+            // те же строки по другому словарю.
+            let (head, raw_link) = split_link(&e.kind_key);
+            let link = link_name(raw_link);
+            if link != raw_link {
+                e.kind_key = if link.is_empty() { head.to_string() } else { format!("{head}@{link}") };
+            }
             let key = (e.kind_key.clone(), e.real.clone());
             if self.cache.contains_key(&key) {
                 continue;
             }
-            // Запись со связью («ФИО@контрагент») восстанавливает словари только этой связи.
-            let link = split_link(&e.kind_key).1.to_string();
             self.enter_group(&link);
             if let Some((kind, _, label)) = parse_kind_key(&e.kind_key) {
                 let number = matches!(kind, Kind::Inn | Kind::Snils | Kind::Passport | Kind::Account);
@@ -1881,11 +2039,15 @@ impl Faker {
                             // Короткий код: занятый фейк не выдаётся новому коду.
                             let me = self.person_owner(&norm_text(&e.real));
                             self.issued_codes.entry(norm_text(&e.fake)).or_insert(me);
-                        } else if d.len() == fd.len() {
+                        } else if fd.len() >= d.len() {
                             // Фейки ключа заняты: новый номер их не получит.
                             let me = self.person_owner(&format!("n:{d}"));
+                            if fd.len() > d.len() {
+                                // Фейк длиннее настоящего (выдан перебором): тот же номер в другом написании — он же.
+                                self.seq_issued.entry(me.clone()).or_insert((fd.clone(), true));
+                            }
                             self.issued.entry(fd.clone()).or_insert(me);
-                            if d.len() >= 9 {
+                            if d.len() >= 9 && d.len() == fd.len() {
                                 self.digits.entry(d).or_insert(fd);
                             }
                         }
@@ -1905,10 +2067,14 @@ impl Faker {
                                     self.emails.entry(r.to_lowercase()).or_insert_with(|| f.clone());
                                 } else {
                                     let (dr, df) = (digits_of(r), digits_of(f));
-                                    if dr.len() == df.len() && dr.len() >= 5 {
+                                    if df.len() >= dr.len() && dr.len() >= 5 {
                                         let (kr, kf) = (phone_key(&dr), phone_key(&df));
                                         self.real_digits.insert(kr.clone());
                                         let me = self.person_owner(&format!("p:{kr}"));
+                                        if df.len() > dr.len() {
+                                            // Фейк длиннее настоящего (выдан перебором) — со своей 8/+7, как его хранит `phones`.
+                                            self.seq_issued.entry(me.clone()).or_insert((df.clone(), true));
+                                        }
                                         self.issued.entry(kf.clone()).or_insert(me);
                                         self.phones.entry(kr).or_insert(kf);
                                     }

@@ -580,6 +580,15 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
         originals.sort();
         originals.dedup();
         reports[fi].leaks = scan_leaks_with(&tmps[fi], &originals, &fakes, &real_digits)?;
+        // Фейк из ключа совпал с реальным номером другой строки — поиск по результату его не отличит от фейка.
+        let clashes = &plans[fi].clashes;
+        if !clashes.is_empty() {
+            reports[fi].leaks.push(Leak {
+                part: "номера: фейк из ключа прошлых запусков совпал с реальным номером другой строки".into(),
+                count: clashes.len(),
+                samples: clashes.iter().take(8).cloned().collect(),
+            });
+        }
         let kept = batch.settings.outside != Outside::All || f.rules.iter().any(|r| r.kind == Kind::Keep);
         if kept && !reports[fi].leaks.is_empty() {
             reports[fi].warnings.push(
@@ -1266,6 +1275,9 @@ pub struct FilePlan {
     /// Название колонки правила из строки шапки листа (та же строка, что у «колонки целиком» в окне).
     pub rule_heads: Vec<Option<String>>,
     pub warnings: Vec<String>,
+    /// Реальные номера (цифры), совпавшие с фейком другого номера этого файла (`number_clashes`):
+    /// в результате такой номер стоит в чужой строке. Идут в находки проверки результата.
+    pub clashes: Vec<String>,
 }
 
 /// В скольких первых строках листа искать шапку таблицы.
@@ -1283,7 +1295,10 @@ fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule], limit: Option<u32>) -> 
     let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
     for (si, info) in wb.sheets.iter().enumerate() {
         let Some(srules) = sheet_rules.get(&si) else { continue };
+        check_cancel()?;
         let xml = part_reader(zip, &info.path)?.with_context(|| format!("нет части {}", info.path))?;
+        // Отмена — и посреди листа в сотни тысяч строк: проверяется через каждые CANCEL_EVERY ячеек.
+        let (mut read, mut cancelled) = (0usize, false);
         let keys: Vec<String> = srules.iter().map(|(_, r)| r.kind_key()).collect();
         let below = |r: &Rule, row: u32, col: u32| r.kind != Kind::Keep && col == r.col && r.row_to.is_some_and(|to| row > to);
         // Первая ячейка за пределом нужна, чтобы остановить чтение листа (строки в листе идут по порядку).
@@ -1292,6 +1307,11 @@ fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule], limit: Option<u32>) -> 
         let mut head_cells: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
         let want = |row: u32, col: u32| row <= HEAD_ROWS || past(row) || srules.iter().any(|(_, r)| r.covers(row, col) || below(r, row, col));
         scan_cells_where(xml, &wb.sst, want, |row, col, v| {
+            read += 1;
+            if read % CANCEL_EVERY == 0 && check_cancel().is_err() {
+                cancelled = true;
+                return false;
+            }
             if past(row) {
                 return false;
             }
@@ -1334,6 +1354,9 @@ fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule], limit: Option<u32>) -> 
             }
             true
         })?;
+        if cancelled {
+            check_cancel()?;
+        }
         let head = head_cells.iter().filter(|(_, c)| c.len() >= 2).max_by_key(|(r, c)| (c.len(), std::cmp::Reverse(**r)));
         if let Some((&hr, cells)) = head {
             for (ri, r) in srules.iter().filter(|(_, r)| hr < r.row_from) {
@@ -1358,7 +1381,7 @@ fn collect(zip: &mut Zip, wb: &Workbook, rules: &[Rule], limit: Option<u32>) -> 
             *h = None;
         }
     }
-    Ok(FilePlan { items, rule_cells, rule_samples, rule_below, rule_heads, warnings })
+    Ok(FilePlan { items, rule_cells, rule_samples, rule_below, rule_heads, warnings, clashes: Vec::new() })
 }
 
 /// Сколько байт прочитает обработка (для полосы хода): листы с правилами — при сборе значений; все листы —
@@ -1392,8 +1415,10 @@ pub fn plan_batch(
 ) -> Result<(Vec<FilePlan>, Faker, usize)> {
     let mut plans = Vec::new();
     for ((zip, wb), r) in books.iter_mut().zip(rules) {
+        check_cancel()?;
         plans.push(collect(zip, wb, r, limit)?);
     }
+    check_cancel()?;
     let mut faker = Faker::new(settings);
     // Порядок связей — по правилам: вне разметки значение из нескольких связей получает фейк первой.
     let links: Vec<String> = rules.iter().flat_map(|rs| rs.iter().map(Rule::link_name)).collect();
@@ -1412,12 +1437,77 @@ pub fn plan_batch(
     faker.prepare_companies(all().filter(|(r, _)| r.kind == Kind::Company).map(|(_, it)| it.1.as_str()));
     faker.note_reals(all().map(|(_, it)| it.1.as_str()));
     let todo: Vec<(&Rule, &String, bool)> = all().map(|(r, it)| (r, &it.1, it.2)).collect();
-    for (r, original, numeric) in todo {
+    for (i, (r, original, numeric)) in todo.into_iter().enumerate() {
+        if i % CANCEL_EVERY == 0 {
+            check_cancel()?;
+        }
         faker.fake(r, original, numeric);
     }
+    check_cancel()?;
     kind_conflicts(&mut plans, rules, &faker, files);
     link_overlaps(&mut plans, &faker);
+    widened_numbers(&mut plans, &faker);
+    number_clashes(&mut plans, rules, &faker);
     Ok((plans, faker, key_entries))
+}
+
+/// Через сколько ячеек при сборе значений и значений при выборе фейков проверяется отмена.
+const CANCEL_EVERY: usize = 1024;
+
+/// Номера, получившие фейк длиннее настоящего: свободных номеров той же длины не хватило (короткие номера,
+/// тысячи значений — все номера этой длины реальные или уже выданы). Совпасть с чужим номером фейку нельзя,
+/// поэтому он длиннее. Одна строка на файл, без самих номеров (журнал могут переслать).
+fn widened_numbers(plans: &mut [FilePlan], faker: &Faker) {
+    for p in plans.iter_mut() {
+        let n = p.items.iter().filter(|(_, o, _)| faker.is_widened(o)).count();
+        if n > 0 {
+            p.warnings.push(format!(
+                "Номеров, чей фейк длиннее настоящего: {n}. Свободных номеров той же длины не хватило — все они реальные номера или фейки других значений, а совпасть с чужим номером фейку нельзя. Если длина номера важна (проверки, формулы ДЛСТР) — учтите это"
+            ));
+        }
+    }
+}
+
+/// Номер для сравнения: телефоны — каждый в ячейке по 10 цифрам (без 8/+7), прочие номера — все цифры
+/// (у 11 цифр на 7/8 — тоже без первой, как сравнивает генератор). Короче пяти цифр — не номер.
+fn number_keys(kind: Kind, s: &str) -> Vec<String> {
+    let parts: Vec<&str> = if kind == Kind::Phone { s.split([';', ',', '\n']).collect() } else { vec![s] };
+    parts.into_iter().map(crate::fake::phone_key).filter(|d| d.len() >= 5).collect()
+}
+
+/// Фейк номера, совпавший с реальным номером другого значения прогона или ключа. Новые фейки с реальными
+/// номерами не совпадают (генератор их обходит), но фейк из ключа прошлых запусков мог достаться номеру,
+/// который появился в данных позже: в результате реальный номер стоит в чужой строке, а проверка результата
+/// фейки не ищет — сказала бы «не найдено». Такие номера — в `FilePlan::clashes`, а оттуда в находки проверки.
+fn number_clashes(plans: &mut [FilePlan], rules: &[&[Rule]], faker: &Faker) {
+    let number = |k: Kind| matches!(k, Kind::Phone | Kind::Inn | Kind::Snils | Kind::Passport | Kind::Account);
+    let mut reals: HashSet<String> = HashSet::new();
+    for e in &faker.entries {
+        if let Some((k, _, _)) = parse_kind_key(&e.kind_key).filter(|(k, _, _)| number(*k)) {
+            reals.extend(number_keys(k, &e.real));
+        }
+    }
+    for (p, rs) in plans.iter_mut().zip(rules) {
+        let mut found: Vec<String> = Vec::new();
+        for (ri, original, _) in &p.items {
+            let r = &rs[*ri];
+            if !number(r.kind) {
+                continue;
+            }
+            let own = number_keys(r.kind, original);
+            // Короткий код («Дог1») — не номер: его фейк длиннее любого кода по замыслу.
+            if own.is_empty() {
+                continue;
+            }
+            let Some(fake) = faker.get(&r.kind_key(), original) else { continue };
+            for k in number_keys(r.kind, fake) {
+                if !own.contains(&k) && reals.contains(&k) && !found.contains(&k) {
+                    found.push(k);
+                }
+            }
+        }
+        p.clashes = found;
+    }
 }
 
 /// Порядок связей: общая — 0, остальные — по первому правилу (файлы по порядку, в файле — правила по порядку).
