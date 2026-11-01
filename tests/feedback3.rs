@@ -203,3 +203,43 @@ fn v07_leak_scan_number_of_minimal_length() {
     let leaks = scan_leaks_with(&input, &["Иванов Иван".to_string()], &[], &digits).unwrap();
     assert_eq!(leaks.iter().map(|l| l.count).sum::<usize>(), 1, "{leaks:?}");
 }
+
+/// Бухгалтеры не поняли «размечены разными типами: …!B — ФИО; …!C — Организация»: что такое «Организация»
+/// и какие это колонки. Теперь — названия колонок из шапки и «правило «…»»; реальных значений нет.
+/// Два «Шаблона» с разными подписями разделены намеренно — о них не предупреждается.
+#[test]
+fn v08_kind_conflict_names_columns_and_rules() {
+    let d = tmp("v08");
+    let input = d.join("Продажи.xlsx");
+    let mut b = Book::default();
+    b.sheet("Л").extend([
+        (1, 0, s("Ответственный")),
+        (1, 1, s("Покупатель")),
+        (2, 0, s("Сидоров Пётр Ильич")),
+        (2, 1, s("Сидоров Пётр Ильич")),
+        (3, 0, s("Кузнецова Анна Павловна")),
+        (3, 1, s("Вектор-Строй")),
+    ]);
+    write_xlsx(&input, &b);
+    let rules = vec![Rule::new("Л", 0, 2, None, Kind::FullName), Rule::new("Л", 1, 2, None, Kind::Company)];
+    let profile = Profile { rules: rules.clone(), settings: Settings { salt: "fb".into(), ..Settings::default() } };
+    let rep = go(&input, &d.join("o1.xlsx"), None, None, rules);
+    let w = rep.warnings.iter().find(|w| w.contains("разные фейки")).unwrap_or_else(|| panic!("нет предупреждения: {:?}", rep.warnings));
+    assert!(w.contains("колонка «Ответственный» (Продажи.xlsx, лист Л, A) — правило «ФИО»"), "{w}");
+    assert!(w.contains("колонка «Покупатель» (Продажи.xlsx, лист Л, B) — правило «Организация»"), "{w}");
+    assert!(w.starts_with("1 одинаковое значение есть"), "одно общее значение: {w}");
+    for real in ["Сидоров", "Кузнецова", "Вектор"] {
+        assert!(!w.contains(real), "в предупреждении реальное значение: {w}");
+    }
+    // Итог отчёта прямо называет, какой файл проверен.
+    let summary = rep.summary(&profile);
+    assert!(summary.iter().any(|l| l == "Проверка обезличенного файла: реальных значений из размеченных колонок в нём не найдено."), "{summary:?}");
+
+    let (mut t1, mut t2) = (Rule::new("Л", 0, 2, None, Kind::Text), Rule::new("Л", 1, 2, None, Kind::Text));
+    t1.label = "Отдел".into();
+    t2.label = "Склад".into();
+    let rep = go(&input, &d.join("o2.xlsx"), None, None, vec![t1, t2]);
+    assert!(rep.warnings.iter().all(|w| !w.contains("разные фейки")), "два «Шаблона» с разными подписями — не ошибка: {:?}", rep.warnings);
+    let g = read_book(&d.join("o2.xlsx"));
+    assert_eq!((text(&g, "Л", "A2"), text(&g, "Л", "B2")), ("Отдел 1".to_string(), "Склад 1".to_string()), "подписи шаблонов разделены");
+}

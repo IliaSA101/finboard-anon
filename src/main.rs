@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, RichText, Sense, Stroke};
 
@@ -12,7 +14,7 @@ use finboard_anon::anon::{
 };
 use finboard_anon::detect;
 use finboard_anon::profile::{Kind, Outside, Profile, Rule, Settings};
-use finboard_anon::xlsx::{col_name, load_grid, parse_range, Grid, GridCell, Workbook};
+use finboard_anon::xlsx::{col_name, load_grid, parse_range, Grid, GridCell, Progress, Workbook};
 
 /// Сколько строк листа загружать для просмотра — столько же читает и предпросмотр правил.
 const GRID_ROWS: u32 = finboard_anon::anon::PREVIEW_ROWS;
@@ -98,6 +100,41 @@ fn column_widths(g: &Grid) -> Vec<f32> {
         .collect()
 }
 
+/// Время по-русски: «45 с», «3 мин 05 с», «1 ч 02 мин» — до целых секунд.
+fn format_duration(d: Duration) -> String {
+    let s = d.as_secs_f64().round() as u64;
+    match s {
+        0..=59 => format!("{s} с"),
+        60..=3599 => format!("{} мин {:02} с", s / 60, s % 60),
+        _ => format!("{} ч {:02} мин", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// Этап обработки по строке журнала — коротко, для полосы хода; `None` — строка не про этап.
+fn stage_of(line: &str) -> Option<&'static str> {
+    [("Сбор значений", "сбор значений"), ("Запись файла", "запись"), ("Проверка результата", "проверка результата")]
+        .into_iter()
+        .find(|(p, _)| line.starts_with(p))
+        .map(|(_, s)| s)
+}
+
+/// Надпись на полосе хода: «37 % — Файл 2 из 10: Продажи.xlsx — запись · осталось ≈ 1 мин 20 с».
+/// Остаток — по доле и прошедшему времени, пока доля мала (до 3 %) — не оценивается.
+fn progress_label(fraction: f32, stage: &str, file_line: &str, elapsed: Duration) -> String {
+    let f = fraction.clamp(0.0, 1.0);
+    let mut parts = vec![format!("{} %", (f * 100.0).floor() as u32)];
+    parts.extend([file_line, stage].into_iter().filter(|s| !s.is_empty()).map(String::from));
+    let tail = if f >= 1.0 {
+        format!("за {}", format_duration(elapsed))
+    } else if f > 0.03 {
+        let left = elapsed.as_secs_f64() * f64::from(1.0 - f) / f64::from(f);
+        format!("осталось ≈ {}", format_duration(Duration::from_secs_f64(left)))
+    } else {
+        "осталось: оценка…".into()
+    };
+    format!("{} · {tail}", parts.join(" — "))
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Hit {
     Cell(u32, u32),
@@ -160,6 +197,10 @@ struct App {
     status_err: bool,
     log: Vec<String>,
     job: Option<Receiver<Msg>>,
+    /// Ход идущей обработки и её начало; этап и строка «Файл k из n» — из журнала, для полосы хода.
+    progress: Option<(Arc<Progress>, Instant)>,
+    stage: String,
+    file_line: String,
     /// Предпросмотр: по файлу — по правилу, и правила, по которым он посчитан (на больших файлах
     /// считается несколько секунд в фоне — пока правило не совпало, его старый предпросмотр не показывается).
     preview: Vec<Vec<RulePreview>>,
@@ -224,6 +265,9 @@ impl App {
             status_err: false,
             log: Vec::new(),
             job: None,
+            progress: None,
+            stage: String::new(),
+            file_line: String::new(),
             preview: Vec::new(),
             preview_rules: Vec::new(),
             preview_dirty: false,
@@ -453,12 +497,21 @@ impl App {
         let mut finished = None;
         while let Ok(m) = rx.try_recv() {
             match m {
-                Msg::Log(s) => self.log.push(s),
+                Msg::Log(s) => {
+                    if s.starts_with("Файл ") && s.contains(" из ") {
+                        self.file_line = s.clone();
+                        self.stage.clear();
+                    } else if let Some(st) = stage_of(&s) {
+                        self.stage = st.into();
+                    }
+                    self.log.push(s);
+                }
                 Msg::Done(r, p) => finished = Some((r, p)),
             }
         }
         if let Some((r, profiles)) = finished {
             self.job = None;
+            let took = self.progress.take().map(|(_, t0)| format!(" — за {}", format_duration(t0.elapsed()))).unwrap_or_default();
             match r {
                 Ok(reports) => {
                     let many = reports.len() > 1;
@@ -475,12 +528,12 @@ impl App {
                     }
                     let leaks = reports.iter().filter(|r| !r.leaks.is_empty()).count();
                     if leaks > 0 {
-                        self.set_status("Готово, но проверка нашла остатки реальных значений — см. журнал внизу", true);
+                        self.set_status(format!("Готово, но проверка нашла остатки реальных значений — см. журнал внизу{took}"), true);
                     } else if many {
                         let dir = reports[0].output.parent().map(|d| d.display().to_string()).unwrap_or_default();
-                        self.set_status(format!("Готово: файлов {} в {dir}", reports.len()), false);
+                        self.set_status(format!("Готово: файлов {} в {dir}{took}", reports.len()), false);
                     } else {
-                        self.set_status(format!("Готово: {}", reports[0].output.display()), false);
+                        self.set_status(format!("Готово: {}{took}", reports[0].output.display()), false);
                     }
                 }
                 Err(e) => {
@@ -542,8 +595,14 @@ impl App {
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         self.job = Some(rx);
+        let progress = Arc::new(Progress::default());
+        self.progress = Some((progress.clone(), Instant::now()));
+        self.stage.clear();
+        self.file_line.clear();
         self.set_status("Обработка…", false);
         std::thread::spawn(move || {
+            // Счётчик — в потоке обработки: считаются только его чтения книг.
+            finboard_anon::xlsx::track_progress(Some(progress));
             let tx_log = tx.clone();
             let ctx_log = ctx.clone();
             let res = run_batch(&batch, &mut |m| {
@@ -1402,11 +1461,16 @@ impl App {
                 ui.spinner();
             }
         });
+        if let (true, Some((p, t0))) = (self.job.is_some(), &self.progress) {
+            let f = p.fraction();
+            let text = progress_label(f, &self.stage, &self.file_line, t0.elapsed());
+            ui.add(egui::ProgressBar::new(f).desired_width(ui.available_width()).text(text));
+        }
         ui.separator();
         egui::ScrollArea::vertical().id_salt("log").stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
             for l in &self.log {
                 let mut t = RichText::new(l).monospace();
-                if l.starts_with("Ошибка") || l.starts_with("Проверка: реальные") || l.starts_with("Внимание") {
+                if l.starts_with("Ошибка") || l.starts_with("Проверка обезличенного файла: в нём ещё") || l.starts_with("Внимание") {
                     t = t.color(Color32::from_rgb(220, 80, 60));
                 }
                 ui.label(t);
@@ -1425,6 +1489,10 @@ impl App {
     /// Кадр окна — без eframe, чтобы тесты гоняли его на настоящих событиях мыши и клавиатуры.
     fn ui(&mut self, ctx: &egui::Context) {
         self.poll_job();
+        // Полоса хода и время обновляются и без сообщений из потока обработки.
+        if self.job.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
         // Перетащенная папка — все файлы Excel из неё.
         let dropped: Vec<PathBuf> = ctx
             .input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect::<Vec<_>>())
@@ -1653,5 +1721,85 @@ mod tests {
         assert_eq!(rules[0].len(), 1);
         assert!(rules[1].is_empty(), "неотмеченный файл — без правил");
         assert!(res.is_ok(), "{res:?}");
+    }
+
+    /// Время по-русски: секунды, минуты с секундами в две цифры, часы с минутами; округление до секунды.
+    #[test]
+    fn duration_in_russian() {
+        let s = |x: f64| format_duration(Duration::from_secs_f64(x));
+        assert_eq!(s(0.0), "0 с");
+        assert_eq!(s(45.0), "45 с");
+        assert_eq!(s(59.4), "59 с");
+        assert_eq!(s(59.6), "1 мин 00 с");
+        assert_eq!(s(60.0), "1 мин 00 с");
+        assert_eq!(s(125.0), "2 мин 05 с");
+        assert_eq!(s(190.0), "3 мин 10 с");
+        assert_eq!(s(3599.0), "59 мин 59 с");
+        assert_eq!(s(3600.0), "1 ч 00 мин");
+        assert_eq!(s(3720.0), "1 ч 02 мин");
+        assert_eq!(s(7385.0), "2 ч 03 мин");
+    }
+
+    /// Надпись полосы хода: проценты вниз, файл и этап, остаток — только когда доля заметна, в конце — затраченное время.
+    #[test]
+    fn progress_label_parts_and_eta() {
+        let secs = Duration::from_secs;
+        // Начало: остаток ещё не оценивается.
+        assert_eq!(progress_label(0.0, "", "", secs(0)), "0 % · осталось: оценка…");
+        assert_eq!(progress_label(0.0, "сбор значений", "", secs(3)), "0 % — сбор значений · осталось: оценка…");
+        // Малая доля (2 %) — оценка по ней была бы случайной.
+        assert_eq!(progress_label(0.02, "сбор значений", "", secs(10)), "2 % — сбор значений · осталось: оценка…");
+        // Чуть больше 3 % — уже оценивается: 31 с × 0,969 / 0,031 = 969 с.
+        assert_eq!(progress_label(0.031, "", "", secs(31)), "3 % · осталось ≈ 16 мин 09 с");
+        // Середина: 48 с за 37,5 % → осталось 48 × 0,625 / 0,375 = 80 с.
+        assert_eq!(
+            progress_label(0.375, "запись", "Файл 2 из 10: Продажи.xlsx", secs(48)),
+            "37 % — Файл 2 из 10: Продажи.xlsx — запись · осталось ≈ 1 мин 20 с"
+        );
+        // Четверть за минуту — осталось три минуты (не 20 с и не 4 мин).
+        assert_eq!(progress_label(0.25, "запись", "", secs(60)), "25 % — запись · осталось ≈ 3 мин 00 с");
+        // Строка файла без этапа (этап сброшен новым файлом).
+        assert_eq!(progress_label(0.5, "", "Файл 3 из 10: Б.xlsx", secs(10)), "50 % — Файл 3 из 10: Б.xlsx · осталось ≈ 10 с");
+        // 99,9 % — ещё не 100.
+        assert_eq!(progress_label(0.999, "проверка результата", "", secs(999)), "99 % — проверка результата · осталось ≈ 1 с");
+        // Готово: без остатка, с затраченным временем.
+        assert_eq!(progress_label(1.0, "проверка результата", "", secs(125)), "100 % — проверка результата · за 2 мин 05 с");
+    }
+
+    /// Этапы из журнала: «Файл k из n» запоминается и сбрасывает этап; конец — время в строке состояния, ход убран.
+    #[test]
+    fn job_stages_and_time_in_status() {
+        assert_eq!(stage_of("Сбор значений по правилам…"), Some("сбор значений"));
+        assert_eq!(stage_of("Запись файла…"), Some("запись"));
+        assert_eq!(stage_of("Проверка результата на остатки реальных значений…"), Some("проверка результата"));
+        assert_eq!(stage_of("Уникальных значений: 5"), None);
+        assert_eq!(stage_of("Проверка: реальных значений из правил в файле не найдено."), None);
+
+        let mut app = App::blank();
+        let (tx, rx) = channel();
+        app.job = Some(rx);
+        app.progress = Some((Arc::new(Progress::default()), Instant::now()));
+        let mut s = Screen::new();
+        let log = |m: &str| Msg::Log(m.into());
+        tx.send(log("Сбор значений по правилам…")).unwrap();
+        tx.send(log("Уникальных значений: 5")).unwrap();
+        s.frame(&mut app, vec![]);
+        assert_eq!((app.stage.as_str(), app.file_line.as_str()), ("сбор значений", ""));
+        tx.send(log("Ключ записан: D:\\к.csv")).unwrap();
+        tx.send(log("Файл 2 из 10: Продажи.xlsx")).unwrap();
+        s.frame(&mut app, vec![]);
+        assert_eq!((app.stage.as_str(), app.file_line.as_str()), ("", "Файл 2 из 10: Продажи.xlsx"));
+        tx.send(log("Запись файла…")).unwrap();
+        s.frame(&mut app, vec![]);
+        assert_eq!((app.stage.as_str(), app.file_line.as_str()), ("запись", "Файл 2 из 10: Продажи.xlsx"));
+        assert_eq!(app.log.len(), 5, "строки этапов остаются и в журнале");
+        assert!(app.job.is_some() && app.progress.is_some());
+
+        let rep = Report { output: PathBuf::from("D:\\р_anon.xlsx"), ..Default::default() };
+        tx.send(Msg::Done(Ok(vec![rep]), vec![Profile::default()])).unwrap();
+        s.frame(&mut app, vec![]);
+        assert!(app.job.is_none() && app.progress.is_none());
+        assert_eq!(app.status, "Готово: D:\\р_anon.xlsx — за 0 с");
+        assert!(!app.status_err);
     }
 }

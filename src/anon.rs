@@ -137,9 +137,10 @@ impl Report {
             l.push(format!("Внимание: {w}"));
         }
         if self.leaks.is_empty() {
-            l.push("Проверка: реальных значений из правил в файле не найдено.".into());
+            // Ищутся значения размеченных колонок всех файлов прогона и ключа прошлых запусков — в результате.
+            l.push("Проверка обезличенного файла: реальных значений из размеченных колонок в нём не найдено.".into());
         } else {
-            l.push("Проверка: реальные значения ещё встречаются:".into());
+            l.push("Проверка обезличенного файла: в нём ещё встречаются реальные значения:".into());
             for k in &self.leaks {
                 l.push(format!("  {} — {} вхожд., например: {}", k.part, k.count, k.samples.join(" | ")));
             }
@@ -992,49 +993,67 @@ pub fn plan_batch(
 /// связка между колонками и файлами рвётся. Об этом — предупреждение в каждом затронутом файле;
 /// самих значений в нём нет (журнал могут переслать), только где и какие типы.
 fn kind_conflicts(plans: &mut [FilePlan], rules: &[&[Rule]], faker: &Faker, files: &[&Path]) {
-    let mut by_real: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut by_real: HashMap<&str, Vec<&str>> = HashMap::new();
     for e in &faker.entries {
-        by_real.entry(e.real.as_str()).or_default().push(e.kind_key.clone());
+        by_real.entry(e.real.as_str()).or_default().push(e.kind_key.as_str());
     }
-    let mut found: std::collections::BTreeMap<Vec<String>, (usize, HashSet<usize>)> = Default::default();
-    for p in plans.iter() {
-        for (_, original, _) in &p.items {
-            if original.chars().count() < 3 {
-                continue;
+    // Расхождение возможно только у значения, записанного в генераторе под двумя типами и больше.
+    by_real.retain(|real, kinds| kinds.len() >= 2 && real.chars().count() >= 3);
+    // Где размечено каждое такое значение: один проход по всем файлам, а не по всем файлам на каждое значение
+    // (на листах в сотни тысяч строк — квадрат).
+    let mut marked: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
+    for (fj, q) in plans.iter().enumerate() {
+        for (rj, o, _) in &q.items {
+            if by_real.contains_key(o.as_str()) {
+                marked.entry(o.as_str()).or_default().push((fj, *rj));
             }
-            let Some(kinds) = by_real.get(original.as_str()) else { continue };
-            let fakes: HashSet<&str> = kinds.iter().filter_map(|k| faker.get(k, original)).collect();
-            if fakes.len() < 2 {
-                continue;
-            }
-            // Где это значение размечено и как: в файлах прогона и в ключе.
-            let mut places: Vec<String> = Vec::new();
-            let mut involved = HashSet::new();
-            for (fj, q) in plans.iter().enumerate() {
-                for (rj, o, _) in &q.items {
-                    if o == original {
-                        let r = &rules[fj][*rj];
-                        places.push(format!("{}!{}!{} — {}", file_name(files[fj]), r.sheet, crate::xlsx::col_name(r.col), r.kind.title()));
-                        involved.insert(fj);
-                    }
-                }
-            }
-            let here: HashSet<String> = plans.iter().zip(rules).flat_map(|(q, rs)| q.items.iter().filter(|it| &it.1 == original).map(|it| rs[it.0].kind_key())).collect();
-            for k in kinds.iter().filter(|k| !here.contains(*k)) {
-                if let Some((kind, _, _)) = parse_kind_key(k) {
-                    places.push(format!("ключ прошлых запусков — {}", kind.title()));
-                }
-            }
-            places.sort();
-            places.dedup();
-            let entry = found.entry(places).or_insert_with(|| (0, HashSet::new()));
-            entry.0 += 1;
-            entry.1.extend(involved);
         }
     }
+    let mut found: std::collections::BTreeMap<Vec<String>, (usize, HashSet<usize>)> = Default::default();
+    for (original, at) in &marked {
+        let kinds = &by_real[original];
+        let fakes: HashSet<&str> = kinds.iter().filter_map(|k| faker.get(k, original)).collect();
+        if fakes.len() < 2 {
+            continue;
+        }
+        // Два «Шаблона» с разными подписями разделены намеренно — это не ошибка разметки.
+        if kinds.iter().all(|k| parse_kind_key(k).is_some_and(|(k, _, _)| k == Kind::Text)) {
+            continue;
+        }
+        // Где это значение размечено и как: в файлах прогона и в ключе. Без самих значений — журнал могут переслать.
+        let mut places: Vec<String> = Vec::new();
+        let mut involved = HashSet::new();
+        let mut here: HashSet<String> = HashSet::new();
+        for &(fj, rj) in at {
+            let r = &rules[fj][rj];
+            let (file, col) = (file_name(files[fj]), crate::xlsx::col_name(r.col));
+            let column = match plans[fj].rule_heads.get(rj).and_then(|h| h.as_deref()) {
+                Some(h) => format!("колонка «{h}» ({file}, лист {}, {col})", r.sheet),
+                None => format!("колонка {col} ({file}, лист {})", r.sheet),
+            };
+            places.push(format!("{column} — правило «{}»", r.kind.title()));
+            involved.insert(fj);
+            here.insert(r.kind_key());
+        }
+        for k in kinds.iter().filter(|k| !here.contains(**k)) {
+            if let Some((kind, _, _)) = parse_kind_key(k) {
+                places.push(format!("ключ прошлых запусков — правило «{}»", kind.title()));
+            }
+        }
+        places.sort();
+        places.dedup();
+        let entry = found.entry(places).or_insert_with(|| (0, HashSet::new()));
+        entry.0 += 1;
+        entry.1.extend(involved);
+    }
     for (places, (count, involved)) in found {
+        let what = match (count % 10, count % 100) {
+            (1, n) if n != 11 => "одинаковое значение есть",
+            (2..=4, n) if !(12..=14).contains(&n) => "одинаковых значения есть",
+            _ => "одинаковых значений есть",
+        };
         let w = format!(
-            "одни и те же значения ({count}) размечены разными типами: {} — у них разные фейки, связь между колонками и файлами потеряется. Поставьте один тип",
+            "{count} {what} в колонках, размеченных правилами разных типов: {}. Они получат разные фейки. Если это одни и те же люди или организации и связь нужна — поставьте колонкам один тип правила; если совпадение случайное — ничего делать не нужно",
             places.join("; ")
         );
         for fi in involved {

@@ -491,8 +491,8 @@ fn different_kinds_for_same_values_are_reported() {
     };
     let reps = run_batch(&batch, &mut |_| {}).unwrap();
     for r in &reps {
-        let w = r.warnings.iter().find(|w| w.contains("разными типами")).unwrap_or_else(|| panic!("нет предупреждения: {:?}", r.warnings));
-        assert!(w.contains("Договоры.xlsx!Договоры!C") && w.contains("Платежи.xlsx!Платежи!C"), "{w}");
+        let w = r.warnings.iter().find(|w| w.contains("правилами разных типов")).unwrap_or_else(|| panic!("нет предупреждения: {:?}", r.warnings));
+        assert!(w.contains("(Договоры.xlsx, лист Договоры, C)") && w.contains("(Платежи.xlsx, лист Платежи, C)"), "{w}");
         assert!(!w.contains("7707083893"), "в предупреждении реальное значение: {w}");
     }
     // Без расхождения типов — без предупреждения.
@@ -503,7 +503,7 @@ fn different_kinds_for_same_values_are_reported() {
         key_in: None,
         key_out: None,
     };
-    assert!(run_batch(&batch, &mut |_| {}).unwrap().iter().all(|r| r.warnings.iter().all(|w| !w.contains("разными типами"))));
+    assert!(run_batch(&batch, &mut |_| {}).unwrap().iter().all(|r| r.warnings.iter().all(|w| !w.contains("правилами разных типов"))));
 }
 
 /// Куда пишется ключ: выбранный вручную — в него; найденный при открытии — в общий ключ его папки
