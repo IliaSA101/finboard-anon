@@ -593,7 +593,7 @@ MUTANTS = [
      '0.6 профиль: «Сохранить профиль…» не сверяет листы с ключом'),
     ('src/anon.rs', "    for e in &faker.entries {\n        s.check_value(&e.real, \"\", parse_kind_key", "    for e in faker.entries.iter().take(0) {\n        s.check_value(&e.real, \"\", parse_kind_key",
      '0.6 приватность: значение из ключа — название колонки'),
-    ('src/fake.rs', "                self.taken.insert(company_key(s));\n                self.taken.insert(n);", "",
+    ('src/fake.rs', "            if !number_like(s) {\n                self.taken.insert(company_key(s));\n            }\n            self.taken.insert(n);", "",
      '0.6 уникальность: фейк равен реальному тексту прогона не из общих строк'),
     ('src/fake.rs', "                        self.taken.extend(real.split([';', ',', '\\n']).map(norm_text).filter(|x| !x.is_empty()));\n", "",
      '0.6 ключ: фейк email равен второму реальному адресу из ячейки ключа'),
