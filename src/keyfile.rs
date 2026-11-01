@@ -425,12 +425,10 @@ fn spoiled_by_excel(e: &KeyEntry) -> Option<String> {
     }
     let digits = |s: &str| s.chars().filter(char::is_ascii_digit).count();
     let (r, f) = (digits(&e.real), digits(&e.fake));
+    // Фейк короче настоящего не бывает: значит, Excel срезал у фейка ведущие нули. Обратное («настоящий короче
+    // фейка») порчей не считается: программа сама удлиняет фейк, когда номеров той же длины не хватило.
     if f < r {
         return Some(e.fake.trim().to_string());
-    }
-    let inn_zero = kind == Kind::Inn && matches!(r, 9 | 11) && f == r + 1;
-    if r > 4 && r < f && !inn_zero {
-        return Some(crate::anon::mask_sample(&e.real));
     }
     None
 }

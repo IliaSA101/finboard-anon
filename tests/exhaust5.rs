@@ -117,6 +117,27 @@ fn x03_exhausted_phones_end_to_end() {
     assert!(summary.contains("не найдено"), "{summary}");
 }
 
+/// Ключ с удлинёнными фейками читается на следующем запуске: проверка «ключ пересохранён в Excel» считала
+/// «настоящий короче фейка» порчей и отвергала ключ, в который программа сама записала фейк на цифру длиннее.
+/// Второй прогон по ключу даёт те же фейки.
+#[test]
+fn x07_key_with_longer_fakes_is_reused() {
+    let d = tmp("x5_07");
+    let reals: Vec<String> = (10_000..20_000).map(|n| n.to_string()).collect();
+    let input = d.join("in.xlsx");
+    phone_book(&input, &reals);
+    let key = d.join("ключ.csv");
+    let mut rule = Rule::new("Л", 0, 2, None, Kind::Phone);
+    rule.with_id = false;
+    run(&input, &d.join("out1.xlsx"), vec![rule.clone()], "x07", None, Some(&key));
+    run(&input, &d.join("out2.xlsx"), vec![rule], "другая соль", Some(&key), Some(&key));
+    let (a, b) = (read_book(&d.join("out1.xlsx")), read_book(&d.join("out2.xlsx")));
+    for i in 0..reals.len() {
+        let cell = format!("A{}", i + 2);
+        assert_eq!(text(&a, "Л", &cell), text(&b, "Л", &cell), "строка {}: по ключу другой фейк", i + 2);
+    }
+}
+
 /// «Прервать и закрыть» во время сбора значений: прежде сбор и выбор фейков шли до конца (на исчерпанных
 /// номерах — минуты), и только потом обработка останавливалась. Теперь — сразу, с ошибкой отмены.
 #[test]
