@@ -836,6 +836,8 @@ fn write_book(
     }
     let mut mashup: Vec<String> = Vec::new();
     let mut printer_unknown: Vec<String> = Vec::new();
+    // Части, которые не удалось прочитать (битый UTF-16): скопированы без обезличивания.
+    let mut unreadable: Vec<String> = Vec::new();
     // При ошибке или сбое на любом шаге недописанный результат удаляет `run_batch` (RemoveOnDrop).
     {
         let out_file = File::create(tmp).with_context(|| format!("не создаётся {}", tmp.display()))?;
@@ -886,6 +888,14 @@ fn write_book(
                 }
             } else if !is_xml || (other_rels && !sheet_rels) {
                 None
+            } else if broken_utf16(zip.by_index(i)?)? {
+                // Битая часть не останавливает обработку книги: копируется как есть, о ней — предупреждение,
+                // и итог проверки не обещает, что в ней чисто.
+                report.warnings.push(format!(
+                    "часть {name} не прочитана (неверная кодировка UTF-16) — скопирована как есть, без обезличивания и проверки; перед пересылкой откройте и пересохраните книгу в Excel"
+                ));
+                unreadable.push(name.clone());
+                None
             } else {
                 let mut data = Vec::new();
                 zip.by_index(i)?.read_to_end(&mut data)?;
@@ -914,6 +924,10 @@ fn write_book(
                                 "{name}: источник сводной не распознан — её кэш очищен, Excel пересоберёт сводную при открытии"
                             ));
                         }
+                    }
+                    // Исходные записи сводной больше не нужны: в памяти не держим две копии сотен мегабайт.
+                    if pivot_out.is_some() {
+                        data = Vec::new();
                     }
                     let data: &[u8] = pivot_out.as_deref().unwrap_or(&data);
                     let overrides: &[(&[u8], &str)] = if !settings.clean_metadata {
@@ -986,6 +1000,10 @@ fn write_book(
             match new {
                 Some(bytes) => {
                     report.parts_changed += 1;
+                    // Большая часть (записи сводной, общие строки) — быстрым сжатием, как листы: обычное
+                    // сжимает сотню мегабайт в разы дольше, чем занимает вся остальная обработка.
+                    let big = bytes.len() > 8 << 20;
+                    let opts = if big { opts.compression_level(Some(1)).large_file(bytes.len() as u64 >= u32::MAX as u64) } else { opts };
                     zw.start_file(name.clone(), opts)?;
                     zw.write_all(&bytes)?;
                 }
@@ -1007,6 +1025,7 @@ fn write_book(
     let (warnings, unchecked) = binary_part_warnings(&names, &dropped, &mashup, &printer_unknown);
     report.warnings.extend(warnings);
     report.unchecked = unchecked;
+    report.unchecked.extend(unreadable);
 
     Ok(report)
 }
@@ -1350,9 +1369,10 @@ fn expected_reads(books: &mut [(Zip, Workbook)], rules: &[&[Rule]]) -> u64 {
         for i in 0..zip.len() {
             let Ok(f) = zip.by_index_raw(i) else { continue };
             let (name, size) = (f.name().to_string(), f.size());
+            // Размер — из заголовка архива, в повреждённом файле он бывает любым: без переполнения.
             match wb.sheets.iter().find(|s| s.path == name) {
-                Some(s) => total += size * if rs.iter().any(|r| r.sheet == s.name) { 4 } else { 3 },
-                None if name.ends_with(".xml") || name.ends_with(".rels") || name.ends_with(".vml") => total += size,
+                Some(s) => total = size.saturating_mul(if rs.iter().any(|r| r.sheet == s.name) { 4 } else { 3 }).saturating_add(total),
+                None if name.ends_with(".xml") || name.ends_with(".rels") || name.ends_with(".vml") => total = total.saturating_add(size),
                 None => {}
             }
         }
@@ -2329,6 +2349,23 @@ fn decode_utf16(data: &[u8], be: bool) -> Result<String> {
     Ok(String::from_utf16(&units)?)
 }
 
+/// Часть с меткой UTF-16, которая не раскодируется (непарные суррогаты). Лишний последний байт, как и
+/// прежде, отбрасывается при раскодировании. Части без метки читаются только до третьего байта.
+fn broken_utf16<R: Read>(mut f: zip::read::ZipFile<'_, R>) -> Result<bool> {
+    let mut head = [0u8; 2];
+    let mut got = 0;
+    while got < 2 {
+        match f.read(&mut head[got..])? {
+            0 => return Ok(false),
+            n => got += n,
+        }
+    }
+    let Some(be) = utf16_bom(&head) else { return Ok(false) };
+    let mut rest = Vec::new();
+    f.read_to_end(&mut rest)?;
+    Ok(decode_utf16(&rest, be).is_err())
+}
+
 /// Текст в UTF-16 с меткой порядка байт.
 fn encode_utf16(s: &str, be: bool) -> Vec<u8> {
     let mut out = if be { vec![0xFE, 0xFF] } else { vec![0xFF, 0xFE] };
@@ -2361,28 +2398,85 @@ fn rewrite_generic(
     stats: &mut Stats,
 ) -> Result<Option<Vec<u8>>> {
     let mut rd = Reader::from_reader(xml);
-    let mut w = Writer::new(Vec::with_capacity(xml.len() + 1024));
-    let mut buf = Vec::new();
-    let mut changed = false;
-    let mut stack: Vec<Vec<u8>> = Vec::new();
-    let mut person_n = 0;
-    let mut override_n = 0;
-    let mut events = Vec::new();
+    let mut g = Generic {
+        w: Writer::new(Vec::with_capacity(xml.len() + 1024)),
+        maps,
+        overrides,
+        persons,
+        clean_meta,
+        changed: false,
+        stack: Vec::new(),
+        person_n: 0,
+        override_n: 0,
+    };
+    // Потоком: в памяти — только текущий абзац (<text>, <a:p>), чтобы склеить его фрагменты. Записи кэша
+    // сводной на миллионы строк — десятки миллионов событий; собранные разом, они занимали гигабайты.
+    // События ссылаются прямо на разбираемый текст части — без копии каждого.
+    let mut para: Vec<Event> = Vec::new();
+    let mut depth = 0usize;
     loop {
-        let ev = rd.read_event_into(&mut buf)?.into_owned();
-        buf.clear();
+        let ev = rd.read_event()?;
         if matches!(ev, Event::Eof) {
             break;
         }
-        events.push(ev);
-    }
-    changed |= merge_split_runs(&mut events, maps, stats)?;
-    for ev in events {
+        if para.is_empty() {
+            let starts = matches!(&ev, Event::Start(e) if matches!(e.local_name().as_ref(), b"text" | b"p"));
+            if !starts {
+                g.emit(ev, stats)?;
+                continue;
+            }
+            depth = 0;
+        }
         match &ev {
-            Event::Eof => break,
+            Event::Start(_) => depth += 1,
+            Event::End(_) => depth -= 1,
+            _ => {}
+        }
+        para.push(ev);
+        if depth == 0 {
+            g.flush_para(&mut para, stats)?;
+        }
+    }
+    // Абзац без закрывающего тега (обрыв части) — склеивается до конца, как и раньше.
+    g.flush_para(&mut para, stats)?;
+    Ok(g.changed.then(|| g.w.into_inner()))
+}
+
+/// Состояние потоковой перезаписи прочих частей (rewrite_generic).
+struct Generic<'a> {
+    w: Writer<Vec<u8>>,
+    maps: &'a GlobalMaps,
+    overrides: &'a [(&'a [u8], &'a str)],
+    persons: bool,
+    clean_meta: bool,
+    changed: bool,
+    stack: Vec<Vec<u8>>,
+    person_n: usize,
+    override_n: usize,
+}
+
+impl Generic<'_> {
+    /// Абзац целиком: склеить разрезанный текст, затем записать его события по одному.
+    fn flush_para(&mut self, para: &mut Vec<Event>, stats: &mut Stats) -> Result<()> {
+        if para.is_empty() {
+            return Ok(());
+        }
+        self.changed |= merge_split_runs(para, self.maps, stats)?;
+        for ev in para.drain(..) {
+            self.emit(ev, stats)?;
+        }
+        Ok(())
+    }
+
+    fn emit(&mut self, ev: Event, stats: &mut Stats) -> Result<()> {
+        let (maps, overrides, persons, clean_meta) = (self.maps, self.overrides, self.persons, self.clean_meta);
+        let (w, stack) = (&mut self.w, &mut self.stack);
+        let (changed, person_n, override_n) = (&mut self.changed, &mut self.person_n, &mut self.override_n);
+        match &ev {
+            Event::Eof => return Ok(()),
             Event::Start(e) | Event::Empty(e) => {
                 let is_start = matches!(ev, Event::Start(_));
-                let ln = e.local_name().as_ref().to_vec();
+                let ln = e.local_name().into_inner();
                 // Новое значение атрибута; None — удалить атрибут.
                 let mut new_attrs: Vec<(Vec<u8>, Option<String>)> = Vec::new();
                 // Границы поля в кэше сводной (min/max) снимаются обе сразу, если хоть одна — реальное
@@ -2393,33 +2487,33 @@ fn rewrite_generic(
                     BOUNDS.contains(&a.key.as_ref()) && a.unescape_value().is_ok_and(|v| maps.is_known_number(&v) || maps.any(&v).is_some())
                 });
                 for a in e.attributes().with_checks(false).flatten() {
-                    let key = a.key.as_ref().to_vec();
+                    let key = a.key.as_ref();
                     if clean_meta && (key == b"userName" || (ln == b"userInfo" && key == b"name")) {
                         // Журнал изменений общей книги: кто вносил правки.
-                        new_attrs.push((key, Some("Автор".into())));
+                        new_attrs.push((key.to_vec(), Some("Автор".into())));
                     } else if persons && ln == b"person" && (key == b"displayName" || key == b"userId") {
                         if key == b"displayName" {
-                            person_n += 1;
+                            *person_n += 1;
                         }
-                        let val = if key == b"displayName" { format!("Автор {}", person_n.max(1)) } else { format!("author{}", person_n.max(1)) };
-                        new_attrs.push((key, Some(val)));
+                        let val = if key == b"displayName" { format!("Автор {}", (*person_n).max(1)) } else { format!("author{}", (*person_n).max(1)) };
+                        new_attrs.push((key.to_vec(), Some(val)));
                     } else if key == b"v" {
                         if let Some(out) = a.unescape_value().ok().and_then(|v| maps.any(&v).cloned()) {
-                            new_attrs.push((key, Some(out)));
+                            new_attrs.push((key.to_vec(), Some(out)));
                         }
                     } else if ln == b"tableColumn" && key == b"name" {
                         // Имя колонки умной таблицы обязано совпадать с текстом ячейки шапки.
                         if let Some(out) = a.unescape_value().ok().and_then(|v| maps.cell_text(&v)) {
-                            new_attrs.push((key, Some(out)));
+                            new_attrs.push((key.to_vec(), Some(out)));
                         }
-                    } else if bound_hit && BOUNDS.contains(&key.as_slice()) {
-                        new_attrs.push((key, None));
+                    } else if bound_hit && BOUNDS.contains(&key) {
+                        new_attrs.push((key.to_vec(), None));
                     } else if clean_meta && ln == b"pivotCacheDefinition" && key == b"refreshedBy" {
-                        new_attrs.push((key, Some("Автор".into())));
+                        new_attrs.push((key.to_vec(), Some("Автор".into())));
                     } else if ln == b"cacheField" && key == b"name" {
                         // Поле сводной называется по шапке источника — переименовываем вместе с ней.
                         if let Some(out) = a.unescape_value().ok().and_then(|v| maps.cell_text(&v)) {
-                            new_attrs.push((key, Some(out)));
+                            new_attrs.push((key.to_vec(), Some(out)));
                         }
                     }
                 }
@@ -2432,16 +2526,16 @@ fn rewrite_generic(
                             None => n.push_attribute(a),
                         }
                     }
-                    changed = true;
+                    *changed = true;
                     stats.other += 1;
                     if is_start {
-                        stack.push(ln);
+                        stack.push(ln.to_vec());
                     }
                     w.write_event(if is_start { Event::Start(n) } else { Event::Empty(n) })?;
-                    continue;
+                    return Ok(());
                 }
                 if is_start {
-                    stack.push(ln);
+                    stack.push(ln.to_vec());
                 }
             }
             Event::End(_) => {
@@ -2452,24 +2546,24 @@ fn rewrite_generic(
                 if let Some((_, repl)) = overrides.iter().find(|(n, _)| *n == top) {
                     // «{n}» — номер: авторы примечаний должны остаться разными.
                     let repl = if repl.contains("{n}") {
-                        override_n += 1;
+                        *override_n += 1;
                         repl.replace("{n}", &override_n.to_string())
                     } else {
                         repl.to_string()
                     };
                     if e.unescape().map(|t| t != repl).unwrap_or(true) {
                         w.write_event(Event::Text(BytesText::new(&repl)))?;
-                        changed = true;
-                        continue;
+                        *changed = true;
+                        return Ok(());
                     }
                 } else {
                     let text = e.unescape()?;
                     if !text.trim().is_empty() {
                         if let Some(out) = maps.replace_in(&text) {
                             w.write_event(Event::Text(BytesText::new(&out)))?;
-                            changed = true;
+                            *changed = true;
                             stats.other += 1;
-                            continue;
+                            return Ok(());
                         }
                     }
                 }
@@ -2477,13 +2571,13 @@ fn rewrite_generic(
             _ => {}
         }
         w.write_event(ev)?;
+        Ok(())
     }
-    Ok(changed.then(|| w.into_inner()))
 }
 
 /// Текст абзаца, разрезанный на фрагменты форматирования (<r><t>Иванов Иван</t></r><r><t> Иванович</t></r>
 /// в примечаниях и надписях): заменяется целиком — склеенный текст в первый фрагмент, остальные пустеют.
-fn merge_split_runs(events: &mut [Event<'static>], maps: &GlobalMaps, stats: &mut Stats) -> Result<bool> {
+fn merge_split_runs(events: &mut [Event], maps: &GlobalMaps, stats: &mut Stats) -> Result<bool> {
     let local = |ev: &Event| match ev {
         Event::Start(e) | Event::Empty(e) => Some(e.local_name().as_ref().to_vec()),
         Event::End(e) => Some(e.local_name().as_ref().to_vec()),
@@ -3135,19 +3229,18 @@ fn rewrite_pivot_items(data: &[u8], is_rec: bool, c0: u32, r0: u32, rules: &[&Ru
     let ruled_cols: HashSet<u32> = rules.iter().map(|r| r.col).collect();
     let mut rd = Reader::from_reader(data);
     let mut w = Writer::new(Vec::with_capacity(data.len()));
-    let mut buf = Vec::new();
     let mut changed = false;
     let (mut field, mut rec, mut k): (i64, i64, i64) = (-1, -1, -1);
     let (mut in_shared, mut depth_r) = (false, 0usize);
     loop {
-        let ev = rd.read_event_into(&mut buf)?.into_owned();
-        buf.clear();
+        // Событие ссылается прямо на текст части: записи сводной — миллионы событий, копия каждого дорога.
+        let ev = rd.read_event()?;
         let mut replaced: Option<Event<'static>> = None;
         match &ev {
             Event::Eof => break,
             Event::Start(e) | Event::Empty(e) => {
                 let is_start = matches!(ev, Event::Start(_));
-                let ln = e.local_name().as_ref().to_vec();
+                let ln = e.local_name().into_inner();
                 let wrap = |n: BytesStart<'static>| if is_start { Event::Start(n) } else { Event::Empty(n) };
                 if is_rec {
                     if ln == b"r" && depth_r == 0 {
@@ -3159,9 +3252,10 @@ fn rewrite_pivot_items(data: &[u8], is_rec: bool, c0: u32, r0: u32, rules: &[&Ru
                     } else if depth_r > 0 {
                         if depth_r == 1 {
                             k += 1;
-                            if matches!(ln.as_slice(), b"n" | b"s" | b"d") {
+                            // Значение читается только в колонках с правилами — в остальных замены не бывает.
+                            let col = c0 + k as u32;
+                            if matches!(ln, b"n" | b"s" | b"d") && ruled_cols.contains(&col) {
                                 let row = r0 + 1 + rec as u32;
-                                let col = c0 + k as u32;
                                 if let Some(out) = attr(e, b"v").and_then(|v| pivot_lookup(rules, Some(row), col, &v, &ln, faker, d1904)) {
                                     replaced = Some(wrap(with_attr(e, b"v", Some(&out))));
                                 }
@@ -3172,7 +3266,7 @@ fn rewrite_pivot_items(data: &[u8], is_rec: bool, c0: u32, r0: u32, rules: &[&Ru
                         }
                     }
                 } else {
-                    match ln.as_slice() {
+                    match ln {
                         b"cacheField" => field += 1,
                         b"sharedItems" => {
                             in_shared = is_start;
@@ -3326,6 +3420,27 @@ fn paragraph_texts(xml: &[u8]) -> Vec<String> {
     out
 }
 
+/// Конец последнего закрывающего тега `</имя>`, который начинается в `d[from..]` и чьё локальное имя (без
+/// префикса `x:`) подходит под `want`. Внутри текста и значений атрибутов «</» не бывает (там «&lt;»), так что
+/// по концу такого тега кусок XML режется, не разрезая ни одного значения.
+fn last_end_tag(d: &[u8], from: usize, want: impl Fn(&[u8]) -> bool) -> Option<usize> {
+    let mut hi = d.len();
+    while hi >= from + 2 {
+        let p = from + d[from..hi].windows(2).rposition(|w| w == b"</")?;
+        let rest = &d[p + 2..];
+        if let Some(q) = rest.iter().take(256).position(|&b| b == b'>') {
+            let name = rest[..q].trim_ascii_end();
+            let local = name.rsplit(|&b| b == b':').next().unwrap_or(name);
+            if want(local) {
+                return Some(p + 2 + q + 1);
+            }
+        }
+        // Следующий поиск — строго левее этого «</».
+        hi = p + 1;
+    }
+    None
+}
+
 /// Ищет реальные значения в XML результата. Значения, которые сами входят в какой-либо фейк
 /// (например, имя «Иван» внутри фейка «Иванова»), не проверяются, чтобы не было ложных тревог.
 pub fn scan_leaks(path: &Path, originals: &[String], fakes: &[&str]) -> Result<Vec<Leak>> {
@@ -3399,21 +3514,29 @@ pub fn scan_leaks_with(path: &Path, originals: &[String], fakes: &[&str], digits
         let mut f = crate::xlsx::counted(f);
         let mut count = 0;
         let mut samples: Vec<String> = Vec::new();
-        let mut check = |data: &[u8]| {
+        // Кусок data: считаются вхождения, которые начинаются в [skip, upto) — начало до skip проверено в
+        // прошлом куске, хвост от upto будет началом следующего. Ответ — где кончается последнее засчитанное
+        // вхождение или номер (часть из них может заходить за upto: второй раз их не считать).
+        let mut check = |data: &[u8], skip: usize, upto: usize| -> usize {
             let mut hits = 0;
+            let mut reach = 0;
             let note = |m: aho_corasick::Match, samples: &mut Vec<String>| {
                 let s = cands[owner[m.pattern().as_usize()]];
                 if samples.len() < 8 && !samples.contains(s) {
                     samples.push(s.clone());
                 }
             };
-            for m in ac.find_iter(data).filter(|m| word_bounded(data, m.start(), m.end())) {
+            let mine = |a: usize| (skip..upto).contains(&a);
+            for m in ac.find_iter(data).filter(|m| mine(m.start()) && word_bounded(data, m.start(), m.end())) {
                 hits += 1;
+                reach = reach.max(m.end());
                 note(m, &mut samples);
             }
             // Текст, разрезанный на фрагменты форматирования, в сыром XML не виден — ищем и в склеенном.
+            // Только в целом куске: абзацы в нём целые (кусок режется по их концам).
             let mut joined_hits = 0;
-            let texts = if para.is_match(data) { paragraph_texts(data) } else { Vec::new() };
+            let whole = skip == 0 && upto == data.len();
+            let texts = if whole && para.is_match(data) { paragraph_texts(data) } else { Vec::new() };
             for text in texts {
                 for m in ac.find_iter(&text).filter(|m| word_bounded(text.as_bytes(), m.start(), m.end())) {
                     joined_hits += 1;
@@ -3423,7 +3546,11 @@ pub fn scan_leaks_with(path: &Path, originals: &[String], fakes: &[&str], digits
             hits = hits.max(joined_hits);
             if !digits.is_empty() {
                 let text = String::from_utf8_lossy(data);
-                for (a, b) in digit_runs(&text).into_iter().filter(|(a, b)| b - a >= min_digits) {
+                for (a, b) in digit_runs(&text).into_iter().filter(|&(a, _)| mine(a)) {
+                    reach = reach.max(b);
+                    if b - a < min_digits {
+                        continue;
+                    }
                     let run = &text[a..b];
                     let d = digits_only(run);
                     let hit = |d: &str| digits.contains(d) || (d.len() == 11 && (d.starts_with('7') || d.starts_with('8')) && digits.contains(&d[1..]));
@@ -3437,21 +3564,56 @@ pub fn scan_leaks_with(path: &Path, originals: &[String], fakes: &[&str], digits
                 }
             }
             count += hits;
+            reach
         };
-        // Большой лист — кусками по границе строк </row>: значение не делится между строками листа.
+        // Большая часть — кусками по безопасной границе, чтобы не держать её в памяти целиком:
+        // лист — по концу строки </row>; общие строки, примечания, надписи — по концу абзаца (</si>, </a:p>…),
+        // чтобы склеенный текст абзаца был целым; часть без абзацев (записи сводной) — по любому закрывающему
+        // тегу. Значение не делится: внутри текста и атрибутов «</» не бывает. Граница ищется только в новом
+        // хвосте куска — без повторного прохода по уже просмотренному (иначе часть без </row> в сотни мегабайт
+        // проверялась бы квадратично долго).
         const CHUNK: usize = 16 << 20;
+        // Кусок без единой границы (огромный текстовый узел): режется где придётся, с перекрытием длиннее
+        // любого образца — вхождение на стыке целиком попадает в один из кусков.
+        const HARD: usize = 64 << 20;
+        let overlap = pats.iter().map(String::len).max().unwrap_or(0).max(min_digits * 4) + 256;
         let mut pending: Vec<u8> = Vec::new();
         let mut block = vec![0u8; 1 << 20];
+        // pending[..searched] уже просмотрен: границы там нет (или абзацев — см. para_seen).
+        let (mut searched, mut skip, mut para_seen, mut utf16) = (0usize, 0usize, false, None::<bool>);
         loop {
             let n = f.read(&mut block)?;
             pending.extend_from_slice(&block[..n]);
+            if utf16.is_none() && (pending.len() >= 2 || n == 0) {
+                utf16 = Some(utf16_bom(&pending).is_some());
+            }
             if n > 0 && pending.len() < CHUNK {
                 continue;
             }
-            if n > 0 && utf16_bom(&pending).is_none() {
-                if let Some(p) = pending.windows(6).rposition(|w| w == b"</row>") {
-                    check(&pending[..p + 6]);
-                    pending.drain(..p + 6);
+            if n > 0 && utf16 == Some(false) {
+                let from = searched.saturating_sub(64);
+                para_seen = para_seen || para.is_match(&pending[from..]);
+                let cut = last_end_tag(&pending, from, |t| t == b"row")
+                    .or_else(|| last_end_tag(&pending, from, |t| matches!(t, b"si" | b"is" | b"text" | b"p")))
+                    .or_else(|| if para_seen { None } else { last_end_tag(&pending, from, |_| true) });
+                if let Some(cut) = cut {
+                    check(&pending[..cut], skip, cut);
+                    pending.drain(..cut);
+                    skip = 0;
+                    searched = pending.len();
+                    para_seen = para.is_match(&pending);
+                } else if pending.len() >= HARD {
+                    let mut cut = pending.len() - overlap;
+                    while cut > 0 && pending[cut] & 0xC0 == 0x80 {
+                        cut -= 1;
+                    }
+                    let reach = check(&pending, skip, cut);
+                    pending.drain(..cut);
+                    skip = reach.saturating_sub(cut);
+                    searched = pending.len();
+                    para_seen = para.is_match(&pending);
+                } else {
+                    searched = pending.len();
                 }
                 continue;
             }
@@ -3459,10 +3621,16 @@ pub fn scan_leaks_with(path: &Path, originals: &[String], fakes: &[&str], digits
             if n > 0 {
                 f.read_to_end(&mut pending)?;
             }
-            if let Some(be) = utf16_bom(&pending) {
-                pending = decode_utf16(&pending[2..], be).map(String::into_bytes).unwrap_or(pending);
+            if let Some(be) = utf16_bom(&pending).filter(|_| utf16 == Some(true)) {
+                // Битый UTF-16 (его скопировали без обработки) — всё равно смотрим, что удалось прочитать.
+                let units: Vec<u16> = pending[2..]
+                    .chunks_exact(2)
+                    .map(|c| if be { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) })
+                    .collect();
+                pending = String::from_utf16_lossy(&units).into_bytes();
             }
-            check(&pending);
+            let len = pending.len();
+            check(&pending, skip, len);
             break;
         }
         if count > 0 {

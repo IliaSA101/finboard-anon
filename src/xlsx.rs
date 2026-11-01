@@ -29,14 +29,22 @@ pub fn open_zip(path: &Path) -> Result<Zip> {
 
 pub fn read_part(zip: &mut Zip, name: &str) -> Result<Option<Vec<u8>>> {
     match zip.by_name(name) {
-        Ok(mut f) => {
-            let mut v = Vec::with_capacity(f.size() as usize);
-            f.read_to_end(&mut v)?;
-            Ok(Some(v))
-        }
+        Ok(f) => Ok(Some(read_all(f)?)),
         Err(ZipError::FileNotFound) => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Сколько памяти заранее занимать под часть по размеру из заголовка архива. Размер в заголовке — заявление
+/// файла, а не факт: в повреждённом или нарочно собранном архиве там бывают гигабайты при пустой части.
+/// Больше предела память растёт по мере чтения — сколько данных на самом деле есть.
+pub const PREALLOC_LIMIT: u64 = 64 << 20;
+
+/// Часть архива целиком (заранее — не больше PREALLOC_LIMIT, сколько бы ни обещал заголовок).
+pub fn read_all<R: Read>(mut f: zip::read::ZipFile<'_, R>) -> Result<Vec<u8>> {
+    let mut v = Vec::with_capacity(f.size().min(PREALLOC_LIMIT) as usize);
+    f.read_to_end(&mut v)?;
+    Ok(v)
 }
 
 /// Часть архива потоком: лист в сотни мегабайт не читается в память целиком.
@@ -306,10 +314,12 @@ impl Workbook {
             .iter()
             .find(|r| r.kind.ends_with("/sharedStrings"))
             .map(|r| r.target.clone());
+        // Общие строки — потоком: часть в сотни мегабайт не держится в памяти рядом с разобранными строками.
         let sst = match &sst_path {
-            Some(p) => match read_part(zip, p)? {
-                Some(x) => parse_sst(&x)?,
-                None => Vec::new(),
+            Some(p) => match zip.by_name(p) {
+                Ok(f) => parse_sst(BufReader::with_capacity(1 << 16, f))?,
+                Err(ZipError::FileNotFound) => Vec::new(),
+                Err(e) => return Err(e.into()),
             },
             None => Vec::new(),
         };
@@ -508,7 +518,7 @@ pub fn pivot_caches(zip: &mut Zip) -> Result<Vec<PivotCache>> {
 }
 
 /// Текст общих строк (rich text склеивается, фонетические подсказки rPh пропускаются).
-pub fn parse_sst(xml: &[u8]) -> Result<Vec<String>> {
+pub fn parse_sst(xml: impl BufRead) -> Result<Vec<String>> {
     let mut rd = Reader::from_reader(xml);
     let mut buf = Vec::new();
     let mut out = Vec::new();
