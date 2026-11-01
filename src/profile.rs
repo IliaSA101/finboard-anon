@@ -412,9 +412,310 @@ impl Profile {
     }
 }
 
+// ---------------------------------------------------------------- похоже ли на данные
+
+/// Слова текста для сравнения: нижний регистр, ё→е, без знаков препинания, через один пробел.
+/// «ООО «Ромашка»» и «ооо ромашка» — одно и то же; «+7 (916) 111-22-33» → «7 916 111 22 33».
+pub fn norm_words(s: &str) -> String {
+    s.to_lowercase()
+        .replace('ё', "е")
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Похоже ли на персональные данные само по себе, без сравнения со значениями: ФИО, номер, email,
+/// организация с формой («ООО «Ромашка»», «ИП Петров»). Возвращает, на что похоже, — для пояснения.
+/// Обычные заголовки («Ответственный», «Покупатель группа», «Остаток на 01.10.2024») — нет.
+pub fn looks_personal(s: &str) -> Option<&'static str> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some((a, b)) = t.split_once('@') {
+        if !a.trim().is_empty() && !a.contains(char::is_whitespace) && b.contains('.') && !b.contains(char::is_whitespace) {
+            return Some("похоже на email");
+        }
+    }
+    if looks_number(t) {
+        return Some("похоже на номер");
+    }
+    if looks_company(t) {
+        return Some("похоже на организацию");
+    }
+    if looks_person(t) {
+        return Some("похоже на ФИО");
+    }
+    None
+}
+
+/// Номер: пять цифр и больше подряд в одном слове (даты «01.10.2024» и годы «2024-2025» не в счёт)
+/// или десять цифр и больше во всём тексте почти без букв (телефон с пробелами).
+fn looks_number(t: &str) -> bool {
+    let date = |w: &str| {
+        let p: Vec<&str> = w.trim_matches(|c: char| !c.is_ascii_digit()).split('.').collect();
+        p.len() == 3 && p.iter().all(|x| !x.is_empty() && x.len() <= 4 && x.chars().all(|c| c.is_ascii_digit()))
+    };
+    let years = |w: &str| {
+        let p: Vec<&str> = w.split(['-', '–', '—']).collect();
+        p.len() == 2 && p.iter().all(|x| x.len() == 4 && x.chars().all(|c| c.is_ascii_digit()) && (x.starts_with("19") || x.starts_with("20")))
+    };
+    let long = t.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '/' | '№')).filter(|w| !date(w) && !years(w)).any(|w| {
+        let mut run = 0;
+        let mut best = 0;
+        for c in w.chars() {
+            if c.is_ascii_digit() {
+                run += 1;
+                best = best.max(run);
+            } else if !matches!(c, '-' | '(' | ')' | '+' | '.') {
+                run = 0;
+            }
+        }
+        best >= 5
+    });
+    let digits = t.chars().filter(|c| c.is_ascii_digit()).count();
+    let letters = t.chars().filter(|c| c.is_alphabetic()).count();
+    long || (digits >= 10 && letters < 3)
+}
+
+/// Организация с формой собственности: «ООО «Ромашка»», «ИП Петров И.И.», «АО Вектор».
+fn looks_company(t: &str) -> bool {
+    let words: Vec<&str> = t.split_whitespace().map(|w| w.trim_matches(|c: char| !c.is_alphanumeric())).filter(|w| !w.is_empty()).collect();
+    words.len() >= 2 && crate::names::LEGAL_FORMS.contains(&words[0])
+}
+
+/// ФИО: два-три слова с большой буквы (или инициалы «И.И.»), и хотя бы одно — известное имя, отчество
+/// («…вич», «…вна») или фамилия рядом с инициалами. «Отдел Кадров», «Покупатель группа» — не ФИО.
+fn looks_person(t: &str) -> bool {
+    let words: Vec<&str> = t.split_whitespace().collect();
+    if !(2..=3).contains(&words.len()) {
+        return false;
+    }
+    let initials = |w: &str| {
+        let letters: Vec<char> = w.chars().filter(|c| *c != '.').collect();
+        w.contains('.') && !letters.is_empty() && letters.len() <= 2 && letters.iter().all(|c| c.is_uppercase())
+    };
+    let capital = |w: &str| {
+        let mut cs = w.chars();
+        cs.next().is_some_and(|c| c.is_uppercase() && is_cyrillic(c)) && cs.all(|c| (c.is_alphabetic() && is_cyrillic(c)) || c == '-')
+    };
+    if !words.iter().all(|w| capital(w) || initials(w)) || words.iter().all(|w| initials(w)) {
+        return false;
+    }
+    let title = |w: &str| {
+        let lower = w.to_lowercase().replace('ё', "е");
+        let mut cs = lower.chars();
+        cs.next().map(|c| c.to_uppercase().chain(cs).collect::<String>()).unwrap_or_default()
+    };
+    let same = |a: &str, b: &str| a.replace('ё', "е") == b;
+    use crate::names::{DETECT_FEMALE, DETECT_MALE, FEMALE, MALE, PATR_STEMS, SURNAMES};
+    let name = |w: &str| MALE.iter().chain(FEMALE).chain(DETECT_MALE).chain(DETECT_FEMALE).any(|n| same(n, w));
+    let patronymic = |w: &str| {
+        let l = w.to_lowercase();
+        (l.ends_with("вич") || l.ends_with("вна") || l.ends_with("ична") || l.ends_with("ьич")) && l.chars().count() >= 6
+            || PATR_STEMS.iter().any(|s| same(&format!("{s}ич"), w) || same(&format!("{s}на"), w))
+    };
+    let known_surname = |w: &str| SURNAMES.iter().any(|s| same(s, w) || same(&format!("{s}а"), w));
+    let surname = |w: &str| {
+        let l = w.to_lowercase();
+        known_surname(w) || ["ов", "ев", "ёв", "ин", "ын", "ова", "ева", "ёва", "ина", "ына", "ский", "ская", "цкий", "цкая"].iter().any(|e| l.ends_with(e))
+    };
+    let full: Vec<String> = words.iter().filter(|w| !initials(w)).map(|w| title(w)).collect();
+    let has_initials = words.iter().any(|w| initials(w));
+    // Есть имя или отчество; фамилия с инициалами; или все слова — фамилии, и хотя бы одна из справочника.
+    full.iter().any(|w| name(w) || patronymic(w))
+        || (has_initials && full.iter().any(|w| surname(w)))
+        || (full.len() >= 2 && full.iter().any(|w| known_surname(w)) && full.iter().all(|w| surname(w)))
+}
+
+fn is_cyrillic(c: char) -> bool {
+    matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё')
+}
+
+/// Тексты-кандидаты (название колонки, имя листа, подпись шаблона), которые сверяются со значениями под правилами
+/// и в ключе. Кандидат совпал, если значение — весь он, или (для ФИО, номеров, организаций, адресов — `partial`)
+/// его часть из слов подряд: «Иванов Иван Иванович» в «Менеджер: Иванов Иван Иванович». Части короче четырёх
+/// букв не в счёт. Значения «Шаблона» («Опт», «Розница») совпадают только целиком: иначе заголовок «Розница, цена»
+/// терял бы название из-за категории в другой колонке.
+/// Значений бывают миллионы, кандидатов — десятки: значения не копируются, каждое смотрится один раз.
+pub struct Suspects {
+    /// Слова кандидата подряд → (номер кандидата, это весь кандидат).
+    grams: std::collections::HashMap<String, Vec<(usize, bool)>>,
+    /// Где нашлось совпадение (первое) — для пояснения; `None` — не совпал.
+    pub found: Vec<Option<String>>,
+    longest: usize,
+}
+
+impl Suspects {
+    pub fn new<'a>(candidates: impl IntoIterator<Item = &'a str>) -> Suspects {
+        let mut grams: std::collections::HashMap<String, Vec<(usize, bool)>> = Default::default();
+        let mut longest = 0;
+        let mut n = 0;
+        for (i, c) in candidates.into_iter().enumerate() {
+            n = i + 1;
+            let norm = norm_words(c);
+            longest = longest.max(norm.len());
+            let words: Vec<&str> = norm.split(' ').filter(|w| !w.is_empty()).collect();
+            // Длинный текст — части не длиннее 16 слов (значения короче), целиком — всегда.
+            for a in 0..words.len() {
+                for b in a + 1..=words.len().min(a + 16) {
+                    let whole = a == 0 && b == words.len();
+                    let g = words[a..b].join(" ");
+                    if whole || g.chars().filter(|c| *c != ' ').count() >= 4 {
+                        let v = grams.entry(g).or_default();
+                        if !v.contains(&(i, whole)) {
+                            v.push((i, whole));
+                        }
+                    }
+                }
+            }
+            if words.len() > 16 {
+                grams.entry(norm.clone()).or_default().push((i, true));
+            }
+        }
+        Suspects { grams, found: vec![None; n], longest }
+    }
+
+    /// Сверяет одно значение; `place` — где оно (записывается при первом совпадении); `partial` — искать и частью
+    /// кандидата.
+    pub fn check(&mut self, value: &str, place: &str, partial: bool) {
+        // Значение длиннее любого кандидата с запасом на знаки препинания — заведомо не его часть.
+        if self.grams.is_empty() || value.len() > self.longest * 2 + 64 {
+            return;
+        }
+        if let Some(hits) = self.grams.get(&norm_words(value)) {
+            for &(i, whole) in hits {
+                if (whole || partial) && self.found[i].is_none() {
+                    self.found[i] = Some(place.to_string());
+                }
+            }
+        }
+    }
+
+    /// Сверяет значение под правилом типа `kind` (`None` — тип неизвестен, только целиком). Кроме всего значения —
+    /// его узнаваемые части, если кандидат — ровно такая часть: фамилия из ФИО (лист «Иванов» при значении
+    /// «Иванов Иван Иванович»), название организации без формы (лист «Ромашка» при «ООО «Ромашка»»).
+    pub fn check_value(&mut self, value: &str, place: &str, kind: Option<Kind>) {
+        self.check(value, place, kind.is_some_and(partial_kind));
+        match kind {
+            Some(Kind::FullName | Kind::LastName) => {
+                for w in value.split_whitespace().filter(|w| w.chars().count() >= 4 && w.starts_with(char::is_uppercase)) {
+                    self.check(w, place, false);
+                }
+            }
+            Some(Kind::Company) => {
+                let core = crate::fake::split_company(value).1;
+                if core.trim() != value.trim() && core.chars().filter(|c| c.is_alphanumeric()).count() >= 4 {
+                    self.check(&core, place, false);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Значения какого типа ищутся и частью текста (`Suspects::check`): люди, номера, организации, адреса.
+pub fn partial_kind(k: Kind) -> bool {
+    matches!(
+        k,
+        Kind::FullName
+            | Kind::LastName
+            | Kind::FirstName
+            | Kind::MiddleName
+            | Kind::Email
+            | Kind::Phone
+            | Kind::Inn
+            | Kind::Snils
+            | Kind::Passport
+            | Kind::Address
+            | Kind::Company
+            | Kind::Account
+    )
+}
+
+/// Что в правилах может оказаться персональными данными, по каждому правилу: имя листа и подпись шаблона,
+/// совпавшие со значением под правилами (`values`: значение, где оно, тип его правила — см. `Suspects::check_value`)
+/// или похожие на данные сами по себе. Строки для журнала — без самих значений (журнал пересылают), только
+/// маской «И*** И***». Имена листов не меняются: правила профиля должны находить свои листы.
+pub fn rule_risks<'a>(rules: &[Rule], values: impl IntoIterator<Item = (&'a str, &'a str, Option<Kind>)>) -> Vec<Vec<String>> {
+    let labels = |r: &Rule| !r.label.trim().is_empty();
+    let mut cands: Vec<&str> = Vec::new();
+    for r in rules {
+        cands.push(r.sheet.as_str());
+        if labels(r) {
+            cands.push(r.label.trim());
+        }
+    }
+    let mut s = Suspects::new(cands.iter().copied());
+    for (v, place, kind) in values {
+        s.check_value(v, place, kind);
+    }
+    let reason = |i: usize, text: &str| -> Option<String> {
+        match (&s.found[i], looks_personal(text)) {
+            (Some(p), _) => Some(format!("совпадает со значением: {p}")),
+            (None, Some(shape)) => Some(shape.to_string()),
+            (None, None) => None,
+        }
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    for r in rules {
+        let mut mine = Vec::new();
+        if let Some(why) = reason(i, &r.sheet) {
+            mine.push(format!(
+                "в профиле имя листа «{}» похоже на данные ({why}) — перед пересылкой профиля переименуйте лист или не пересылайте профиль; в обезличенном файле имя листа тоже остаётся как есть",
+                crate::anon::mask_sample(&r.sheet)
+            ));
+        }
+        i += 1;
+        if labels(r) {
+            let label = r.label.trim();
+            if let Some(why) = reason(i, label) {
+                let m = crate::anon::mask_sample(label);
+                let tail = if r.kind == Kind::Text {
+                    format!("; подпись попадёт и в обезличенный файл («{m} 1», «{m} 2»…) — лучше поменять её")
+                } else {
+                    String::new()
+                };
+                mine.push(format!(
+                    "в профиле подпись шаблона «{m}» (колонка {}) похожа на данные ({why}) — перед пересылкой профиля поменяйте подпись или не пересылайте профиль{tail}",
+                    col_name(r.col)
+                ));
+            }
+            i += 1;
+        }
+        out.push(mine);
+    }
+    out
+}
+
+/// Предупреждения о профиле перед сохранением и пересылкой (см. `rule_risks`), без повторов: одно имя листа
+/// в нескольких правилах — одна строка. Общая проверка окна («Сохранить профиль…», сохранение рядом с файлом)
+/// и обработки (журнал, командная строка).
+pub fn privacy_risks<'a>(profile: &Profile, values: impl IntoIterator<Item = (&'a str, &'a str, Option<Kind>)>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in rule_risks(&profile.rules, values).into_iter().flatten() {
+        if !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn personal_shapes() {
+        for s in ["Иванов Иван Иванович", "Сидорова Анна", "Петров И.И.", "ИВАНОВ ИВАН", "ООО «Ромашка»", "ИП Петров", "7707083893", "ИНН/КПП: 5029290277", "+7 (916) 111-22-33", "ivanov@mail.ru", "Смирнов Козлов"] {
+            assert!(looks_personal(s).is_some(), "{s}");
+        }
+        for s in ["Ответственный", "Покупатель группа", "Отдел Кадров", "Остаток на 01.10.2024", "Выручка 2024-2025", "Период: 2024 г.", "ФИО Сотрудника", "Сумма, руб.", "Лист1", "Должность", "ООО", "Номер Договора", "Продажи по менеджерам"] {
+            assert!(looks_personal(s).is_none(), "{s}");
+        }
+    }
 
     #[test]
     fn salt_not_saved_and_ignored_on_load() {

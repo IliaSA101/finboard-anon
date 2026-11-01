@@ -524,6 +524,9 @@ fn run_batch_inner(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Rep
     }
     // Записи ключа уже есть — считаются только новые: с ключом на 2000 строк и тем же файлом здесь 0.
     log(format!("Новых значений (нет в ключе): {}", faker.entries.len() - key_entries));
+    // Имена листов и подписи шаблонов профиля, похожие на данные: профиль пересылают. В генераторе с ключом —
+    // и значения прогона (они сверяются раньше и называют свою колонку), и записи ключа.
+    let risks = plan_risks(&plans, &rules, &paths, if batch.key_in.is_some() { &faker.entries } else { &[] });
 
     // Папки результатов — до записи: сбой на середине пакета оставил бы часть файлов без ключа.
     for f in &batch.files {
@@ -551,6 +554,11 @@ fn run_batch_inner(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Rep
         let (maps, scan_extra) = build_maps(&faker, &plans, &rules, wb.date1904, batch.settings.inner_search());
         let mut report = write_book(zip, wb, &f.rules, &faker, &maps, &batch.settings, &f.output, &tmps[fi], log)?;
         report.warnings.splice(0..0, plans[fi].warnings.iter().cloned());
+        for w in risks[fi].iter().flatten() {
+            if !report.warnings.contains(w) {
+                report.warnings.push(w.clone());
+            }
+        }
         report.distinct_values = plans[fi].items.len();
         report.rule_heads = plans[fi].rule_heads.clone();
         reports.push(report);
@@ -1524,6 +1532,8 @@ pub fn plan_batch(
         faker.fake(r, original, numeric);
     }
     check_cancel()?;
+    // Названия колонок — до предупреждений, где они называются.
+    guard_heads(&mut plans, rules, &faker);
     kind_conflicts(&mut plans, rules, &faker, files);
     link_overlaps(&mut plans, &faker);
     widened_numbers(&mut plans, &faker);
@@ -1533,6 +1543,92 @@ pub fn plan_batch(
 
 /// Через сколько ячеек при сборе значений и значений при выборе фейков проверяется отмена.
 const CANCEL_EVERY: usize = 1024;
+
+/// Шапка листа — строка, где больше всего текста среди первых строк. Над таблицей бывает строка-карточка
+/// («Иванов Иван Иванович | Менеджер | Отдел продаж»), не попавшая под правила, — тогда «названием колонки»
+/// стало бы ФИО, а оно идёт в журнал (его пересылают), в предупреждения и на карточку правила.
+/// Название убирается (колонка называется буквой), если оно совпадает со значением под любым правилом прогона
+/// (все файлы) или в ключе прошлых запусков — любого типа — либо само похоже на ФИО, номер, email,
+/// организацию (`looks_personal`). Обычные заголовки («Ответственный», «Покупатель группа») остаются.
+fn guard_heads(plans: &mut [FilePlan], rules: &[&[Rule]], faker: &Faker) {
+    let mut at: Vec<(usize, usize)> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    for (fi, p) in plans.iter_mut().enumerate() {
+        for (ri, h) in p.rule_heads.iter_mut().enumerate() {
+            if h.as_deref().is_some_and(|t| crate::profile::looks_personal(t).is_some()) {
+                *h = None;
+            }
+            if let Some(t) = h {
+                at.push((fi, ri));
+                texts.push(t.clone());
+            }
+        }
+    }
+    if at.is_empty() {
+        return;
+    }
+    let mut s = crate::profile::Suspects::new(texts.iter().map(String::as_str));
+    for (p, rs) in plans.iter().zip(rules) {
+        for (ri, v, _) in &p.items {
+            s.check_value(v, "", Some(rs[*ri].kind));
+        }
+    }
+    // В генераторе — и значения прогона, и ключ прошлых запусков.
+    for e in &faker.entries {
+        s.check_value(&e.real, "", parse_kind_key(&e.kind_key).map(|(k, _, _)| k));
+    }
+    for (k, &(fi, ri)) in at.iter().enumerate() {
+        if s.found[k].is_some() {
+            plans[fi].rule_heads[ri] = None;
+        }
+    }
+}
+
+/// Имена листов и подписи шаблонов, похожие на данные (`profile::rule_risks`), по каждому правилу каждого файла.
+/// Сверяются со значениями под правилами всех файлов прогона и с ключом (`key` — его записи, пусто — без ключа).
+fn plan_risks(plans: &[FilePlan], rules: &[&[Rule]], files: &[&Path], key: &[crate::fake::KeyEntry]) -> Vec<Vec<Vec<String>>> {
+    let all: Vec<Rule> = rules.iter().flat_map(|rs| rs.iter().cloned()).collect();
+    let mut flat = risks_against(&all, plans, rules, files, key).into_iter();
+    rules.iter().map(|rs| flat.by_ref().take(rs.len()).collect()).collect()
+}
+
+/// `profile::rule_risks` для правил `check` против значений прогона (`plans`) и ключа.
+fn risks_against(check: &[Rule], plans: &[FilePlan], rules: &[&[Rule]], files: &[&Path], key: &[crate::fake::KeyEntry]) -> Vec<Vec<String>> {
+    let places: Vec<Vec<String>> =
+        rules.iter().zip(files).map(|(rs, f)| rs.iter().map(|r| format!("колонка {}, {}", crate::xlsx::col_name(r.col), file_name(f))).collect()).collect();
+    let values = plans
+        .iter()
+        .zip(rules)
+        .zip(&places)
+        .flat_map(|((p, rs), pl)| p.items.iter().map(move |(ri, v, _)| (v.as_str(), pl[*ri].as_str(), Some(rs[*ri].kind))))
+        .chain(key.iter().map(|e| (e.real.as_str(), "ключ прошлых запусков", parse_kind_key(&e.kind_key).map(|(k, _, _)| k))));
+    crate::profile::rule_risks(check, values)
+}
+
+/// Проверка профиля перед сохранением в окне («Сохранить профиль…»): имена листов и подписи шаблонов,
+/// похожие на данные. Значения — под правилами открытых файлов (`files`, первые `PREVIEW_ROWS` строк листов,
+/// как в предпросмотре) и в ключе. Строки — для журнала, значения в них только маской.
+pub fn profile_risks(profile: &Profile, files: &[(PathBuf, Vec<Rule>)], key_in: Option<&Path>) -> Result<Vec<String>> {
+    let mut plans = Vec::new();
+    for (input, rules) in files {
+        let mut zip = open_zip(input)?;
+        let wb = Workbook::from_zip(&mut zip)?;
+        plans.push(collect(&mut zip, &wb, rules, Some(PREVIEW_ROWS))?);
+    }
+    let key = match key_in {
+        Some(k) => keyfile::read(k)?,
+        None => Vec::new(),
+    };
+    let rules: Vec<&[Rule]> = files.iter().map(|(_, r)| r.as_slice()).collect();
+    let paths: Vec<&Path> = files.iter().map(|(p, _)| p.as_path()).collect();
+    let mut out: Vec<String> = Vec::new();
+    for w in risks_against(&profile.rules, &plans, &rules, &paths, &key).into_iter().flatten() {
+        if !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    Ok(out)
+}
 
 /// Номера, получившие фейк длиннее настоящего: свободных номеров той же длины не хватило (короткие номера,
 /// тысячи значений — все номера этой длины реальные или уже выданы). Совпасть с чужим номером фейку нельзя,
@@ -1731,6 +1827,11 @@ pub struct RulePreview {
     pub samples: Vec<(String, String)>,
     /// Заполненных ячеек ниже конца правила (правило короче таблицы).
     pub below: usize,
+    /// Название колонки из шапки — то же, что в отчёте: без строк-карточек с ФИО и номерами над таблицей.
+    pub head: Option<String>,
+    /// Имя листа или подпись шаблона этого правила похожи на данные (`profile::rule_risks`) — профиль с ними
+    /// пересылать нельзя. Значения в строках только маской.
+    pub risks: Vec<String>,
 }
 
 pub fn preview(input: &Path, profile: &Profile, key_in: Option<&Path>) -> Result<Vec<RulePreview>> {
@@ -1753,22 +1854,28 @@ fn preview_batch_inner(files: &[(PathBuf, Vec<Rule>)], settings: &Settings, key_
     let rules: Vec<&[Rule]> = files.iter().map(|(_, r)| r.as_slice()).collect();
     let paths: Vec<&Path> = files.iter().map(|(p, _)| p.as_path()).collect();
     let (plans, faker, _) = plan_batch(&mut books, &paths, &rules, settings, key_in, Some(PREVIEW_ROWS))?;
+    let risks = plan_risks(&plans, &rules, &paths, if key_in.is_some() { &faker.entries } else { &[] });
     Ok(plans
         .iter()
         .zip(&rules)
-        .map(|(p, rules)| {
+        .zip(risks)
+        .map(|((p, rules), risks)| {
             p.rule_cells
                 .iter()
                 .zip(&p.rule_samples)
                 .zip(rules.iter())
                 .zip(&p.rule_below)
-                .map(|(((&cells, values), rule), &below)| RulePreview {
+                .zip(&p.rule_heads)
+                .zip(risks)
+                .map(|(((((&cells, values), rule), &below), head), risks)| RulePreview {
                     cells,
                     below,
                     samples: values
                         .iter()
                         .filter_map(|v| faker.get(&rule.kind_key(), v).map(|f| (v.clone(), f.to_string())))
                         .collect(),
+                    head: head.clone(),
+                    risks,
                 })
                 .collect()
         })
