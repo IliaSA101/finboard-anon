@@ -18,7 +18,7 @@ use finboard_anon::xlsx::{col_name, load_grid, parse_range, Grid, GridCell, Work
 const GRID_ROWS: u32 = 20_000;
 const GRID_COLS: u32 = 200;
 const ROW_H: f32 = 20.0;
-const HEAD_H: f32 = 22.0;
+const HEAD_H: f32 = 28.0;
 const ROWNUM_W: f32 = 52.0;
 
 /// Профиль рядом с исходным файлом: «<имя>_профиль.json».
@@ -33,6 +33,29 @@ fn file_name(p: &std::path::Path) -> String {
 
 fn is_excel(p: &std::path::Path) -> bool {
     p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("xlsx") || e.eq_ignore_ascii_case("xlsm"))
+}
+
+/// Файлы Excel в папке и её подпапках — по порядку имён. Без результатов прошлых запусков («…_anon»)
+/// и временных файлов открытой книги («~$…»).
+fn excel_files_in(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if is_excel(&p) {
+                let stem = p.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+                if !stem.starts_with("~$") && !stem.ends_with("_anon") && !stem.contains("_anon_") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Текст ячейки для просмотра: числа без хвостов вроде 39.200000000000003.
@@ -75,7 +98,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1500.0, 920.0])
             .with_min_inner_size([1000.0, 600.0])
-            .with_title("Обезличивание Excel")
+            .with_title(format!("Обезличивание Excel {}", env!("CARGO_PKG_VERSION")))
             .with_icon(egui::IconData { rgba: include_bytes!("../assets/icon_256.rgba").to_vec(), width: 256, height: 256 })
             .with_drag_and_drop(true),
         ..Default::default()
@@ -97,6 +120,8 @@ struct Doc {
     cur_sheet: usize,
     /// Правила этого файла (настройки общие — `App::settings`).
     profile: Profile,
+    /// Галочка: файл обрабатывается. Снятая — файл остаётся в списке, но не обезличивается.
+    on: bool,
 }
 
 struct App {
@@ -135,6 +160,9 @@ struct App {
     last_vp: Rect,
     ensure_visible: bool,
     grid_id: Option<egui::Id>,
+    /// Правило под активной ячейкой — подсвечено справа; `scroll_rule` — прокрутить список к нему.
+    focus_rule: Option<usize>,
+    scroll_rule: bool,
 }
 
 impl App {
@@ -147,7 +175,25 @@ impl App {
             }
         }
         cc.egui_ctx.set_fonts(fonts);
-        let mut app = App {
+        let mut app = App::blank();
+        // finboard-anon.exe <файл.xlsx>… [профиль.json] — так же работает «Открыть с помощью».
+        let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
+        if let Some(p) = args.iter().find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"))) {
+            match Profile::load(p) {
+                Ok(pr) => {
+                    app.settings = pr.settings.clone();
+                    app.arg_profile = Some(pr);
+                }
+                Err(e) => app.set_status(format!("{e:#}"), true),
+            }
+        }
+        let files: Vec<PathBuf> = args.into_iter().filter(|p| !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"))).collect();
+        app.open_files(files, false);
+        app
+    }
+
+    fn blank() -> App {
+        App {
             docs: Vec::new(),
             cur: 0,
             settings: Settings::default(),
@@ -174,21 +220,9 @@ impl App {
             last_vp: Rect::NOTHING,
             ensure_visible: false,
             grid_id: None,
-        };
-        // finboard-anon.exe <файл.xlsx>… [профиль.json] — так же работает «Открыть с помощью».
-        let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
-        if let Some(p) = args.iter().find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"))) {
-            match Profile::load(p) {
-                Ok(pr) => {
-                    app.settings = pr.settings.clone();
-                    app.arg_profile = Some(pr);
-                }
-                Err(e) => app.set_status(format!("{e:#}"), true),
-            }
+            focus_rule: None,
+            scroll_rule: false,
         }
-        let files: Vec<PathBuf> = args.into_iter().filter(|p| !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"))).collect();
-        app.open_files(files, false);
-        app
     }
 
     fn set_status(&mut self, s: impl Into<String>, err: bool) {
@@ -256,7 +290,7 @@ impl App {
                 }
                 _ => {}
             }
-            self.docs.push(Doc { path, wb, grids: HashMap::new(), widths: HashMap::new(), cur_sheet: 0, profile });
+            self.docs.push(Doc { path, wb, grids: HashMap::new(), widths: HashMap::new(), cur_sheet: 0, profile, on: true });
             last = Some(self.docs.len() - 1);
         }
         if let Some(i) = last {
@@ -281,6 +315,7 @@ impl App {
         self.sel = None;
         self.cursor = None;
         self.drag_anchor = None;
+        self.focus_rule = None;
         let s = self.docs[i].cur_sheet;
         self.ensure_grid(s);
     }
@@ -358,7 +393,9 @@ impl App {
             self.preview_rules.clear();
             return;
         }
-        let files: Vec<(PathBuf, Vec<Rule>)> = self.docs.iter().map(|d| (d.path.clone(), d.profile.rules.clone())).collect();
+        // Неотмеченный файл — без правил: в обработку он не идёт, значения из него не считаются.
+        let files: Vec<(PathBuf, Vec<Rule>)> =
+            self.docs.iter().map(|d| (d.path.clone(), if d.on { d.profile.rules.clone() } else { Vec::new() })).collect();
         let rules: Vec<Vec<Rule>> = files.iter().map(|(_, r)| r.clone()).collect();
         let (settings, key) = (self.settings.clone(), self.key_in.clone());
         let (tx, rx) = channel();
@@ -443,15 +480,15 @@ impl App {
     }
 
     fn start_job(&mut self, ctx: &egui::Context) {
-        if self.docs.is_empty() {
+        let inputs: Vec<PathBuf> = self.docs.iter().filter(|d| d.on).map(|d| d.path.clone()).collect();
+        if inputs.is_empty() {
             return;
         }
-        let empty: Vec<String> = self.docs.iter().filter(|d| d.profile.rules.is_empty()).map(|d| file_name(&d.path)).collect();
+        let empty: Vec<String> = self.docs.iter().filter(|d| d.on && d.profile.rules.is_empty()).map(|d| file_name(&d.path)).collect();
         if !empty.is_empty() {
-            self.set_status(format!("Нет правил в файлах: {} — добавьте правила или уберите файлы из списка", empty.join(", ")), true);
+            self.set_status(format!("Нет правил в файлах: {} — добавьте правила или снимите с них галочку", empty.join(", ")), true);
             return;
         }
-        let inputs: Vec<PathBuf> = self.docs.iter().map(|d| d.path.clone()).collect();
         let outputs = if inputs.len() == 1 {
             let default = default_output_path(&inputs[0]);
             let mut dlg = rfd::FileDialog::new().add_filter("Excel", &["xlsx", "xlsm"]);
@@ -473,9 +510,9 @@ impl App {
         };
         self.log.clear();
         let profiles: Vec<Profile> =
-            self.docs.iter().map(|d| Profile { rules: d.profile.rules.clone(), settings: self.settings.clone() }).collect();
+            self.docs.iter().filter(|d| d.on).map(|d| Profile { rules: d.profile.rules.clone(), settings: self.settings.clone() }).collect();
         if self.save_profile {
-            for (d, p) in self.docs.iter().zip(&profiles) {
+            for (d, p) in self.docs.iter().filter(|d| d.on).zip(&profiles) {
                 let side = side_profile_path(&d.path);
                 match p.save(&side) {
                     Ok(()) => self.log.push(format!("Профиль сохранён рядом с файлом: {}", side.display())),
@@ -522,6 +559,20 @@ impl App {
             {
                 if let Some(p) = rfd::FileDialog::new().add_filter("Excel", &["xlsx", "xlsm"]).pick_files() {
                     self.open_files(p, false);
+                }
+            }
+            if ui
+                .button("Добавить папку…")
+                .on_hover_text("Все файлы Excel из папки и её подпапок (кроме уже обезличенных «…_anon»). Лишние — снять галочку или убрать из списка")
+                .clicked()
+            {
+                if let Some(dir) = rfd::FileDialog::new().set_title("Папка с файлами Excel").pick_folder() {
+                    let files = excel_files_in(&dir);
+                    if files.is_empty() {
+                        self.set_status(format!("В папке {} нет файлов Excel", dir.display()), true);
+                    } else {
+                        self.open_files(files, false);
+                    }
                 }
             }
             ui.separator();
@@ -580,19 +631,31 @@ impl App {
             .default_height(180.0)
             .height_range(70.0..=max_files)
             .show_inside(ui, |ui| {
-                ui.heading(format!("Файлы ({})", self.docs.len()));
-                if self.docs.len() > 1 {
-                    ui.label(RichText::new("Один человек, организация, ИНН — один фейк во всех файлах набора").small().weak());
-                }
+                let on = self.docs.iter().filter(|d| d.on).count();
+                ui.horizontal(|ui| {
+                    ui.heading(format!("Файлы ({on} из {})", self.docs.len()));
+                    if self.docs.len() > 1 {
+                        let mut all = on == self.docs.len();
+                        if ui.checkbox(&mut all, "все").on_hover_text("Отметить или снять все файлы").changed() {
+                            self.docs.iter_mut().for_each(|d| d.on = all);
+                            self.preview_dirty = true;
+                        }
+                    }
+                });
+                ui.label(RichText::new("Галочка — файл обрабатывается. Один человек, организация, ИНН — один фейк во всех отмеченных файлах").small().weak());
                 egui::ScrollArea::vertical().id_salt("files").auto_shrink([false, false]).show(ui, |ui| {
-                    for (i, d) in self.docs.iter().enumerate() {
+                    for (i, d) in self.docs.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
-                            if ui.small_button("✕").on_hover_text("Убрать файл из набора (сам файл не удаляется)").clicked() {
-                                close = Some(i);
+                            if ui.checkbox(&mut d.on, "").on_hover_text("Обрабатывать этот файл").changed() {
+                                self.preview_dirty = true;
                             }
                             let label = format!("{}  [{}]", file_name(&d.path), d.profile.rules.len());
-                            if ui.selectable_label(self.cur == i, label).on_hover_text(d.path.display().to_string()).clicked() {
+                            let text = if d.on { RichText::new(label) } else { RichText::new(label).weak().strikethrough() };
+                            if ui.selectable_label(self.cur == i, text).on_hover_text(d.path.display().to_string()).clicked() {
                                 pick = Some(i);
+                            }
+                            if ui.small_button("убрать").on_hover_text("Убрать файл из списка (сам файл не удаляется)").clicked() {
+                                close = Some(i);
                             }
                         });
                     }
@@ -622,6 +685,7 @@ impl App {
             self.docs[self.cur].cur_sheet = i;
             self.sel = None;
             self.cursor = None;
+            self.focus_rule = None;
             self.ensure_grid(i);
         }
         ui.separator();
@@ -646,7 +710,7 @@ impl App {
         // Строка добавления правила
         ui.horizontal(|ui| {
             ui.label("Диапазон:");
-            ui.add(egui::TextEdit::singleline(&mut self.range_text).desired_width(110.0).hint_text("C5:C120"))
+            ui.add(egui::TextEdit::singleline(&mut self.range_text).id(egui::Id::new("range_text")).desired_width(110.0).hint_text("C5:C120"))
                 .on_hover_text("Например C5:C120, C5:C (до конца листа), B5:D100 (несколько колонок).\nМожно выделить мышью: протянуть по ячейкам, или щелчок — начало, Shift+щелчок — конец; щелчок по букве колонки — вся колонка.\nЕсли диапазон пересекается с правилом — правило заменяется новым");
             ui.checkbox(&mut self.new_to_end, "до конца листа");
             egui::ComboBox::from_id_salt("new_kind")
@@ -721,16 +785,25 @@ impl App {
         let rule_fill = Color32::from_rgba_unmultiplied(70, 130, 255, 60);
         let sel_fill = Color32::from_rgba_unmultiplied(255, 165, 0, 120);
         let line = Stroke::new(1.0_f32, visuals.widgets.noninteractive.bg_stroke.color.gamma_multiply(0.5));
-        let border = Stroke::new(1.0_f32, visuals.widgets.noninteractive.bg_stroke.color);
         let font = FontId::proportional(13.0);
+        let head_font = FontId::proportional(16.0);
+        let (head_fill, head_text, cur_fill) = if visuals.dark_mode {
+            (Color32::from_rgb(40, 62, 98), Color32::WHITE, Color32::from_rgb(200, 120, 0))
+        } else {
+            (Color32::from_rgb(200, 216, 242), Color32::BLACK, Color32::from_rgb(255, 190, 90))
+        };
+        let head_line = Stroke::new(1.0_f32, head_text.gamma_multiply(0.35));
         let shift = ui.input(|i| i.modifiers.shift);
+        let (old, old_cursor) = (self.sel, self.cursor);
         let press_origin = ui.input(|i| i.pointer.press_origin());
 
         // Клавиатура как в Excel: стрелки, Shift — выделение вверх-вниз, Ctrl — к краю данных,
-        // PageUp/PageDown, Home, Ctrl+Home/End. Не мешаем вводу в полях.
-        let grid_focused = self.grid_id.is_some_and(|id| ui.memory(|m| m.has_focus(id)));
-        let free = ui.memory(|m| m.focused().is_none());
-        if (grid_focused || free) && !ui.ctx().wants_keyboard_input() && ncols > 0 && nrows > 0 {
+        // PageUp/PageDown, Home, Ctrl+Home/End. Не мешаем вводу в полях и открытым спискам.
+        // (`wants_keyboard_input` не годится: он истинен при любом фокусе, в том числе у самой таблицы.)
+        let focused = ui.memory(|m| m.focused());
+        let typing = focused.is_some_and(|f| Some(f) != self.grid_id && egui::TextEdit::load_state(ui.ctx(), f).is_some());
+        let popup = ui.memory(|m| m.any_popup_open());
+        if !typing && !popup && ncols > 0 && nrows > 0 {
             let keys: Vec<(egui::Key, egui::Modifiers)> = ui.input(|i| {
                 i.events
                     .iter()
@@ -781,6 +854,10 @@ impl App {
                     }
                 }
                 self.ensure_visible = true;
+                // Стрелки дальше достаются таблице, а не переводят фокус между кнопками.
+                if let Some(id) = self.grid_id {
+                    ui.memory_mut(|m| m.request_focus(id));
+                }
             }
         }
         let sel = self.sel;
@@ -874,33 +951,42 @@ impl App {
                 painter.hline(vis.x_range(), y + ROW_H, line);
             }
 
-            // Закреплённая строка с буквами колонок.
-            painter.rect_filled(Rect::from_min_size(vis.min, vec2(vis.width(), HEAD_H)), 0.0, visuals.extreme_bg_color);
+            // Закреплённая строка с буквами колонок: своя заливка и крупные буквы — колонку видно сразу.
+            painter.rect_filled(Rect::from_min_size(vis.min, vec2(vis.width(), HEAD_H)), 0.0, head_fill);
             for c in c0..c1 {
                 let col = c as u32;
                 let cr = Rect::from_min_size(pos2(o.x + ROWNUM_W + xs[c], vis.min.y), vec2(widths[c], HEAD_H));
-                if sel.is_some_and(|(sc, _, _)| sc == col) {
+                if cursor.is_some_and(|(cc, _)| cc == col) {
+                    painter.rect_filled(cr, 0.0, cur_fill);
+                } else if sel.is_some_and(|(sc, _, _)| sc == col) {
                     painter.rect_filled(cr, 0.0, sel_fill);
                 }
-                painter.text(cr.center(), Align2::CENTER_CENTER, col_name(col), font.clone(), visuals.strong_text_color());
-                painter.vline(cr.max.x, cr.y_range(), line);
+                painter.text(cr.center(), Align2::CENTER_CENTER, col_name(col), head_font.clone(), head_text);
+                painter.vline(cr.max.x, cr.y_range(), head_line);
             }
-            painter.hline(vis.x_range(), vis.min.y + HEAD_H, border);
+            painter.hline(vis.x_range(), vis.min.y + HEAD_H, head_line);
 
             // Закреплённая колонка с номерами строк.
             let nums = Rect::from_min_size(pos2(vis.min.x, vis.min.y + HEAD_H), vec2(ROWNUM_W, (vis.height() - HEAD_H).max(0.0)));
-            painter.rect_filled(nums, 0.0, visuals.extreme_bg_color);
+            painter.rect_filled(nums, 0.0, head_fill);
             let np = painter.with_clip_rect(nums);
             for ri in r0..r1 {
                 let row = ri + 1;
                 let rr = Rect::from_min_size(pos2(vis.min.x, o.y + HEAD_H + ri as f32 * ROW_H), vec2(ROWNUM_W, ROW_H));
-                if sel.is_some_and(|(_, a, b)| row >= a && row <= b) {
+                if cursor.is_some_and(|(_, cr)| cr == row) {
+                    np.rect_filled(rr, 0.0, cur_fill);
+                } else if sel.is_some_and(|(_, a, b)| row >= a && row <= b) {
                     np.rect_filled(rr, 0.0, sel_fill);
                 }
-                np.text(pos2(rr.max.x - 6.0, rr.center().y), Align2::RIGHT_CENTER, row.to_string(), font.clone(), visuals.weak_text_color());
+                np.text(pos2(rr.max.x - 6.0, rr.center().y), Align2::RIGHT_CENTER, row.to_string(), font.clone(), head_text);
             }
-            painter.vline(vis.min.x + ROWNUM_W, vis.y_range(), border);
-            painter.rect_filled(Rect::from_min_size(vis.min, vec2(ROWNUM_W, HEAD_H)), 0.0, visuals.extreme_bg_color);
+            painter.vline(vis.min.x + ROWNUM_W, vis.y_range(), head_line);
+            // Угол — адрес активной ячейки, как поле имени в Excel.
+            let corner = Rect::from_min_size(vis.min, vec2(ROWNUM_W, HEAD_H));
+            painter.rect_filled(corner, 0.0, head_fill);
+            if let Some((c, r)) = cursor {
+                painter.with_clip_rect(corner).text(corner.center(), Align2::CENTER_CENTER, format!("{}{r}", col_name(c)), FontId::proportional(12.0), head_text);
+            }
 
             let hit = |p: egui::Pos2| -> Hit {
                 if !vis.contains(p) || p.x < vis.min.x + ROWNUM_W {
@@ -949,7 +1035,7 @@ impl App {
                             tip.push_str(&format!(": {}", cell_display(cell)));
                         }
                         if let Some(x) = rules.iter().find(|x| x.covers(r, c)) {
-                            tip.push_str(&format!("\nПравило {} — {}", x.range_text(), x.kind.title()));
+                            tip.push_str(&format!("\nПравило {} — {} (щелчок — правило справа)", x.range_text(), x.kind.title()));
                         }
                         tip.push_str("\nДвойной щелчок — колонка отсюда до конца листа");
                         resp.on_hover_text_at_pointer(tip);
@@ -964,7 +1050,6 @@ impl App {
 
         self.last_vp = seen_vp;
         self.grid_id = grid_id;
-        let old = self.sel;
         // Колонка целиком (щелчок по букве) или двойной щелчок по ячейке — от неё (по шапке — от строки
         // под шапкой) до конца листа: в настоящем файле строк больше, чем видно.
         let whole = match (clicked, double) {
@@ -1007,6 +1092,11 @@ impl App {
                 self.range_text = format!("{0}{1}:{0}{2}", col_name(c), a, b);
             }
         }
+        // Ячейка под правилом — правило справа подсвечивается и прокручивается в вид: его можно сразу править.
+        if self.cursor != old_cursor {
+            self.focus_rule = self.cursor.and_then(|(c, r)| self.docs[self.cur].profile.rules.iter().position(|x| x.sheet == sheet && x.covers(r, c)));
+            self.scroll_rule = self.focus_rule.is_some();
+        }
     }
 
     fn rules_panel(&mut self, ui: &mut egui::Ui) {
@@ -1037,6 +1127,8 @@ impl App {
         let no_preview = Vec::new();
         let preview = self.preview.get(self.cur).unwrap_or(&no_preview);
         let mut take = None;
+        let focus = self.focus_rule;
+        let scroll = std::mem::take(&mut self.scroll_rule);
         // Правило, которому нужно подобрать подпись шаблона (сменили тип или диапазон).
         let mut refill = None;
         let doc = &mut self.docs[self.cur];
@@ -1047,7 +1139,11 @@ impl App {
             for (i, r) in doc.profile.rules.iter_mut().enumerate() {
                 // Предпросмотр, посчитанный для этого же правила (правку ещё считают — не показываем старое).
                 let pv = preview.get(i).filter(|_| preview_rules.and_then(|v| v.get(i)) == Some(&*r));
-                egui::Frame::group(ui.style()).show(ui, |ui| {
+                let mut frame = egui::Frame::group(ui.style());
+                if focus == Some(i) {
+                    frame = frame.stroke(Stroke::new(2.0_f32, Color32::from_rgb(255, 165, 0)));
+                }
+                let shown = frame.show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.strong(format!("{}!{}", r.sheet, r.range_text()));
@@ -1137,10 +1233,14 @@ impl App {
                     }
                     ui.label(RichText::new(format!("Пример: {}", r.kind.hint())).small().weak().italics());
                 });
+                if scroll && focus == Some(i) {
+                    shown.response.scroll_to_me(Some(egui::Align::Center));
+                }
             }
         });
         if let Some(i) = remove {
             doc.profile.rules.remove(i);
+            self.focus_rule = None;
             changed = true;
         }
         if let (Some(i), Some((sheet, (c, a, b)))) = (take, cur_sel) {
@@ -1166,6 +1266,8 @@ impl App {
                 self.drag_anchor = Some((r.col, r.row_from));
                 self.scroll_to = Some((r.row_from, r.col));
                 self.range_text = r.range_text().replace('…', "");
+                self.cursor = Some((r.col, r.row_from));
+                self.focus_rule = Some(i);
             }
         }
         if let Some(i) = refill {
@@ -1242,8 +1344,13 @@ impl App {
         });
         ui.horizontal(|ui| {
             let running = self.job.is_some();
-            let can = !self.docs.is_empty() && !running;
-            let label = if self.docs.len() > 1 { format!("Обезличить все файлы ({})…", self.docs.len()) } else { "Обезличить и сохранить…".into() };
+            let on = self.docs.iter().filter(|d| d.on).count();
+            let can = on > 0 && !running;
+            let label = match (self.docs.len(), on) {
+                (n, k) if n > 1 && k == n => format!("Обезличить все файлы ({n})…"),
+                (n, k) if n > 1 => format!("Обезличить отмеченные файлы ({k} из {n})…"),
+                _ => "Обезличить и сохранить…".into(),
+            };
             if ui.add_enabled(can, egui::Button::new(RichText::new(label).strong().size(16.0))).clicked() {
                 self.start_job(ui.ctx());
             }
@@ -1266,8 +1373,21 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui(ctx);
+    }
+}
+
+impl App {
+    /// Кадр окна — без eframe, чтобы тесты гоняли его на настоящих событиях мыши и клавиатуры.
+    fn ui(&mut self, ctx: &egui::Context) {
         self.poll_job();
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).filter(|p| is_excel(p)).collect());
+        // Перетащенная папка — все файлы Excel из неё.
+        let dropped: Vec<PathBuf> = ctx
+            .input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect::<Vec<_>>())
+            .into_iter()
+            .flat_map(|p| if p.is_dir() { excel_files_in(&p) } else { vec![p] })
+            .filter(|p| is_excel(p))
+            .collect();
         if !dropped.is_empty() {
             self.open_files(dropped, false);
         }
@@ -1282,5 +1402,195 @@ impl eframe::App for App {
         if self.preview_dirty && self.preview_job.is_none() && !ctx.input(|i| i.pointer.any_down()) {
             self.start_preview(ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Event, Key, Modifiers, PointerButton};
+
+    /// Окно без экрана: кадры с событиями мыши и клавиатуры, как от пользователя.
+    struct Screen {
+        ctx: egui::Context,
+        t: f64,
+    }
+
+    impl Screen {
+        fn new() -> Screen {
+            Screen { ctx: egui::Context::default(), t: 0.0 }
+        }
+
+        fn frame(&mut self, app: &mut App, events: Vec<Event>) {
+            self.t += 0.05;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1500.0, 920.0))),
+                time: Some(self.t),
+                events,
+                ..Default::default()
+            };
+            let _ = self.ctx.run(input, |ctx| app.ui(ctx));
+        }
+
+        fn click(&mut self, app: &mut App, p: egui::Pos2) {
+            let button = |pressed| Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+            self.frame(app, vec![Event::PointerMoved(p)]);
+            self.frame(app, vec![button(true)]);
+            self.frame(app, vec![button(false)]);
+            // Пауза больше двойного щелчка: следующий щелчок — новый.
+            self.t += 1.0;
+            self.frame(app, vec![]);
+        }
+
+        fn key(&mut self, app: &mut App, key: Key, modifiers: Modifiers) {
+            let ev = |pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
+            self.frame(app, vec![ev(true)]);
+            self.frame(app, vec![ev(false)]);
+            self.frame(app, vec![]);
+        }
+
+        /// Середина ячейки на экране — по прямоугольнику таблицы в прошлом кадре.
+        fn cell(&self, app: &App, c: u32, r: u32) -> egui::Pos2 {
+            let rect = self.ctx.read_response(app.grid_id.expect("таблица не нарисована")).unwrap().rect;
+            let d = &app.docs[app.cur];
+            let w = &d.widths[&d.cur_sheet];
+            let x: f32 = w[..c as usize].iter().sum();
+            rect.min + vec2(ROWNUM_W + x + w[c as usize] / 2.0, HEAD_H + (r - 1) as f32 * ROW_H + ROW_H / 2.0)
+        }
+    }
+
+    fn sample() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples").join("demo_dashboard.xlsx")
+    }
+
+    fn sample_app() -> (App, Screen) {
+        let mut app = App::blank();
+        app.open_files(vec![sample()], true);
+        assert_eq!(app.docs.len(), 1, "{}", app.status);
+        let mut s = Screen::new();
+        s.frame(&mut app, vec![]);
+        s.frame(&mut app, vec![]);
+        (app, s)
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("fb_main_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Стрелки после щелчка по ячейке двигали курсор только изредка: фокус таблицы сам же их и отключал.
+    /// Каждое нажатие — подряд, в отдельных кадрах, как у человека.
+    #[test]
+    fn arrows_move_cursor_after_click() {
+        let (mut app, mut s) = sample_app();
+        let p = s.cell(&app, 1, 3);
+        s.click(&mut app, p);
+        assert_eq!(app.cursor, Some((1, 3)), "щелчок ставит курсор");
+        for (key, want) in [
+            (Key::ArrowRight, (2, 3)),
+            (Key::ArrowRight, (3, 3)),
+            (Key::ArrowDown, (3, 4)),
+            (Key::ArrowDown, (3, 5)),
+            (Key::ArrowLeft, (2, 5)),
+            (Key::ArrowUp, (2, 4)),
+            (Key::ArrowLeft, (1, 4)),
+            (Key::ArrowLeft, (0, 4)),
+            (Key::ArrowLeft, (0, 4)),
+            (Key::ArrowUp, (0, 3)),
+        ] {
+            s.key(&mut app, key, Modifiers::NONE);
+            assert_eq!(app.cursor, Some(want), "{key:?}");
+        }
+        assert_eq!(app.sel, Some((0, 3, 3)), "выделение идёт за курсором");
+        s.key(&mut app, Key::ArrowDown, Modifiers::SHIFT);
+        s.key(&mut app, Key::ArrowDown, Modifiers::SHIFT);
+        assert_eq!(app.sel, Some((0, 3, 5)), "Shift+стрелка расширяет выделение");
+        assert_eq!(app.range_text, "A3:A5");
+        s.key(&mut app, Key::Home, Modifiers::COMMAND);
+        assert_eq!(app.cursor, Some((0, 1)));
+    }
+
+    /// Пока печатают диапазон в поле, стрелки двигают текстовый курсор, а не таблицу.
+    #[test]
+    fn arrows_leave_text_field_alone() {
+        let (mut app, mut s) = sample_app();
+        let p = s.cell(&app, 2, 2);
+        s.click(&mut app, p);
+        s.ctx.memory_mut(|m| m.request_focus(egui::Id::new("range_text")));
+        s.frame(&mut app, vec![]);
+        s.key(&mut app, Key::ArrowRight, Modifiers::NONE);
+        s.key(&mut app, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(app.cursor, Some((2, 2)));
+        // Вписанный руками диапазон не затирается выделением в таблице.
+        app.range_text = "C5:C120".into();
+        s.frame(&mut app, vec![]);
+        assert_eq!(app.range_text, "C5:C120");
+        // Открытый выпадающий список (тип правила) — стрелки выбирают в нём.
+        let p = s.cell(&app, 2, 2);
+        s.click(&mut app, p);
+        s.ctx.memory_mut(|m| m.open_popup(egui::Id::new("new_kind")));
+        s.key(&mut app, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(app.cursor, Some((2, 2)), "стрелка ушла в таблицу при открытом списке");
+        s.ctx.memory_mut(|m| m.close_popup());
+        // Снова щелчок по таблице — стрелки опять её.
+        let p = s.cell(&app, 2, 2);
+        s.click(&mut app, p);
+        s.key(&mut app, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(app.cursor, Some((2, 3)));
+    }
+
+    /// Ячейка под правилом — правило справа подсвечено (его номер в списке); вне правил — подсветки нет.
+    #[test]
+    fn cell_under_rule_points_to_rule() {
+        let (mut app, mut s) = sample_app();
+        let sheet = app.sheet_name(0);
+        app.docs[0].profile.rules.push(Rule::new(&sheet, 0, 2, Some(3), Kind::FullName));
+        app.docs[0].profile.rules.push(Rule::new(&sheet, 1, 2, None, Kind::FullName));
+        s.frame(&mut app, vec![]);
+        let p = s.cell(&app, 1, 4);
+        s.click(&mut app, p);
+        assert_eq!(app.focus_rule, Some(1));
+        s.key(&mut app, Key::ArrowLeft, Modifiers::NONE);
+        assert_eq!(app.focus_rule, None, "A4 ниже правила A2:A3");
+        s.key(&mut app, Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(app.focus_rule, Some(0));
+        s.key(&mut app, Key::ArrowRight, Modifiers::NONE);
+        s.key(&mut app, Key::ArrowRight, Modifiers::NONE);
+        assert_eq!(app.focus_rule, None);
+    }
+
+    /// Папка: файлы Excel из всех подпапок; результаты прошлых запусков и временные файлы Excel — нет.
+    #[test]
+    fn folder_lists_excel_files_recursively() {
+        let d = temp_dir("folder");
+        std::fs::create_dir_all(d.join("2024").join("март")).unwrap();
+        for f in ["Продажи.xlsx", "Продажи_anon.xlsx", "~$Продажи.xlsx", "Отчёт.XLSM", "заметки.txt", "2024/Затраты.xlsx", "2024/март/ДДС.xlsx", "2024/ДДС_anon_2.xlsx"] {
+            std::fs::write(d.join(f), b"x").unwrap();
+        }
+        let names: Vec<String> = excel_files_in(&d).iter().map(|p| p.strip_prefix(&d).unwrap().to_string_lossy().replace('\\', "/")).collect();
+        assert_eq!(names, ["2024/Затраты.xlsx", "2024/март/ДДС.xlsx", "Отчёт.XLSM", "Продажи.xlsx"]);
+    }
+
+    /// Файл без галочки не обрабатывается и в предпросмотр не даёт значений.
+    #[test]
+    fn unchecked_file_is_left_out() {
+        let d = temp_dir("checked");
+        let (a, b) = (d.join("a.xlsx"), d.join("b.xlsx"));
+        std::fs::copy(sample(), &a).unwrap();
+        std::fs::copy(sample(), &b).unwrap();
+        let mut app = App::blank();
+        app.open_files(vec![a, b], true);
+        let sheet = app.sheet_name(0);
+        for doc in &mut app.docs {
+            doc.profile.rules.push(Rule::new(&sheet, 0, 2, None, Kind::FullName));
+        }
+        app.docs[1].on = false;
+        app.start_preview(&egui::Context::default());
+        let (rules, res) = app.preview_job.take().unwrap().recv().unwrap();
+        assert_eq!(rules[0].len(), 1);
+        assert!(rules[1].is_empty(), "неотмеченный файл — без правил");
+        assert!(res.is_ok(), "{res:?}");
     }
 }

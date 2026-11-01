@@ -1,13 +1,46 @@
-"""Собирает assets/icon.o (COFF-объект с секцией .rsrc) из assets/icon.ico.
+"""Собирает assets/icon.o (COFF-объект с секцией .rsrc): иконка из assets/icon.ico и версия из Cargo.toml
+(«Свойства → Подробно» у exe).
 
-Так иконка попадает в .exe без windres/rc: build.rs передаёт icon.o линковщику.
-Запуск после замены иконки:  python tools/icon_to_coff.py
+Так ресурсы попадают в .exe без windres/rc: build.rs передаёт icon.o линковщику.
+Запуск после замены иконки или смены версии (tools/release.ps1 запускает сам):  python tools/icon_to_coff.py
 """
+import re
 import struct
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-RT_ICON, RT_GROUP_ICON, LANG = 3, 14, 0x0409
+RT_ICON, RT_GROUP_ICON, RT_VERSION, LANG = 3, 14, 16, 0x0409
+
+
+def cargo_version():
+    toml = (ROOT / 'Cargo.toml').read_text(encoding='utf-8')
+    return re.search(r'^version\s*=\s*"([^"]+)"', toml, re.M).group(1)
+
+
+def ver_node(key, value=b'', wtype=1, children=(), value_len=None):
+    """Узел VS_VERSIONINFO: длина, длина значения, тип, ключ UTF-16, выравнивание по 4, значение, дети."""
+    def pad(b):
+        return b + b'\0' * (-len(b) % 4)
+    body = pad(struct.pack('<HHH', 0, 0, wtype) + (key + '\0').encode('utf-16-le'))
+    if value:
+        body = pad(body + value)
+    for c in children:
+        body = pad(body) + c
+    vlen = value_len if value_len is not None else len(value)
+    return struct.pack('<HH', len(body), vlen) + body[4:]
+
+
+def version_info(version):
+    nums = [int(x) for x in re.findall(r'\d+', version)[:4]] + [0] * 4
+    ms, ls = nums[0] << 16 | nums[1], nums[2] << 16 | nums[3]
+    fixed = struct.pack('<13I', 0xFEEF04BD, 0x00010000, ms, ls, ms, ls, 0x3F, 0, 0x40004, 1, 0, 0, 0)
+    strings = [('CompanyName', 'finboard-anon'), ('FileDescription', 'Обезличивание Excel'), ('FileVersion', version),
+               ('InternalName', 'finboard-anon'), ('LegalCopyright', 'GPL-3.0-only'), ('ProductName', 'finboard-anon'),
+               ('ProductVersion', version)]
+    table = ver_node('041904B0', children=[ver_node(k, (v + '\0').encode('utf-16-le'), 1, value_len=len(v) + 1) for k, v in strings])
+    sfi = ver_node('StringFileInfo', children=[table])
+    vfi = ver_node('VarFileInfo', children=[ver_node('Translation', struct.pack('<HH', 0x0419, 1200), 0)])
+    return ver_node('VS_VERSION_INFO', fixed, 0, [sfi, vfi])
 
 
 def read_ico(path):
@@ -20,13 +53,14 @@ def read_ico(path):
     return out
 
 
-def build(images):
+def build(images, version):
     group = struct.pack('<HHH', 0, 1, len(images))
     for i, (w, h, cc, planes, bits, data) in enumerate(images, start=1):
         group += struct.pack('<BBBBHHIH', w, h, cc, 0, planes, bits, len(data), i)
     # тип -> [(id, данные)], типы и id по возрастанию
     tree = [(RT_ICON, [(i, img[5]) for i, img in enumerate(images, start=1)]),
-            (RT_GROUP_ICON, [(1, group)])]
+            (RT_GROUP_ICON, [(1, group)]),
+            (RT_VERSION, [(1, version_info(version))])]
 
     def dir_size(n):
         return 16 + 8 * n
@@ -89,6 +123,7 @@ def build(images):
 
 
 if __name__ == '__main__':
-    obj = build(read_ico(ROOT / 'assets' / 'icon.ico'))
+    version = cargo_version()
+    obj = build(read_ico(ROOT / 'assets' / 'icon.ico'), version)
     (ROOT / 'assets' / 'icon.o').write_bytes(obj)
-    print(f'assets/icon.o: {len(obj)} байт')
+    print(f'assets/icon.o: {len(obj)} байт, версия {version}')
