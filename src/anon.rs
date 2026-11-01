@@ -53,6 +53,9 @@ pub struct Report {
     pub parts_changed: usize,
     pub warnings: Vec<String>,
     pub leaks: Vec<Leak>,
+    /// Двоичные части, которые программа не обезличивала и не проверяла (модель данных, запросы Power Query,
+    /// внедрённые объекты, макросы, рисунки): проверка результата о них ничего сказать не может.
+    pub unchecked: Vec<String>,
 }
 
 /// Общий ключ папки: все файлы одной папки получают одни и те же фейки для одних и тех же людей,
@@ -136,15 +139,24 @@ impl Report {
         for w in &self.warnings {
             l.push(format!("Внимание: {w}"));
         }
-        if self.leaks.is_empty() {
+        if self.leaks.is_empty() && self.unchecked.is_empty() {
             // Ищутся значения размеченных колонок всех файлов прогона и ключа прошлых запусков — в результате.
             l.push("Проверка обезличенного файла: реальных значений из размеченных колонок в нём не найдено.".into());
+        } else if self.leaks.is_empty() {
+            // Двоичные части не проверены — «не найдено» было бы обещанием, которого проверка не даёт.
+            l.push(
+                "Проверка обезличенного файла: в листах и XML-частях реальных значений из размеченных колонок не найдено; двоичные части (см. «Внимание» выше) не проверялись."
+                    .into(),
+            );
         } else {
             l.push("Проверка обезличенного файла: в нём ещё встречаются реальные значения:".into());
             for k in &self.leaks {
                 l.push(format!("  {} — {} вхожд., например: {}", k.part, k.count, k.samples.join(" | ")));
             }
             l.push("  Обычно это текст формул, заголовки, имена листов или колонки, не попавшие в правила.".into());
+            if !self.unchecked.is_empty() {
+                l.push("  Двоичные части (см. «Внимание» выше) не проверялись.".into());
+            }
         }
         l
     }
@@ -666,6 +678,15 @@ fn write_book(
         }
     }
     let mut stats = Stats { rule_cells: vec![0; rules.len()], ..Default::default() };
+    // Миниатюра первого листа (docProps/thumbnail.*) — картинка с реальными данными: в результат не попадает,
+    // ссылки на неё убираются из связей и типов частей.
+    let names: Vec<String> = zip.file_names().map(String::from).collect();
+    let dropped = thumbnail_parts(zip, &names)?;
+    if !dropped.is_empty() {
+        log("Миниатюра первого листа (docProps/thumbnail) удалена".into());
+    }
+    let mut mashup: Vec<String> = Vec::new();
+    let mut printer_unknown: Vec<String> = Vec::new();
     let tmp = output.with_extension("tmp");
     // При ошибке или сбое на любом шаге недописанный результат удаляется (после переименования его уже нет).
     let _tmp_guard = RemoveOnDrop(&tmp);
@@ -676,6 +697,9 @@ fn write_book(
         let empty: Vec<(usize, &Rule)> = Vec::new();
         for i in 0..zip.len() {
             let name = zip.by_index_raw(i)?.name().to_string();
+            if dropped.contains(&name.to_lowercase()) {
+                continue;
+            }
             let is_xml = name.ends_with(".xml") || name.ends_with(".rels");
             let sheet_rels = name.starts_with("xl/worksheets/_rels/") && name.ends_with(".rels");
             let other_rels = name.contains("/_rels/") || name.starts_with("_rels/");
@@ -701,7 +725,18 @@ fn write_book(
                 }
                 continue;
             }
-            let new: Option<Vec<u8>> = if !is_xml || (other_rels && !sheet_rels) {
+            let printer = !is_xml && name.to_lowercase().starts_with("xl/printersettings/");
+            let new: Option<Vec<u8>> = if printer && settings.clean_metadata {
+                let mut data = Vec::new();
+                zip.by_index(i)?.read_to_end(&mut data)?;
+                match clean_devmode(&data) {
+                    Some(r) => (r != data).then_some(r),
+                    None => {
+                        printer_unknown.push(name.clone());
+                        None
+                    }
+                }
+            } else if !is_xml || (other_rels && !sheet_rels) {
                 None
             } else {
                 let mut data = Vec::new();
@@ -710,6 +745,10 @@ fn write_book(
                 let utf16 = utf16_bom(&data);
                 if let Some(be) = utf16 {
                     data = decode_utf16(&data[2..], be).with_context(|| format!("{name}: неверный UTF-16"))?.into_bytes();
+                }
+                // Запросы Power Query лежат в customXml сжатым архивом в base64 — внутрь программа не заглядывает.
+                if name.starts_with("customXml/") && data.windows(10).any(|w| w == b"DataMashup") {
+                    mashup.push(name.clone());
                 }
                 let res = if sheet_rels {
                     rewrite_hyperlink_rels(&data, maps, &mut stats)?
@@ -763,6 +802,19 @@ fn write_book(
                     (r, _) => r,
                 }
             };
+            let new = if !dropped.is_empty() && (name == "_rels/.rels" || name == "[Content_Types].xml") {
+                let cur = match &new {
+                    Some(b) => b.clone(),
+                    None => {
+                        let mut d = Vec::new();
+                        zip.by_index(i)?.read_to_end(&mut d)?;
+                        d
+                    }
+                };
+                String::from_utf8(cur).ok().and_then(|t| drop_part_refs(&t, &dropped)).map(String::into_bytes).or(new)
+            } else {
+                new
+            };
             // Пути профиля пользователя в служебных частях: связи (гиперссылки, внешние книги), книга,
             // подключения, свойства файла (база гиперссылок). Тексты ячеек, примечаний и кэшей — данные,
             // их меняют только правила.
@@ -803,8 +855,197 @@ fn write_book(
     report.formula_text_replaced = stats.formula_text;
     report.formula_cache_cleared = stats.formula_cleared;
     report.other_replaced = stats.other;
+    let (warnings, unchecked) = binary_part_warnings(&names, &dropped, &mashup, &printer_unknown);
+    report.warnings.extend(warnings);
+    report.unchecked = unchecked;
 
     Ok(report)
+}
+
+/// Миниатюра книги: части docProps/thumbnail.* и то, на что указывает связь «metadata/thumbnail».
+/// Пути — строчными: имена частей в xlsx не различают регистр.
+fn thumbnail_parts(zip: &mut Zip, names: &[String]) -> Result<HashSet<String>> {
+    let mut out: HashSet<String> =
+        names.iter().map(|n| n.to_lowercase()).filter(|n| n.starts_with("docprops/thumbnail")).collect();
+    if names.iter().any(|n| n == "_rels/.rels") {
+        let mut rels = String::new();
+        zip.by_name("_rels/.rels")?.read_to_string(&mut rels).ok();
+        for tag in xml_tags(&rels) {
+            if tag_local(tag) == "Relationship" && tag_attr(tag, "Type").is_some_and(|t| t.ends_with("/metadata/thumbnail")) {
+                if let Some(t) = tag_attr(tag, "Target") {
+                    out.insert(t.trim_start_matches('/').to_lowercase());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Открывающие и пустые теги XML по порядку, как есть в тексте.
+fn xml_tags(xml: &str) -> impl Iterator<Item = &str> {
+    let mut rest = xml;
+    std::iter::from_fn(move || {
+        let p = rest.find('<')?;
+        let e = rest[p..].find('>')? + p + 1;
+        let tag = &rest[p..e];
+        rest = &rest[e..];
+        Some(tag)
+    })
+}
+
+/// Имя тега без пространства имён: «<x:Override …/>» → «Override».
+fn tag_local(tag: &str) -> &str {
+    let name = tag.trim_start_matches('<').split(|c: char| c.is_whitespace() || c == '/' || c == '>').next().unwrap_or("");
+    name.rsplit(':').next().unwrap_or(name)
+}
+
+/// Значение атрибута в тексте тега (в кавычках любого вида).
+fn tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(p) = tag[from..].find(name) {
+        let s = from + p;
+        from = s + name.len();
+        if !tag[..s].ends_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
+        let Some(v) = tag[from..].trim_start().strip_prefix('=') else { continue };
+        let v = v.trim_start();
+        let q = v.chars().next()?;
+        if q != '"' && q != '\'' {
+            return None;
+        }
+        return v[1..].find(q).map(|e| &v[1..1 + e]);
+    }
+    None
+}
+
+/// Убирает из связей (_rels/.rels) и типов частей ([Content_Types].xml) ссылки на удалённые части —
+/// иначе Excel предложит «восстановить» книгу.
+fn drop_part_refs(xml: &str, dropped: &HashSet<String>) -> Option<String> {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    let mut changed = false;
+    while let Some(p) = rest.find('<') {
+        out.push_str(&rest[..p]);
+        rest = &rest[p..];
+        let Some(e) = rest.find('>').map(|e| e + 1) else { break };
+        let tag = &rest[..e];
+        let target = match tag_local(tag) {
+            "Relationship" if tag_attr(tag, "TargetMode") != Some("External") => tag_attr(tag, "Target"),
+            "Override" => tag_attr(tag, "PartName"),
+            _ => None,
+        };
+        rest = &rest[e..];
+        if target.is_some_and(|t| dropped.contains(&t.trim_start_matches('/').to_lowercase())) {
+            changed = true;
+            // Непустая форма: <Relationship …></Relationship>.
+            if !tag.ends_with("/>") && rest.starts_with("</") {
+                if let Some(c) = rest.find('>') {
+                    rest = &rest[c + 1..];
+                }
+            }
+            continue;
+        }
+        out.push_str(tag);
+    }
+    out.push_str(rest);
+    changed.then_some(out)
+}
+
+/// Настройки принтера (структура DEVMODE Windows): в начале — имя принтера, часто с именем сервера печати
+/// («\\BUH-SRV\HP 2 этаж»), в хвосте — данные драйвера, где бывает что угодно, вплоть до имени пользователя.
+/// Имя стирается, данные драйвера отрезаются; размер бумаги, ориентация и прочее остаются.
+/// None — формат не узнан (не Windows или повреждён).
+fn clean_devmode(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 72 {
+        return None;
+    }
+    let word = |i: usize| u16::from_le_bytes([data[i], data[i + 1]]) as usize;
+    let (spec, size, extra) = (word(64), word(68), word(70));
+    if !(0x0300..=0x04ff).contains(&spec) || size < 72 || size + extra != data.len() {
+        return None;
+    }
+    let mut out = data[..size].to_vec();
+    out[..64].fill(0);
+    out[70..72].fill(0);
+    Some(out)
+}
+
+/// Предупреждения о частях, которые программа не обезличивает и не проверяет, — по одному на вид, с тем,
+/// что сделать перед пересылкой. Второе — сами эти части (проверка результата о них молчит).
+fn binary_part_warnings(names: &[String], dropped: &HashSet<String>, mashup: &[String], printer_unknown: &[String]) -> (Vec<String>, Vec<String>) {
+    let (mut model, mut embed, mut vba, mut media, mut other) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for n in names {
+        let low = n.to_lowercase();
+        if n.ends_with('/') || dropped.contains(&low) {
+            continue;
+        }
+        let list = if low.starts_with("xl/model/") {
+            &mut model
+        } else if low.starts_with("xl/embeddings/") {
+            &mut embed
+        } else if low.starts_with("xl/vbaproject") {
+            &mut vba
+        } else if low.starts_with("xl/media/") {
+            &mut media
+        } else if low.starts_with("xl/printersettings/") || [".xml", ".rels", ".vml"].iter().any(|x| low.ends_with(x)) {
+            continue;
+        } else {
+            &mut other
+        };
+        list.push(n.clone());
+    }
+    let few = |v: &[String]| {
+        let mut s = v.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+        if v.len() > 3 {
+            s.push_str(&format!(" и ещё {}", v.len() - 3));
+        }
+        s
+    };
+    let mut w = Vec::new();
+    if !model.is_empty() {
+        w.push(format!(
+            "в книге есть модель данных Power Pivot ({}) — там может лежать полная копия исходных таблиц; программа её не обезличивает и не проверяет. Перед пересылкой удалите таблицы модели в Excel (Данные → Управление моделью данных) или не пересылайте файл",
+            few(&model)
+        ));
+    }
+    if !mashup.is_empty() {
+        w.push(format!(
+            "в книге есть запросы Power Query ({}, блок DataMashup) — в них бывают пути к папкам, имена серверов и введённые вручную таблицы с реальными данными; программа их не обезличивает и не проверяет. Перед пересылкой удалите запросы в Excel (Данные → Запросы и подключения) или не пересылайте файл",
+            few(mashup)
+        ));
+    }
+    if !embed.is_empty() {
+        w.push(format!(
+            "в книге есть внедрённые объекты — другие книги, документы ({} шт.: {}); программа их не обезличивает и не проверяет. Перед пересылкой удалите их с листов или не пересылайте файл",
+            embed.len(),
+            few(&embed)
+        ));
+    }
+    if !vba.is_empty() {
+        w.push(format!(
+            "в книге есть макросы ({}) — в их коде и формах бывают имена, пути и данные; программа их не обезличивает и не проверяет. Перед пересылкой сохраните книгу в Excel как «Книга Excel (*.xlsx)» — макросы не сохранятся — или проверьте код вручную (Alt+F11)",
+            few(&vba)
+        ));
+    }
+    if !media.is_empty() {
+        w.push(format!(
+            "в книге есть рисунки ({} шт.: {}) — на снимках и сканах могут быть реальные данные; программа их не обезличивает и не проверяет. Просмотрите рисунки на листах и удалите лишние перед пересылкой",
+            media.len(),
+            few(&media)
+        ));
+    }
+    if !printer_unknown.is_empty() {
+        w.push(format!(
+            "настройки принтера в незнакомом формате ({}) скопированы как есть — там может быть имя принтера и сервера печати; программа их не проверяет",
+            few(printer_unknown)
+        ));
+    }
+    if !other.is_empty() {
+        w.push(format!("в книге есть другие двоичные части ({}) — программа их не обезличивает и не проверяет", few(&other)));
+    }
+    let unchecked = [model, mashup.to_vec(), embed, vba, media, printer_unknown.to_vec(), other].concat();
+    (w, unchecked)
 }
 
 /// День, от которого Excel считает даты: 30.12.1899, в книгах «1904» — 01.01.1904.

@@ -146,6 +146,35 @@ pub fn write_xlsx(path: &Path, book: &Book) {
     z.finish().unwrap();
 }
 
+/// Пересобирает готовую книгу: `edit` правит текстовые части по имени (вернул None — часть без изменений),
+/// `add` — новые части любого содержимого (двоичные: модель данных, макросы, рисунки).
+pub fn repack(path: &Path, edit: &dyn Fn(&str, &str) -> Option<String>, add: &[(&str, Vec<u8>)]) {
+    use std::io::Read;
+    let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+    {
+        let mut z = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        for i in 0..z.len() {
+            let mut f = z.by_index(i).unwrap();
+            let mut data = Vec::new();
+            f.read_to_end(&mut data).unwrap();
+            let name = f.name().to_string();
+            let data = match std::str::from_utf8(&data).ok().and_then(|t| edit(&name, t)) {
+                Some(t) => t.into_bytes(),
+                None => data,
+            };
+            parts.push((name, data));
+        }
+    }
+    parts.extend(add.iter().map(|(n, d)| (n.to_string(), d.clone())));
+    let mut z = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let o = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, data) in parts {
+        z.start_file(name, o).unwrap();
+        z.write_all(&data).unwrap();
+    }
+    z.finish().unwrap();
+}
+
 /// Все листы книги в виде сеток (значения так, как их видит программа).
 pub fn read_book(path: &Path) -> HashMap<String, Grid> {
     let wb = Workbook::open(path).unwrap();
