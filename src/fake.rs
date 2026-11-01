@@ -5,13 +5,16 @@
 //! * ID выдаётся по нормализованному значению: «+7 916 123-45-67» и «89161234567» — один ID;
 //! * части ФИО заменяются через общие словари: фамилия «Иванов» в колонке «Фамилия»
 //!   и в полном ФИО превратится в одну и ту же фейковую фамилию, с учётом пола;
-//! * «Иванов И.И.» привязывается к «Иванов Иван Иванович», если такой человек в данных один.
+//! * «Иванов И.И.» привязывается к «Иванов Иван Иванович», если такой человек в данных один;
+//! * у правил с разной «Связью» свои словари «реальное → фейк» и своя соль: одно значение в колонках
+//!   разных связей получает разные фейки. Счётчики ID и «занятые» фейки общие — двум разным значениям
+//!   один фейк не достанется и в разных связях.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::names::*;
-use crate::profile::{parse_kind_key, Kind, Rule, Settings};
+use crate::profile::{parse_kind_key, split_link, Kind, Rule, Settings};
 
 // ---------------------------------------------------------------- RNG
 
@@ -630,9 +633,96 @@ pub struct Faker {
     taken: HashSet<String>,
     people: HashMap<(String, char, char), HashSet<String>>,
     full_by_norm: HashMap<String, String>,
+    /// Связь, чьи словари сейчас в полях выше (пусто — общая).
+    group: String,
+    /// Словари остальных связей, пока работа идёт с другой.
+    groups: HashMap<String, GroupMaps>,
+    /// Непустые связи по порядку: сначала в порядке правил, затем встреченные только в ключе.
+    link_order: Vec<String>,
+    /// Соль запуска; у непустой связи к ней добавляется «@связь».
+    base_salt: String,
+}
+
+/// Словари «реальное → фейк» (и «реальное → ID») одной связи. У каждой связи свои: этим связи и
+/// разделены. Всё, что не перечислено здесь (счётчики ID, занятые фейки, строки книги), — общее.
+#[derive(Default)]
+struct GroupMaps {
+    ids: HashMap<String, HashMap<String, u32>>,
+    surname: HashMap<String, String>,
+    first: [HashMap<String, String>; 2],
+    patr: HashMap<String, usize>,
+    company: HashMap<String, String>,
+    company_text: HashMap<String, (String, Option<u32>)>,
+    digits: HashMap<String, String>,
+    phones: HashMap<String, String>,
+    emails: HashMap<String, String>,
+    addresses: HashMap<String, String>,
+    date_shift: HashMap<i64, i64>,
 }
 
 impl Faker {
+    /// Меняет местами словари текущей связи и `m`.
+    fn swap_group_maps(&mut self, m: &mut GroupMaps) {
+        std::mem::swap(&mut self.ids, &mut m.ids);
+        std::mem::swap(&mut self.surname, &mut m.surname);
+        std::mem::swap(&mut self.first, &mut m.first);
+        std::mem::swap(&mut self.patr, &mut m.patr);
+        std::mem::swap(&mut self.company, &mut m.company);
+        std::mem::swap(&mut self.company_text, &mut m.company_text);
+        std::mem::swap(&mut self.digits, &mut m.digits);
+        std::mem::swap(&mut self.phones, &mut m.phones);
+        std::mem::swap(&mut self.emails, &mut m.emails);
+        std::mem::swap(&mut self.addresses, &mut m.addresses);
+        std::mem::swap(&mut self.date_shift, &mut m.date_shift);
+    }
+
+    /// Переключает генератор на словари и соль связи `g`. Общая связь («») — ровно прежнее поведение:
+    /// соль та же, что до 0.5.0, поэтому профили без связей дают те же фейки.
+    fn enter_group(&mut self, g: &str) {
+        if self.group == g {
+            return;
+        }
+        let mut cur = GroupMaps::default();
+        self.swap_group_maps(&mut cur);
+        self.groups.insert(std::mem::take(&mut self.group), cur);
+        let mut next = self.groups.remove(g).unwrap_or_default();
+        self.swap_group_maps(&mut next);
+        self.group = g.to_string();
+        if !g.is_empty() && !self.link_order.iter().any(|x| x == g) {
+            self.link_order.push(g.to_string());
+        }
+        self.s.salt = if g.is_empty() { self.base_salt.clone() } else { format!("{}@{g}", self.base_salt) };
+    }
+
+    /// Порядок связей для мест вне разметки: непустые связи в порядке правил (до загрузки ключа и фейков).
+    /// Общая связь всегда первая и сюда не входит.
+    pub fn set_link_order<'a>(&mut self, links: impl IntoIterator<Item = &'a str>) {
+        for l in links {
+            if !l.is_empty() && !self.link_order.iter().any(|x| x == l) {
+                self.link_order.push(l.to_string());
+            }
+        }
+    }
+
+    /// Один и тот же словарь всех связей: общая первой, затем по `link_order`. Вне разметки значение,
+    /// размеченное в нескольких связях, получает фейк первой из них (вызывающий берёт первое вхождение).
+    fn in_link_order<'a, T>(&'a self, current: &'a T, stored: impl Fn(&'a GroupMaps) -> &'a T) -> Vec<&'a T> {
+        std::iter::once("")
+            .chain(self.link_order.iter().map(String::as_str))
+            .filter_map(|g| if g == self.group { Some(current) } else { self.groups.get(g).map(&stored) })
+            .collect()
+    }
+
+    /// Владелец фейкового ФИО без ID: исходное значение и связь — тот же человек в другой связи
+    /// не может «узнать» свой фейк.
+    fn person_owner(&self, norm: &str) -> String {
+        if self.group.is_empty() {
+            norm.to_string()
+        } else {
+            format!("{norm}@{}", self.group)
+        }
+    }
+
     pub fn new(settings: &Settings) -> Faker {
         Faker {
             s: settings.clone(),
@@ -661,6 +751,10 @@ impl Faker {
             taken: HashSet::new(),
             people: HashMap::new(),
             full_by_norm: HashMap::new(),
+            group: String::new(),
+            groups: HashMap::new(),
+            link_order: Vec::new(),
+            base_salt: settings.salt.clone(),
         }
     }
 
@@ -674,8 +768,11 @@ impl Faker {
     }
 
     /// Организации: название как в данных → фейковое название (без формы) и ID.
+    /// Все связи по порядку (общая первой): одно название может встретиться несколько раз — первое главное.
     pub fn company_names(&self) -> impl Iterator<Item = (&str, &str, Option<u32>)> {
-        self.company_text.iter().map(|(a, (b, id))| (a.as_str(), b.as_str(), *id))
+        self.in_link_order(&self.company_text, |g| &g.company_text)
+            .into_iter()
+            .flat_map(|m| m.iter().map(|(a, (b, id))| (a.as_str(), b.as_str(), *id)))
     }
 
     /// Что ставится до и после фейка при добавлении ID: для «{fake} (ID {id})» — ("", " (ID 3)").
@@ -695,14 +792,14 @@ impl Faker {
             .or_else(|| self.known_fakes.get(original).map(String::as_str))
     }
 
-    /// Цифры номеров (ИНН, СНИЛС, паспорт, счёт): реальные → фейковые.
+    /// Цифры номеров (ИНН, СНИЛС, паспорт, счёт): реальные → фейковые. Все связи, общая первой.
     pub fn digit_pairs(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.digits.iter().map(|(a, b)| (a.as_str(), b.as_str()))
+        self.in_link_order(&self.digits, |g| &g.digits).into_iter().flat_map(|m| m.iter().map(|(a, b)| (a.as_str(), b.as_str())))
     }
 
-    /// Телефоны: 10 цифр номера, реальные → фейковые.
+    /// Телефоны: 10 цифр номера, реальные → фейковые. Все связи, общая первой.
     pub fn phone_pairs(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.phones.iter().map(|(a, b)| (a.as_str(), b.as_str()))
+        self.in_link_order(&self.phones, |g| &g.phones).into_iter().flat_map(|m| m.iter().map(|(a, b)| (a.as_str(), b.as_str())))
     }
 
     /// Запоминает полные ФИО, чтобы потом связать с ними сокращённые («Иванов И.И.»).
@@ -731,6 +828,7 @@ impl Faker {
         if self.known_fakes.contains(original) {
             return original.to_string();
         }
+        self.enter_group(&rule.link_name());
         self.last_id = None;
         let w = rule.with_id_effective();
         let out = match rule.kind {
@@ -973,7 +1071,8 @@ impl Faker {
             let n = norm_text(f);
             n != id_norm && me.taken.contains(&n)
         };
-        while self.used_person.get(&fake).is_some_and(|owner| *owner != id_norm) || taken(&fake, self) {
+        let me = self.person_owner(&id_norm);
+        while self.used_person.get(&fake).is_some_and(|owner| *owner != me) || taken(&fake, self) {
             k += 1;
             let mut alt = out.clone();
             if let Some(i) = patr_pos {
@@ -988,7 +1087,7 @@ impl Faker {
                 fake = format!("{} {k}", out.join(" "));
             }
         }
-        self.used_person.insert(fake.clone(), id_norm);
+        self.used_person.insert(fake.clone(), me);
         fake
     }
 
@@ -1001,9 +1100,10 @@ impl Faker {
                 let id = self.id_for("person", norm);
                 return self.with_id(&fake, id);
             }
-            let clash = self.used_person.get(&fake).is_some_and(|o| o != norm) || self.taken.contains(&norm_text(&fake));
+            let me = self.person_owner(norm);
+            let clash = self.used_person.get(&fake).is_some_and(|o| *o != me) || self.taken.contains(&norm_text(&fake));
             if !clash || attempt > 1000 {
-                self.used_person.insert(fake.clone(), norm.to_string());
+                self.used_person.insert(fake.clone(), me);
                 return fake;
             }
             attempt += 1;
@@ -1361,6 +1461,19 @@ impl Faker {
                 if o == 0 {
                     o = 7;
                 }
+                // Та же дата в другой связи сдвинута на столько же — фейк выдал бы, что даты равны.
+                // Сдвигов всего 360, совпадение было бы нередким: берём следующий свободный.
+                if let Some(d) = day {
+                    for _ in 0..361 {
+                        if o != 0 && !self.groups.values().any(|g| g.date_shift.get(&d) == Some(&o)) {
+                            break;
+                        }
+                        o = if o >= 180 { -180 } else { o + 1 };
+                    }
+                    if o == 0 {
+                        o = 7;
+                    }
+                }
                 if let Some(d) = day {
                     self.date_shift.insert(d, o);
                 }
@@ -1410,6 +1523,9 @@ impl Faker {
             if self.cache.contains_key(&key) {
                 continue;
             }
+            // Запись со связью («ФИО@контрагент») восстанавливает словари только этой связи.
+            let link = split_link(&e.kind_key).1.to_string();
+            self.enter_group(&link);
             if let Some((kind, _, label)) = parse_kind_key(&e.kind_key) {
                 let number = matches!(kind, Kind::Inn | Kind::Snils | Kind::Passport | Kind::Account);
                 let short = number && short_code(&digits_of(&e.real));
@@ -1443,7 +1559,7 @@ impl Faker {
                         // «Иванов И.И.» в новом файле привяжется к полному ФИО из ключа.
                         self.prepare_people(std::iter::once(e.real.as_str()));
                         if e.id.is_none() {
-                            self.used_person.insert(e.fake.clone(), norm_text(strip_id_suffix(&e.real)));
+                            self.used_person.insert(e.fake.clone(), self.person_owner(&norm_text(strip_id_suffix(&e.real))));
                         }
                     }
                     Kind::Company => {
@@ -1456,7 +1572,7 @@ impl Faker {
                                 self.company_text.entry(rn.trim().to_string()).or_insert_with(|| (fname.clone(), None));
                             }
                             if e.id.is_none() {
-                                self.used_person.insert(fname.clone(), norm_text(&rn));
+                                self.used_person.insert(fname.clone(), self.person_owner(&norm_text(&rn)));
                             }
                         } else if !fp.is_empty() || !fname.is_empty() {
                             self.used_company.insert(norm_text(&fname));
@@ -1516,6 +1632,7 @@ impl Faker {
             self.entries.push(e);
             self.cache.insert(key, self.entries.len() - 1);
         }
+        self.enter_group("");
     }
 
     fn register_token(&mut self, role: Role, real: &str, fake: &str, female: bool) {

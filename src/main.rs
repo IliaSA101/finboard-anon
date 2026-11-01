@@ -13,7 +13,7 @@ use finboard_anon::anon::{
     RulePreview,
 };
 use finboard_anon::detect;
-use finboard_anon::profile::{Kind, Outside, Profile, Rule, Settings};
+use finboard_anon::profile::{link_name, Kind, Outside, Profile, Rule, Settings};
 use finboard_anon::xlsx::{col_name, load_grid, parse_range, Grid, GridCell, Progress, Workbook};
 
 /// Сколько строк листа загружать для просмотра — столько же читает и предпросмотр правил.
@@ -117,6 +117,9 @@ fn stage_of(line: &str) -> Option<&'static str> {
         .find(|(p, _)| line.starts_with(p))
         .map(|(_, s)| s)
 }
+
+/// Подсказка к полю «Связь:» на карточке правила.
+const LINK_HINT: &str = "Оставьте пустым — одно значение везде получает один фейк. Впишите слово (например, «контрагент») — у колонок с этим словом свои фейки, не связанные с остальными.";
 
 /// Надпись на полосе хода: «37 % — Файл 2 из 10: Продажи.xlsx — запись · осталось ≈ 1 мин 20 с».
 /// Остаток — по доле и прошедшему времени, пока доля мала (до 3 %) — не оценивается.
@@ -1253,6 +1256,11 @@ impl App {
         let scroll = std::mem::take(&mut self.scroll_rule);
         // Правило, которому нужно подобрать подпись шаблона (сменили тип или диапазон).
         let mut refill = None;
+        // Уже вписанные связи всех файлов — чтобы выбрать, а не набирать заново (и без опечаток).
+        let mut used_links: Vec<String> =
+            self.docs.iter().flat_map(|d| d.profile.rules.iter()).map(|r| r.link.trim().to_string()).filter(|l| !link_name(l).is_empty()).collect();
+        used_links.sort_by_key(|l| link_name(l));
+        used_links.dedup_by_key(|l| link_name(l));
         let doc = &mut self.docs[self.cur];
         egui::ScrollArea::vertical().id_salt(("rules", self.cur)).auto_shrink([false, false]).show(ui, |ui| {
             if doc.profile.rules.is_empty() {
@@ -1301,7 +1309,8 @@ impl App {
                             }
                         });
                     });
-                    ui.horizontal(|ui| {
+                    // С переносом: в узкой панели «Связь:» уходит на следующую строку, а не за край.
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Строки с");
                         changed |= ui.add(egui::DragValue::new(&mut r.row_from).range(1..=1_048_576)).changed();
                         ui.label("по");
@@ -1320,6 +1329,29 @@ impl App {
                             if let Some(c) = finboard_anon::xlsx::parse_col(col.trim()) {
                                 r.col = c;
                                 changed = true;
+                            }
+                        }
+                        // «Очистить» и «Не менять» фейков не дают — связь им не нужна.
+                        if !matches!(r.kind, Kind::Clear | Kind::Keep) {
+                            ui.label("Связь:").on_hover_text(LINK_HINT);
+                            changed |= ui
+                                .add(egui::TextEdit::singleline(&mut r.link).id(egui::Id::new(("link", i))).desired_width(80.0).hint_text("общая"))
+                                .on_hover_text(LINK_HINT)
+                                .changed();
+                            let others: Vec<&String> = used_links.iter().filter(|l| link_name(l) != r.link_name()).collect();
+                            if !others.is_empty() || !r.link.trim().is_empty() {
+                                egui::ComboBox::from_id_salt(("link_pick", i)).selected_text("").width(14.0).show_ui(ui, |ui| {
+                                    if !r.link.trim().is_empty() && ui.selectable_label(false, "общая (пусто)").clicked() {
+                                        r.link.clear();
+                                        changed = true;
+                                    }
+                                    for l in others {
+                                        if ui.selectable_label(false, l.as_str()).clicked() {
+                                            r.link = l.clone();
+                                            changed = true;
+                                        }
+                                    }
+                                });
                             }
                         }
                     });
@@ -1921,5 +1953,28 @@ mod tests {
         assert!(app.status_err);
         assert!(app.status.contains("(причина: сломалось)"), "{}", app.status);
         assert_eq!(app.log.iter().filter(|l| l.contains("сбой обработки")).count(), 1, "{:?}", app.log);
+    }
+
+    /// «Связь:» на карточке правила: напечатанное слово попадает в правило, а с ним — в ключ типа.
+    /// У «Очистить» поля нет: фейков у этого типа нет, связь ему ни к чему.
+    #[test]
+    fn typing_link_updates_rule() {
+        let (mut app, mut s) = sample_app();
+        let sheet = app.sheet_name(0);
+        app.docs[0].profile.rules.push(Rule::new(&sheet, 1, 2, None, Kind::Address));
+        app.docs[0].profile.rules.push(Rule::new(&sheet, 2, 2, None, Kind::Clear));
+        s.frame(&mut app, vec![]);
+        let field = egui::Id::new(("link", 0usize));
+        let rect = s.ctx.read_response(field).expect("поля «Связь:» нет на карточке").rect;
+        assert!(rect.max.x <= 1500.0 && rect.min.x > 0.0, "поле «Связь:» за краем окна: {rect:?}");
+        assert!(s.ctx.read_response(egui::Id::new(("link", 1usize))).is_none(), "у «Очистить» поле связи не нужно");
+        s.ctx.memory_mut(|m| m.request_focus(field));
+        s.frame(&mut app, vec![]);
+        s.frame(&mut app, vec![Event::Text("Контрагент".into())]);
+        s.frame(&mut app, vec![]);
+        let r = &app.docs[0].profile.rules[0];
+        assert_eq!(r.link, "Контрагент");
+        assert_eq!(r.kind_key(), "Адрес+ID@контрагент");
+        assert_eq!(app.docs[0].profile.rules[1].link, "", "печать ушла не в то правило");
     }
 }

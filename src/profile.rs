@@ -152,6 +152,35 @@ pub struct Rule {
     /// Подпись для типа «Шаблон».
     #[serde(default)]
     pub label: String,
+    /// «Связь»: слово, которое отделяет колонку от остальных. Пусто — общая связь (как до 0.5.0):
+    /// одно значение одного типа везде получает один фейк. У колонок со словом «контрагент» —
+    /// свои фейки: «Москва» в них и «Москва» в колонках без слова получат разные фейки,
+    /// а между собой (на любых листах и в любых файлах) — один.
+    /// В профиль пишется, только если заполнено: старые программы и старые профили его не видят.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub link: String,
+}
+
+/// Имя связи, как оно идёт в ключ и в генератор фейков: без лишних пробелов, строчными
+/// («Контрагент» и «контрагент » — одна связь), без «@», «[», «]» — они разделяют части ключа типа.
+pub fn link_name(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !matches!(c, '@' | '[' | ']') && !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_lowercase()
+}
+
+/// Ключ типа без связи и связь: «ФИО+ID@контрагент» → («ФИО+ID», «контрагент»); без «@» — связь пустая.
+/// «@» внутри подписи шаблона («Текст + ID[a@b]») связью не считается: после связи нет «]».
+pub fn split_link(key: &str) -> (&str, &str) {
+    match key.rsplit_once('@') {
+        Some((head, link)) if !head.is_empty() && !link.contains(']') => (head, link),
+        _ => (key, ""),
+    }
 }
 
 impl Rule {
@@ -164,7 +193,13 @@ impl Rule {
             kind,
             with_id: kind.default_with_id(),
             label: String::new(),
+            link: String::new(),
         }
+    }
+
+    /// Связь правила в виде для ключа и генератора (см. `link_name`); пусто — общая.
+    pub fn link_name(&self) -> String {
+        link_name(&self.link)
     }
 
     pub fn covers(&self, row: u32, col: u32) -> bool {
@@ -201,7 +236,8 @@ impl Rule {
     }
 
     /// Ключ типа замены: одно и то же значение под одним ключом всегда даёт один фейк.
-    /// Пишется в колонку «Тип» файла-ключа.
+    /// Пишется в колонку «Тип» файла-ключа. Связь — в конце через «@» и только непустая:
+    /// ключи без связи те же, что до 0.5.0.
     pub fn kind_key(&self) -> String {
         let mut s = self.kind.key_name().to_string();
         if self.kind.id_optional() && self.with_id {
@@ -210,12 +246,18 @@ impl Rule {
         if self.kind == Kind::Text {
             s.push_str(&format!("[{}]", self.label_or_default()));
         }
+        let link = self.link_name();
+        if !link.is_empty() {
+            s.push('@');
+            s.push_str(&link);
+        }
         s
     }
 }
 
-/// Разбирает ключ типа обратно: (тип, с ID, подпись).
+/// Разбирает ключ типа обратно: (тип, с ID, подпись). Связь отбрасывается — её даёт `split_link`.
 pub fn parse_kind_key(key: &str) -> Option<(Kind, bool, String)> {
+    let key = split_link(key).0;
     let (head, label) = match key.find('[') {
         Some(i) if key.ends_with(']') => (&key[..i], key[i + 1..key.len() - 1].to_string()),
         _ => (key, String::new()),

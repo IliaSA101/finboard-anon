@@ -15,7 +15,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use crate::fake::Faker;
-use crate::profile::{parse_kind_key, Kind, Outside, Profile, Rule, Settings};
+use crate::profile::{parse_kind_key, split_link, Kind, Outside, Profile, Rule, Settings};
 use crate::xlsx::{attr, open_zip, parse_range, part_reader, pivot_caches, resolve_value, scan_cells_where, PivotCache, Workbook, Zip};
 use crate::keyfile;
 
@@ -127,7 +127,8 @@ impl Report {
                 Some(h) => format!("колонка «{h}», "),
                 None => String::new(),
             };
-            l.push(format!("  {}!{} — {col}правило «{}»: {what} ячеек {}", r.sheet, r.range_text(), r.kind.title(), n));
+            let link = if r.link_name().is_empty() { String::new() } else { format!(", связь «{}»", r.link.trim()) };
+            l.push(format!("  {}!{} — {col}правило «{}»{link}: {what} ячеек {}", r.sheet, r.range_text(), r.kind.title(), n));
         }
         l.push(format!(
             "Уникальных значений: {}; общих строк: {}; формул (текст/кэш/очищено кэшей): {}/{}/{}; прочих мест (сводные, диаграммы, примечания): {}",
@@ -578,21 +579,31 @@ fn build_maps(faker: &Faker, plans: &[FilePlan], rules: &[&[Rule]], date1904: bo
             scan_extra.push(a);
         }
     };
-    for (fi, p) in plans.iter().enumerate() {
-        for (ri, original, numeric) in &p.items {
-            let rule = &rules[fi][*ri];
-            let out = faker.get(&rule.kind_key(), original).unwrap_or_default().to_string();
-            maps.strings.entry(original.clone()).or_insert_with(|| out.clone());
-            if *numeric {
-                maps.numbers.entry(original.clone()).or_insert_with(|| out.clone());
-                // Сводные таблицы хранят даты как «1982-02-16T00:00:00».
-                if rule.kind == Kind::BirthDate {
-                    add_date(&mut maps, original, &out);
-                }
+    // Значение, размеченное в нескольких связях, вне разметки получает один фейк: общей связи,
+    // а если в общей его нет — связи первого по порядку правила (первая запись побеждает).
+    // Без связей порядок прежний: сортировка устойчивая.
+    let rank = link_ranks(rules);
+    let link_rank = |l: &str| rank.get(l).copied().unwrap_or(usize::MAX);
+    let mut items: Vec<(usize, &(usize, String, bool))> = plans.iter().enumerate().flat_map(|(fi, p)| p.items.iter().map(move |it| (fi, it))).collect();
+    if rank.len() > 1 {
+        let rule_rank: Vec<Vec<usize>> = rules.iter().map(|rs| rs.iter().map(|r| link_rank(&r.link_name())).collect()).collect();
+        items.sort_by_key(|(fi, it)| rule_rank[*fi][it.0]);
+    }
+    let mut entries: Vec<&crate::fake::KeyEntry> = faker.entries.iter().collect();
+    entries.sort_by_key(|e| link_rank(split_link(&e.kind_key).1));
+    for (fi, (ri, original, numeric)) in items {
+        let rule = &rules[fi][*ri];
+        let out = faker.get(&rule.kind_key(), original).unwrap_or_default().to_string();
+        maps.strings.entry(original.clone()).or_insert_with(|| out.clone());
+        if *numeric {
+            maps.numbers.entry(original.clone()).or_insert_with(|| out.clone());
+            // Сводные таблицы хранят даты как «1982-02-16T00:00:00».
+            if rule.kind == Kind::BirthDate {
+                add_date(&mut maps, original, &out);
             }
         }
     }
-    for e in &faker.entries {
+    for e in entries {
         maps.strings.entry(e.real.clone()).or_insert_with(|| e.fake.clone());
         if is_plain_number(&e.real) && is_plain_number(&e.fake) {
             maps.numbers.entry(e.real.clone()).or_insert_with(|| e.fake.clone());
@@ -620,8 +631,11 @@ fn build_maps(faker: &Faker, plans: &[FilePlan], rules: &[&[Rule]], date1904: bo
         .filter(|(k, _, _)| !maps.strings.contains_key(k))
         .collect();
     maps.extra_inner.extend(variants);
+    // Связи по порядку (общая первой): номер из нескольких связей получает фейк первой.
     for (real, fake) in faker.digit_pairs() {
-        maps.digits.insert(real.to_string(), fake.to_string());
+        maps.digits.entry(real.to_string()).or_insert_with(|| fake.to_string());
+    }
+    for (real, fake) in faker.digit_pairs() {
         // ИНН числом без ведущего нуля.
         if let Some(short) = real.strip_prefix('0') {
             if short.len() >= 9 {
@@ -631,7 +645,7 @@ fn build_maps(faker: &Faker, plans: &[FilePlan], rules: &[&[Rule]], date1904: bo
     }
     // Телефоны — только полные номера (10 цифр): короткие внутри текста легко совпадут случайно.
     for (real, fake) in faker.phone_pairs().filter(|(r, f)| r.len() == 10 && f.len() == 10) {
-        maps.phones.insert(real.to_string(), fake.to_string());
+        maps.phones.entry(real.to_string()).or_insert_with(|| fake.to_string());
     }
     if inner {
         maps.build_inner();
@@ -1226,6 +1240,9 @@ pub fn plan_batch(
         plans.push(collect(zip, wb, r, limit)?);
     }
     let mut faker = Faker::new(settings);
+    // Порядок связей — по правилам: вне разметки значение из нескольких связей получает фейк первой.
+    let links: Vec<String> = rules.iter().flat_map(|rs| rs.iter().map(Rule::link_name)).collect();
+    faker.set_link_order(links.iter().map(String::as_str));
     for (_, wb) in books.iter() {
         faker.set_taken(wb.sst.iter().map(String::as_str));
     }
@@ -1242,7 +1259,50 @@ pub fn plan_batch(
         faker.fake(r, original, numeric);
     }
     kind_conflicts(&mut plans, rules, &faker, files);
+    link_overlaps(&mut plans, &faker);
     Ok((plans, faker, key_entries))
+}
+
+/// Порядок связей: общая — 0, остальные — по первому правилу (файлы по порядку, в файле — правила по порядку).
+fn link_ranks(rules: &[&[Rule]]) -> HashMap<String, usize> {
+    let mut rank = HashMap::from([(String::new(), 0)]);
+    for r in rules.iter().flat_map(|rs| rs.iter()) {
+        let n = rank.len();
+        rank.entry(r.link_name()).or_insert(n);
+    }
+    rank
+}
+
+/// Одно значение размечено в колонках разных связей — у него несколько фейков, так и задумано.
+/// Но в ячейках вне разметки, внутри текста, формул, сводных ставится один из них: общей связи, если
+/// значение размечено в ней, иначе — связи первого по порядку правила (`build_maps`). Об этом — одна строка
+/// в каждом файле, где такие значения размечены; самих значений в ней нет (журнал могут переслать).
+fn link_overlaps(plans: &mut [FilePlan], faker: &Faker) {
+    let mut links: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for e in &faker.entries {
+        if parse_kind_key(&e.kind_key).is_some_and(|(k, _, _)| matches!(k, Kind::Clear | Kind::Keep)) {
+            continue;
+        }
+        links.entry(e.real.as_str()).or_default().insert(split_link(&e.kind_key).1);
+    }
+    links.retain(|_, l| l.len() >= 2);
+    if links.is_empty() {
+        return;
+    }
+    for p in plans.iter_mut() {
+        let count = p.items.iter().map(|(_, o, _)| o.as_str()).filter(|o| links.contains_key(o)).collect::<HashSet<_>>().len();
+        if count == 0 {
+            continue;
+        }
+        let what = match (count % 10, count % 100) {
+            (1, n) if n != 11 => "значение размечено в колонках с разной «Связью» и получило",
+            (2..=4, n) if !(12..=14).contains(&n) => "значения размечены в колонках с разной «Связью» и получили",
+            _ => "значений размечены в колонках с разной «Связью» и получили",
+        };
+        p.warnings.push(format!(
+            "{count} {what} в них разные фейки. Где такое значение стоит вне разметки (другие колонки, текст, формулы, сводные, примечания), ставится фейк общей связи, а если в общей его нет — связи первого по порядку правила"
+        ));
+    }
 }
 
 /// Одно значение под правилами разных типов (ИНН в одном файле, «Текст» в другом) получает разные фейки —
@@ -1267,21 +1327,34 @@ fn kind_conflicts(plans: &mut [FilePlan], rules: &[&[Rule]], faker: &Faker, file
     }
     let mut found: std::collections::BTreeMap<Vec<String>, (usize, HashSet<usize>)> = Default::default();
     for (original, at) in &marked {
-        let kinds = &by_real[original];
-        let fakes: HashSet<&str> = kinds.iter().filter_map(|k| faker.get(k, original)).collect();
-        if fakes.len() < 2 {
+        // Разные связи разделены намеренно (так же, как «Шаблоны» с разными подписями) — расхождение
+        // ищется только внутри одной связи.
+        let mut by_link: HashMap<&str, Vec<&str>> = HashMap::new();
+        for k in &by_real[original] {
+            by_link.entry(split_link(k).1).or_default().push(*k);
+        }
+        let bad: HashSet<&str> = by_link
+            .iter()
+            .filter(|(_, ks)| {
+                let fakes: HashSet<&str> = ks.iter().filter_map(|k| faker.get(k, original)).collect();
+                // Два «Шаблона» с разными подписями разделены намеренно — это не ошибка разметки.
+                fakes.len() >= 2 && !ks.iter().all(|k| parse_kind_key(k).is_some_and(|(k, _, _)| k == Kind::Text))
+            })
+            .map(|(l, _)| *l)
+            .collect();
+        if bad.is_empty() {
             continue;
         }
-        // Два «Шаблона» с разными подписями разделены намеренно — это не ошибка разметки.
-        if kinds.iter().all(|k| parse_kind_key(k).is_some_and(|(k, _, _)| k == Kind::Text)) {
-            continue;
-        }
+        let kinds: Vec<&str> = by_real[original].iter().copied().filter(|k| bad.contains(split_link(k).1)).collect();
         // Где это значение размечено и как: в файлах прогона и в ключе. Без самих значений — журнал могут переслать.
         let mut places: Vec<String> = Vec::new();
         let mut involved = HashSet::new();
         let mut here: HashSet<String> = HashSet::new();
         for &(fj, rj) in at {
             let r = &rules[fj][rj];
+            if !bad.contains(r.link_name().as_str()) {
+                continue;
+            }
             let (file, col) = (file_name(files[fj]), crate::xlsx::col_name(r.col));
             let column = match plans[fj].rule_heads.get(rj).and_then(|h| h.as_deref()) {
                 Some(h) => format!("колонка «{h}» ({file}, лист {}, {col})", r.sheet),
