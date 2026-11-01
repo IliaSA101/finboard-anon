@@ -7,6 +7,29 @@ $root = Split-Path $PSScriptRoot
 Set-Location $root
 
 $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+
+# Пакет собирается по белому списку. Если программу запускали на dist\finboard-anon\Пример, рядом
+# остались *_anon*.xlsx, *_профиль*.json и КЛЮЧ_ОБЕЗЛИЧИВАНИЯ_НЕ_ПЕРЕДАВАТЬ*.csv — им не место в архиве.
+$pkgFiles = @('ИНСТРУКЦИЯ.txt', 'Пример\demo_dashboard.xlsx', 'Пример\demo_profile.json')
+# Следы сборок прежнего вида в исходной папке (в git не входят): не копируются, но и не мешают.
+$staleBuild = @('finboard-anon.exe', 'finboard-anon-cli.exe', 'LICENSE.txt', 'THIRD_PARTY_NOTICES.txt')
+
+# Все файлы папки (и скрытые) — путями от неё, через «\».
+function Get-RelativeFiles([string]$dir) {
+  $full = (Resolve-Path -LiteralPath $dir).Path.TrimEnd('\')
+  @(Get-ChildItem -LiteralPath $full -Recurse -File -Force | ForEach-Object { $_.FullName.Substring($full.Length + 1) } | Sort-Object)
+}
+
+# Ошибка со списком всех файлов папки не из списка.
+function Assert-OnlyFiles([string]$dir, [string[]]$allowed) {
+  $extra = @(Get-RelativeFiles $dir | Where-Object { $allowed -notcontains $_ })
+  if ($extra.Count) {
+    throw "В $dir лишние файлы (могут содержать персональные данные) — уберите их и запустите снова:`n  $($extra -join "`n  ")"
+  }
+}
+
+$src = Join-Path $root 'dist\finboard-anon'
+Assert-OnlyFiles $src ($pkgFiles + $staleBuild)
 # Ресурсы exe (иконка и версия) — под текущую версию из Cargo.toml.
 python tools/icon_to_coff.py
 if ($LASTEXITCODE) { throw 'не собран assets\icon.o' }
@@ -49,13 +72,23 @@ foreach ($exe in $exes) {
 $name = "finboard-anon-$ver"
 $pkg = Join-Path $root "dist\$name"
 Remove-Item $pkg -Recurse -Force -ErrorAction SilentlyContinue
-# Инструкция и пример — из dist\finboard-anon (они в git), exe — с версией в имени.
-Copy-Item (Join-Path $root 'dist\finboard-anon') $pkg -Recurse
-Get-ChildItem $pkg -Filter *.exe | Remove-Item
+# Инструкция и пример — по списку из dist\finboard-anon (они в git), exe — с версией в имени.
+Assert-OnlyFiles $src ($pkgFiles + $staleBuild)
+New-Item -ItemType Directory $pkg | Out-Null
+foreach ($f in $pkgFiles) {
+  $to = Join-Path $pkg $f
+  New-Item -ItemType Directory -Force (Split-Path $to) | Out-Null
+  Copy-Item -LiteralPath (Join-Path $src $f) $to
+}
 Copy-Item $exes[0] (Join-Path $pkg "finboard-anon-$ver.exe")
 Copy-Item $exes[1] (Join-Path $pkg "finboard-anon-cli-$ver.exe")
 Copy-Item (Join-Path $root 'LICENSE') (Join-Path $pkg 'LICENSE.txt') -Force
 Copy-Item (Join-Path $root 'THIRD_PARTY_NOTICES.txt') $pkg -Force
+# В пакете — ровно эти файлы, не больше и не меньше.
+$expected = @($pkgFiles + @("finboard-anon-$ver.exe", "finboard-anon-cli-$ver.exe", 'LICENSE.txt', 'THIRD_PARTY_NOTICES.txt'))
+Assert-OnlyFiles $pkg $expected
+$missing = @($expected | Where-Object { -not (Test-Path -LiteralPath (Join-Path $pkg $_)) })
+if ($missing.Count) { throw "В пакете $pkg нет файлов: $($missing -join ', ')" }
 
 $zip = Join-Path $root "dist\$name-windows-x64.zip"
 Remove-Item $zip -ErrorAction SilentlyContinue
