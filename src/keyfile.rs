@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::fake::KeyEntry;
+use crate::profile::{parse_kind_key, Kind};
 
 const HEADER: [&str; 4] = ["Тип", "ID", "Реальное значение", "Фейковое значение"];
 
@@ -33,7 +34,7 @@ pub fn write(path: &Path, entries: &[KeyEntry]) -> Result<()> {
     // Временный файл — тоже с настоящими значениями: при сбое он удаляется, а не остаётся рядом.
     // Перед переименованием — сброс на диск: при отключении питания сразу после записи на месте ключа
     // мог остаться файл нулевой длины, а результаты, им покрытые, уже лежат рядом.
-    let tmp = path.with_extension("csv.tmp");
+    let tmp = tmp_path(path);
     let done = write_synced(&tmp, &data)
         .with_context(|| format!("не записывается ключ {}", tmp.display()))
         .and_then(|_| std::fs::rename(&tmp, path).with_context(|| format!("не записывается ключ {}", path.display())));
@@ -41,6 +42,19 @@ pub fn write(path: &Path, entries: &[KeyEntry]) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     done
+}
+
+/// Временный файл ключа: «<ключ>.csv.tmp» рядом с ним. В нём настоящие значения.
+pub fn tmp_path(key: &Path) -> PathBuf {
+    key.with_extension("csv.tmp")
+}
+
+/// Временный файл ключа, оставшийся от запуска, который не дошёл до конца (процесс сняли, выключили
+/// компьютер): в нём настоящие значения, и лежит он рядом с ключом, как обычный файл. Удаляется в начале
+/// следующего запуска — под замком ключа, так что чужой идущий запуск его не пишет. Возвращает путь удалённого.
+pub fn remove_leftover_tmp(key: &Path) -> Option<PathBuf> {
+    let tmp = tmp_path(key);
+    (tmp.is_file() && std::fs::remove_file(&tmp).is_ok()).then_some(tmp)
 }
 
 /// Запись файла со сбросом на диск (не только в кэш системы).
@@ -68,12 +82,47 @@ const LOCK_STALE: Duration = Duration::from_secs(12 * 3600);
 /// и при ошибке, и при сбое (панике).
 pub struct KeyLock {
     path: PathBuf,
+    /// Что записано в замок: снимается только он сам.
+    text: String,
 }
 
 impl Drop for KeyLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Свой замок могли счесть брошенным и заменить своим (запуск шёл дольше 12 часов) — чужой не снимаем.
+        remove_if_same(&self.path, &self.text);
     }
+}
+
+/// Удаляет замок, только если в нём всё ещё `expected`. Просто «прочитать, сравнить, удалить» мало: между
+/// чтением и удалением другой запуск мог убрать этот замок и поставить свой — удалён был бы его свежий замок,
+/// и на ключе работали бы два запуска. Поэтому замок сначала забирается переименованием (это мгновенно и
+/// целиком), сравнивается уже под новым именем и только тогда удаляется; чужой замок возвращается на место.
+fn remove_if_same(path: &Path, expected: &str) -> bool {
+    let mut s = path.as_os_str().to_owned();
+    s.push(format!(".{}-{}.снят", std::process::id(), nanos()));
+    let taken = PathBuf::from(s);
+    if std::fs::rename(path, &taken).is_err() {
+        return false;
+    }
+    if read_text(&taken) == expected {
+        let _ = std::fs::remove_file(&taken);
+        return true;
+    }
+    // Чужой — на место. Жёсткая ссылка не затирает замок, если за это время поставили ещё один
+    // (переименование в Windows затёрло бы); где ссылок нет (флешка, сетевая папка) — переименование, если место свободно.
+    if std::fs::hard_link(&taken, path).is_err() && !path.exists() {
+        let _ = std::fs::rename(&taken, path);
+    }
+    let _ = std::fs::remove_file(&taken);
+    false
+}
+
+fn read_text(path: &Path) -> String {
+    std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
+}
+
+fn nanos() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
 }
 
 pub fn lock_path(key: &Path) -> PathBuf {
@@ -82,11 +131,13 @@ pub fn lock_path(key: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Кто держит замок: номер процесса, компьютер, начало (секунды от 1970 г.).
+/// Кто держит замок: номер процесса, компьютер, начало (секунды от 1970 г.) и время запуска самого процесса
+/// (нет в замках версий до 0.5.0 и там, где его не узнать).
 struct Holder {
     pid: u32,
     host: String,
     started: u64,
+    process: Option<String>,
 }
 
 fn now_secs() -> u64 {
@@ -99,13 +150,21 @@ fn host_name() -> String {
 
 fn parse_holder(text: &str) -> Option<Holder> {
     let field = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix('=')).map(str::trim);
-    Some(Holder { pid: field("pid")?.parse().ok()?, host: field("компьютер")?.to_string(), started: field("начат")?.parse().ok()? })
+    Some(Holder {
+        pid: field("pid")?.parse().ok()?,
+        host: field("компьютер")?.to_string(),
+        started: field("начат")?.parse().ok()?,
+        process: field("процесс_запущен").filter(|s| !s.is_empty()).map(String::from),
+    })
 }
 
 /// Замок брошен: запуск, который его поставил, уже не идёт (процесс завершился аварийно, компьютер выключили).
 /// Процесс проверяется только на этом же компьютере (ключ может лежать в общей папке); замок старше
 /// `LOCK_STALE` брошен в любом случае. Непонятное содержимое — брошен, если файлу больше минуты
 /// (меньше — его, возможно, ещё дописывают).
+///
+/// Номер процесса после перезагрузки достаётся другим программам — и нашей тоже. Поэтому живой процесс
+/// с тем же номером — ещё не владелец: сверяется и время его запуска, записанное в замке.
 fn is_stale(text: &str, modified: Option<SystemTime>) -> bool {
     match parse_holder(text) {
         Some(h) => {
@@ -113,10 +172,54 @@ fn is_stale(text: &str, modified: Option<SystemTime>) -> bool {
             if age > LOCK_STALE.as_secs() {
                 return true;
             }
-            h.host == host_name() && h.pid != std::process::id() && !process_alive(h.pid)
+            if h.host != host_name() {
+                return false;
+            }
+            // Время запуска узнать не удалось (процесс другого пользователя) — считается, что тот же.
+            let other_start = |now: Option<String>| h.process.is_some() && now.is_some() && now != h.process;
+            if h.pid == std::process::id() {
+                // Наш номер: либо замок этого же процесса (второй прогон в том же окне), либо номер остался от
+                // процесса до перезагрузки — тогда время запуска другое.
+                return other_start(process_start(h.pid));
+            }
+            !process_alive(h.pid) || other_start(process_start(h.pid))
         }
         None => modified.and_then(|m| m.elapsed().ok()).is_some_and(|a| a > Duration::from_secs(60)),
     }
+}
+
+/// Время запуска процесса — как строка, только для сравнения на равенство (`None` — не узнать).
+#[cfg(windows)]
+fn process_start(pid: u32) -> Option<String> {
+    type Handle = *mut std::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn GetProcessTimes(process: Handle, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+        fn CloseHandle(h: Handle) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    // SAFETY: обычные вызовы Windows с проверкой результата; FILETIME — 8 байт, как u64; описатель закрывается.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let (mut creation, mut exit, mut kernel, mut user) = (0u64, 0u64, 0u64, 0u64);
+        let ok = GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user) != 0;
+        CloseHandle(h);
+        (ok && creation != 0).then(|| creation.to_string())
+    }
+}
+
+/// Linux: номер загрузки системы и время запуска процесса от загрузки (поле 22 в /proc/<pid>/stat).
+#[cfg(not(windows))]
+fn process_start(pid: u32) -> Option<String> {
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Имя процесса в скобках может содержать пробелы — поля считаются после последней «)».
+    let start = stat.rsplit_once(')')?.1.split_whitespace().nth(19)?;
+    Some(format!("{}/{start}", boot.trim()))
 }
 
 /// Идёт ли процесс с этим номером (только Windows и Linux; где проверить нельзя — считается, что идёт).
@@ -159,25 +262,29 @@ pub fn lock(key: &Path) -> Result<KeyLock> {
     for _ in 0..3 {
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut f) => {
-                let lock = KeyLock { path: path.clone() };
+                // «метка» — чтобы два замка одного процесса (два прогона подряд в одном окне) не совпадали текстом.
                 let text = format!(
-                    "Идёт обезличивание с этим ключом. Файл удаляется сам по окончании.\r\npid={}\r\nкомпьютер={}\r\nначат={}\r\n",
+                    "Идёт обезличивание с этим ключом. Файл удаляется сам по окончании.\r\npid={}\r\nкомпьютер={}\r\nначат={}\r\nпроцесс_запущен={}\r\nметка={}\r\n",
                     std::process::id(),
                     host_name(),
-                    now_secs()
+                    now_secs(),
+                    process_start(std::process::id()).unwrap_or_default(),
+                    nanos()
                 );
-                f.write_all(text.as_bytes()).and_then(|_| f.sync_all()).with_context(|| format!("не записывается замок ключа {}", path.display()))?;
-                return Ok(lock);
+                if let Err(e) = f.write_all(text.as_bytes()).and_then(|_| f.sync_all()) {
+                    // Файл только что создан этим запуском — он наш, даже недописанный.
+                    drop(f);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(anyhow!(e)).with_context(|| format!("не записывается замок ключа {}", path.display()));
+                }
+                return Ok(KeyLock { path: path.clone(), text });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let text = std::fs::read(&path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+                let text = read_text(&path);
                 let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
                 if is_stale(&text, modified) {
                     // Убираем, только если это всё тот же брошенный замок: его мог уже заменить свежий замок другого запуска.
-                    let again = std::fs::read(&path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
-                    if again == text {
-                        let _ = std::fs::remove_file(&path);
-                    }
+                    remove_if_same(&path, &text);
                     continue;
                 }
                 let who = match parse_holder(&text) {
@@ -255,6 +362,8 @@ pub fn read(path: &Path) -> Result<Vec<KeyEntry>> {
         .ok_or_else(|| damaged("первая строка — не «Тип;ID;Реальное значение;Фейковое значение»".into()))?;
     let mut r = csv::ReaderBuilder::new().delimiter(delim).flexible(true).from_reader(text.as_bytes());
     let mut out = Vec::new();
+    // Строки с номерами, испорченными Excel: номер строки и показываемое значение (настоящее — скрыто).
+    let mut spoiled: Vec<(usize, String)> = Vec::new();
     // Номер строки — как в Excel: заголовок первый, ячейка с переносом строки остаётся одной строкой.
     for (i, rec) in r.records().enumerate() {
         let line = i + 2;
@@ -265,14 +374,91 @@ pub fn read(path: &Path) -> Result<Vec<KeyEntry>> {
         if rec.len() < 4 || rec.iter().skip(4).any(|f| !f.trim().is_empty()) {
             return Err(damaged(format!("строка {line}: полей {} вместо 4", rec.len())));
         }
-        out.push(KeyEntry {
-            kind_key: rec[0].to_string(),
-            id: rec[1].trim().parse().ok(),
-            real: rec[2].to_string(),
-            fake: rec[3].to_string(),
-        });
+        let e = KeyEntry { kind_key: rec[0].to_string(), id: rec[1].trim().parse().ok(), real: rec[2].to_string(), fake: rec[3].to_string() };
+        if let Some(shown) = spoiled_by_excel(&e) {
+            spoiled.push((line, shown));
+        }
+        out.push(e);
+    }
+    if let Some((line, shown)) = spoiled.first() {
+        let more = match spoiled.len() - 1 {
+            0 => String::new(),
+            n => format!(", и ещё строк с такими числами: {n}"),
+        };
+        bail!(
+            "Ключ {} похоже пересохранён в Excel: числа в нём испорчены (строка {line}: «{shown}»{more}).\n\
+             Excel при сохранении превращает длинные номера (ИНН, счета, карты) в вид «7,70708E+11» и срезает \
+             ведущие нули — по такому ключу прежние фейки не восстановить, а испорченные строки остались бы в нём навсегда.\n\
+             Ключ НЕ изменён, обезличивание не выполнено.\n\
+             Как исправить: верните ключ из «{}» (копия, которую программа кладёт рядом перед каждой перезаписью ключа) \
+             или из своей резервной копии. Смотреть ключ в Excel можно, но не сохраняйте его там (при закрытии — «Не сохранять»).",
+            path.display(),
+            copy_path(path).file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+        );
     }
     Ok(out)
+}
+
+/// Типы, у которых фейк — номер из стольких же цифр, сколько в настоящем значении.
+const NUMBER_KINDS: [Kind; 5] = [Kind::Inn, Kind::Snils, Kind::Passport, Kind::Account, Kind::Phone];
+
+/// Запись ключа, испорченная Excel (ключ открыли и сохранили в Excel — он превращает чисто цифровые ячейки
+/// в числа): что показать в сообщении или `None`, если запись цела. Настоящее значение показывается скрытым.
+///
+/// Признаки:
+/// - число в экспоненциальной записи «7,70708E+11» / «7.70708E+11» — так Excel показывает (и сохраняет) номера
+///   длиннее 11 цифр. В xlsx и в ключе программы таких значений нет: xlsx хранит числа с точкой и всеми цифрами;
+/// - номер (ИНН, СНИЛС, паспорт, счёт, телефон), у которого фейк короче настоящего: фейк программы — из стольких же
+///   цифр, а Excel срезает его ведущие нули («00000000000000000012» → «12»);
+/// - настоящий номер короче фейка: срезаны ведущие нули настоящего. Исключения — короткий код до 4 цифр
+///   («Дог1» → «Дог900001») и ИНН в 9 или 11 цифр (ведущий ноль срезан ещё в исходной книге, фейк — полный).
+fn spoiled_by_excel(e: &KeyEntry) -> Option<String> {
+    if excel_exponent(&e.fake) {
+        return Some(e.fake.trim().to_string());
+    }
+    if excel_exponent(&e.real) {
+        return Some(hide_digits(e.real.trim()));
+    }
+    let kind = parse_kind_key(&e.kind_key)?.0;
+    if !NUMBER_KINDS.contains(&kind) {
+        return None;
+    }
+    let digits = |s: &str| s.chars().filter(char::is_ascii_digit).count();
+    let (r, f) = (digits(&e.real), digits(&e.fake));
+    if f < r {
+        return Some(e.fake.trim().to_string());
+    }
+    let inn_zero = kind == Kind::Inn && matches!(r, 9 | 11) && f == r + 1;
+    if r > 4 && r < f && !inn_zero {
+        return Some(crate::anon::mask_sample(&e.real));
+    }
+    None
+}
+
+/// «7,70708E+11», «4.07028E+19», «1E+15» — номер от 12 цифр, как его показывает и сохраняет Excel (порядок
+/// от 11). Мантисса с запятой — всегда Excel; с точкой — если в ней не больше шести цифр (столько показывает
+/// Excel; xlsx хранит число со всеми значащими цифрами).
+fn excel_exponent(s: &str) -> bool {
+    let s = s.trim();
+    let Some((mant, exp)) = s.split_once("E+") else { return false };
+    if exp.len() != 2 || exp.parse::<u32>().map_or(true, |p| p < 11) {
+        return false;
+    }
+    let (int, frac, comma) = match mant.split_once([',', '.']) {
+        Some((i, f)) => (i, f, mant.contains(',')),
+        None => (mant, "", false),
+    };
+    let all_digits = |p: &str| p.bytes().all(|b| b.is_ascii_digit());
+    if int.is_empty() || !all_digits(int) || !all_digits(frac) {
+        return false;
+    }
+    comma || int.len() + frac.len() <= 6
+}
+
+/// Цифры настоящего значения — «#»: «7,70708E+11» → «#,#####E+11» (видно, что число испорчено, но не какое).
+fn hide_digits(s: &str) -> String {
+    let (mant, exp) = s.split_at(s.find('E').unwrap_or(s.len()));
+    mant.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect::<String>() + exp
 }
 
 /// Первая строка — заголовок ключа при этом разделителе (лишние пустые колонки допустимы).

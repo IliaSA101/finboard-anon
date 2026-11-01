@@ -495,6 +495,10 @@ pub fn run_batch(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Repor
     // (другое окно, командная строка) получит понятную ошибку, а не выдаст тем же ID других людей.
     // Отпечаток ключа — тоже до чтения: перед записью он сверяется (запуски прежних версий замка не ставят).
     let _key_lock = batch.key_out.as_deref().map(keyfile::lock).transpose()?;
+    // Временный файл ключа от прерванного запуска — с настоящими значениями; под замком его никто не пишет.
+    if let Some(tmp) = batch.key_out.as_deref().and_then(keyfile::remove_leftover_tmp) {
+        log(format!("Удалён временный файл ключа, оставшийся от прерванного запуска (в нём были настоящие значения): {}", tmp.display()));
+    }
     let key_stamp = batch.key_out.as_deref().and_then(keyfile::stamp);
     let mut books = Vec::new();
     for f in &batch.files {
@@ -666,15 +670,26 @@ fn commit(batch: &Batch, faker: &Faker, tmps: &[PathBuf], key_stamp: keyfile::St
                 k.display()
             );
         }
+        let mut moved = None;
         if k.exists() && !batch.key_in.as_deref().is_some_and(|i| same_file(i, k)) {
             let backup = keyfile::backup_path(k);
             std::fs::rename(k, &backup).with_context(|| format!("не переименовывается прежний ключ {} — файлы не записаны", k.display()))?;
             log(format!("Прежний ключ не был загружен и сохранён как {}", backup.display()));
+            moved = Some(backup);
         } else if k.exists() {
             let copy = keyfile::keep_copy(k)?;
             log(format!("Копия ключа до этого запуска: {}", copy.display()));
         }
-        keyfile::write(k, &faker.entries).context("файлы не записаны")?;
+        if let Err(e) = keyfile::write(k, &faker.entries) {
+            // Прежний ключ уже отложен под другим именем, а новый не записался: на месте ключа пусто. Прежний
+            // возвращается на место; не вышло — сообщение говорит, где он, чтобы его не сочли потерянным.
+            let old = match moved {
+                Some(b) if !k.exists() && std::fs::rename(&b, k).is_ok() => format!("\nПрежний ключ возвращён на место: {}.", k.display()),
+                Some(b) => format!("\nПрежний ключ не потерян — он лежит под именем {}.", b.display()),
+                None => String::new(),
+            };
+            bail!("{e:#}.\nФайлы не записаны: их прежние версии не тронуты.{old}");
+        }
         log(format!("Ключ записан: {}", k.display()));
     }
     // Только переименование: копирование поверх существующего пути при неудаче могло бы записать результат
@@ -1603,13 +1618,30 @@ pub fn preview_batch(files: &[(PathBuf, Vec<Rule>)], settings: &Settings, key_in
 
 /// Один и тот же файл на диске. Сравнение путей не видит жёстких ссылок (два имени одного файла):
 /// у существующих файлов сравнивается номер тома и номер файла на нём.
+/// Файлов ещё нет (результаты первого прогона) — сравниваются полные пути, в Windows без учёта регистра:
+/// «A.xlsx» и «a.xlsx» там — один файл, и второй результат записался бы поверх первого.
 fn same_file(a: &Path, b: &Path) -> bool {
     if let (Some(x), Some(y)) = (file_id(a), file_id(b)) {
         return x == y;
     }
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => a == b,
+    let (x, y) = (full_path(a), full_path(b));
+    if cfg!(windows) {
+        x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase()
+    } else {
+        x == y
+    }
+}
+
+/// Полный путь для сравнения: существующий файл — как его видит система; нового файла — путь его папки
+/// и имя («.\a.xlsx» и «a.xlsx» — одно и то же).
+fn full_path(p: &Path) -> PathBuf {
+    if let Ok(c) = p.canonicalize() {
+        return c;
+    }
+    let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    match (dir.canonicalize(), p.file_name()) {
+        (Ok(d), Some(n)) => d.join(n),
+        _ => std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()),
     }
 }
 
