@@ -623,6 +623,15 @@ fn build_maps(faker: &Faker, plans: &[FilePlan], rules: &[&[Rule]], date1904: bo
     (maps, scan_extra)
 }
 
+/// Удаляет временный файл при выходе из области — и при ошибке, и при панике.
+struct RemoveOnDrop<'a>(&'a Path);
+
+impl Drop for RemoveOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
 /// Перезапись одной книги по готовым заменам.
 #[allow(clippy::too_many_arguments)]
 fn write_book(
@@ -654,6 +663,8 @@ fn write_book(
     }
     let mut stats = Stats { rule_cells: vec![0; rules.len()], ..Default::default() };
     let tmp = output.with_extension("tmp");
+    // При ошибке или сбое на любом шаге недописанный результат удаляется (после переименования его уже нет).
+    let _tmp_guard = RemoveOnDrop(&tmp);
     {
         let out_file = File::create(&tmp).with_context(|| format!("не создаётся {}", tmp.display()))?;
         let mut zw = ZipWriter::new(BufWriter::new(out_file));
@@ -1225,6 +1236,10 @@ fn rewrite_sheet(
                     continue;
                 }
             }
+            // Обрезанный лист: конец файла внутри ячейки. Без этой проверки цикл не кончился бы никогда.
+            if matches!(ev, Event::Eof) {
+                bail!("файл повреждён: лист обрывается внутри ячейки {}{}", crate::xlsx::col_name(*c), r);
+            }
             inner.push(ev);
             continue;
         }
@@ -1632,6 +1647,7 @@ fn rewrite_sst(xml: &[u8], maps: &GlobalMaps, stats: &mut Stats) -> Result<Optio
                 },
                 Event::Text(e) if in_t => text.push_str(&e.unescape()?),
                 Event::CData(e) if in_t => text.push_str(&String::from_utf8_lossy(e)),
+                Event::Eof => bail!("файл повреждён: общие строки (sharedStrings) обрываются внутри записи"),
                 _ => {}
             }
             inner.push(ev);

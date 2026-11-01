@@ -160,6 +160,21 @@ enum Msg {
     Done(Result<Vec<Report>, String>, Vec<Profile>),
 }
 
+/// Сбой потока обработки (паника). Результаты пишутся во временные файлы и переименовываются только
+/// в конце, а исходные файлы только читаются — поэтому их сбой не задевает.
+fn crash_message(panic: Option<&str>) -> String {
+    let why = panic.map(|p| format!(" (причина: {p})")).unwrap_or_default();
+    format!("сбой обработки — программа прервала работу с файлом{why}. Исходные файлы не изменены.")
+}
+
+/// Паника внутри обработки — ошибка с её текстом, а не молча оборвавшийся поток.
+fn guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        let text = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned());
+        Err(crash_message(text.as_deref()))
+    })
+}
+
 /// Открытый файл: своя книга, свои правила. Генератор фейков и ключ — общие для всех файлов.
 struct Doc {
     path: PathBuf,
@@ -495,7 +510,16 @@ impl App {
     fn poll_job(&mut self) {
         let Some(rx) = &self.job else { return };
         let mut finished = None;
-        while let Ok(m) = rx.try_recv() {
+        loop {
+            let m = match rx.try_recv() {
+                Ok(m) => m,
+                Err(TryRecvError::Empty) => break,
+                // Поток обработки кончился, не прислав итога (сбой): иначе окно навсегда осталось бы в «Обработка…».
+                Err(TryRecvError::Disconnected) => {
+                    finished = finished.or_else(|| Some((Err(crash_message(None)), Vec::new())));
+                    break;
+                }
+            };
             match m {
                 Msg::Log(s) => {
                     if s.starts_with("Файл ") && s.contains(" из ") {
@@ -605,11 +629,14 @@ impl App {
             finboard_anon::xlsx::track_progress(Some(progress));
             let tx_log = tx.clone();
             let ctx_log = ctx.clone();
-            let res = run_batch(&batch, &mut |m| {
-                let _ = tx_log.send(Msg::Log(m));
-                ctx_log.request_repaint();
+            let res = guarded(|| {
+                run_batch(&batch, &mut |m| {
+                    let _ = tx_log.send(Msg::Log(m));
+                    ctx_log.request_repaint();
+                })
+                .map_err(|e| format!("{e:#}"))
             });
-            let _ = tx.send(Msg::Done(res.map_err(|e| format!("{e:#}")), profiles));
+            let _ = tx.send(Msg::Done(res, profiles));
             ctx.request_repaint();
         });
     }
@@ -1844,5 +1871,55 @@ mod tests {
         }
         let names: Vec<String> = excel_files_in(&d).iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(names, ["Продажи.xlsx", "Продажи_anon_.xlsx", "Продажи_anon_2024г.xlsx"]);
+    }
+
+    /// Поток обработки оборвался без итога: окно не должно навсегда остаться в «Обработка…».
+    #[test]
+    fn job_thread_gone_without_result_shows_error() {
+        let mut app = App::blank();
+        let (tx, rx) = channel();
+        app.job = Some(rx);
+        app.progress = Some((Arc::new(Progress::default()), Instant::now()));
+        app.set_status("Обработка…", false);
+        let mut s = Screen::new();
+        tx.send(Msg::Log("Запись файла…".into())).unwrap();
+        s.frame(&mut app, vec![]);
+        assert!(app.job.is_some(), "поток ещё жив — ждём");
+        drop(tx);
+        s.frame(&mut app, vec![]);
+        assert!(app.job.is_none() && app.progress.is_none(), "обработка не сброшена");
+        assert!(app.status_err, "{}", app.status);
+        let last = app.log.last().unwrap();
+        assert_eq!(last, &format!("Ошибка: {}", crash_message(None)));
+        assert!(last.contains("Исходные файлы не изменены"), "{last}");
+        assert_eq!(app.log.len(), 2, "строки журнала до сбоя сохраняются: {:?}", app.log);
+    }
+
+    /// Паника в потоке обработки — та же ошибка, с текстом паники; итог, пришедший до обрыва канала, не теряется.
+    #[test]
+    fn job_panic_becomes_error_with_text() {
+        let ok: Result<u8, String> = guarded(|| Ok(7));
+        assert_eq!(ok, Ok(7));
+        assert_eq!(guarded::<u8>(|| Err("плохо".into())), Err("плохо".into()));
+        let e = guarded::<u8>(|| panic!("индекс за пределами")).unwrap_err();
+        assert!(e.starts_with("сбой обработки") && e.contains("(причина: индекс за пределами)"), "{e}");
+        let e = guarded::<u8>(|| panic!("{} строк", 5)).unwrap_err();
+        assert!(e.contains("(причина: 5 строк)"), "{e}");
+
+        let mut app = App::blank();
+        let (tx, rx) = channel();
+        app.job = Some(rx);
+        app.progress = Some((Arc::new(Progress::default()), Instant::now()));
+        let worker = std::thread::spawn(move || {
+            let res = guarded(|| -> Result<Vec<Report>, String> { panic!("сломалось") });
+            let _ = tx.send(Msg::Done(res, Vec::new()));
+        });
+        worker.join().unwrap();
+        let mut s = Screen::new();
+        s.frame(&mut app, vec![]);
+        assert!(app.job.is_none() && app.progress.is_none());
+        assert!(app.status_err);
+        assert!(app.status.contains("(причина: сломалось)"), "{}", app.status);
+        assert_eq!(app.log.iter().filter(|l| l.contains("сбой обработки")).count(), 1, "{:?}", app.log);
     }
 }
