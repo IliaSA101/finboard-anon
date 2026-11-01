@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, FontId, Rect, RichText, Sense, Stroke};
 
 use finboard_anon::anon::{
-    batch_outputs, default_output_path, find_key, key_out_path, preview_batch, run_batch, Batch, FileJob, Report,
-    RulePreview,
+    batch_outputs, default_output_path, find_key, key_out_path, preview_batch, run_batch, Batch, FileJob, ProfileCheck,
+    Report, RulePreview,
 };
 use finboard_anon::detect;
 use finboard_anon::profile::{link_name, Kind, Outside, Profile, Rule, Settings};
@@ -338,6 +338,8 @@ struct App {
     preview_rules: Vec<Vec<Rule>>,
     preview_dirty: bool,
     preview_job: Option<Receiver<(Vec<Vec<Rule>>, Result<Vec<Vec<RulePreview>>, String>)>>,
+    /// Идущая в фоне проверка сохранённого профиля (`anon::profile_check`) и куда он сохранён.
+    profile_job: Option<(Receiver<ProfileCheck>, PathBuf)>,
     /// Активная ячейка (колонка, строка) — двигается стрелками.
     cursor: Option<(u32, u32)>,
     /// Видимая часть таблицы в прошлом кадре — чтобы прокрутить к активной ячейке.
@@ -407,6 +409,7 @@ impl App {
             preview_rules: Vec::new(),
             preview_dirty: false,
             preview_job: None,
+            profile_job: None,
             cursor: None,
             last_vp: Rect::NOTHING,
             ensure_visible: false,
@@ -713,6 +716,75 @@ impl App {
         }
     }
 
+    /// Предпросмотр посчитан по нынешним правилам всех файлов (и текущий файл в обработке): его проверка
+    /// профиля (`RulePreview::risks`) верна и для сохранения.
+    fn preview_fresh(&self) -> bool {
+        let Some(d) = self.docs.get(self.cur) else { return false };
+        self.preview_job.is_none()
+            && !self.preview_dirty
+            && d.on
+            && self.preview_rules.len() == self.docs.len()
+            && self.preview.get(self.cur).is_some_and(|p| p.len() == d.profile.rules.len())
+            && self.docs.iter().zip(&self.preview_rules).all(|(d, r)| if d.on { *r == d.profile.rules } else { r.is_empty() })
+    }
+
+    /// «Сохранить профиль…»: профиль текущего файла записывается сразу. Его пересылают — имена листов и подписи,
+    /// похожие на данные, идут в журнал (маской). Проверка берётся из готового предпросмотра (файлы заново не
+    /// читаются), а если он устарел — идёт в фоне: окно не замирает на секунды чтения файлов.
+    fn save_profile_as(&mut self, p: PathBuf, ctx: &egui::Context) {
+        let pr = Profile { rules: self.docs[self.cur].profile.rules.clone(), settings: self.settings.clone() };
+        if let Err(e) = pr.save(&p) {
+            self.set_status(format!("{e:#}"), true);
+            return;
+        }
+        if self.preview_fresh() {
+            let risks = finboard_anon::anon::preview_risks(&self.preview[self.cur]);
+            self.profile_checked(&p, ProfileCheck { risks, skipped: Vec::new() });
+            return;
+        }
+        let files: Vec<(PathBuf, Vec<Rule>)> = self.docs.iter().map(|d| (d.path.clone(), d.profile.rules.clone())).collect();
+        let key = self.key_in.clone();
+        let (tx, rx) = channel();
+        self.profile_job = Some((rx, p.clone()));
+        self.set_status(format!("Профиль сохранён: {} — проверяю, нет ли в нём похожего на данные…", p.display()), false);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(finboard_anon::anon::profile_check(&pr, &files, key.as_deref()));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_profile_check(&mut self) {
+        let Some((rx, _)) = &self.profile_job else { return };
+        match rx.try_recv() {
+            Ok(check) => {
+                let (_, p) = self.profile_job.take().unwrap();
+                self.profile_checked(&p, check);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                let (_, p) = self.profile_job.take().unwrap();
+                self.set_status(format!("Профиль сохранён: {}, но проверка на похожее на данные не закончилась", p.display()), true);
+            }
+        }
+    }
+
+    /// Итог проверки сохранённого профиля — в журнал и строку состояния. Нечитаемый файл не отменяет проверку:
+    /// о нём своя строка в журнале, а в строке состояния — что проверка неполная.
+    fn profile_checked(&mut self, p: &std::path::Path, check: ProfileCheck) {
+        self.log.extend(check.risks.iter().map(|w| format!("Внимание: {w}")));
+        self.log.extend(check.skipped.iter().map(|w| format!("Внимание: {w}")));
+        let saved = format!("Профиль сохранён: {}", p.display());
+        if !check.risks.is_empty() {
+            self.set_status(format!("{saved} — в нём есть похожее на данные, см. журнал"), true);
+        } else if let Some(first) = check.skipped.first() {
+            let more = if check.skipped.len() > 1 { format!(" (и ещё {})", check.skipped.len() - 1) } else { String::new() };
+            self.set_status(format!("{saved}, но проверен не со всеми файлами: {first}{more}"), true);
+        } else {
+            self.set_status(saved, false);
+        }
+    }
+
     /// Строка, после которой правило считается «до конца»: последняя строка листа в просмотре.
     fn sheet_last_row(&self, sheet: &str) -> Option<u32> {
         let d = self.doc()?;
@@ -913,16 +985,7 @@ impl App {
                     dlg = dlg.set_directory(dir);
                 }
                 if let Some(p) = dlg.save_file() {
-                    let pr = Profile { rules: self.docs[self.cur].profile.rules.clone(), settings: self.settings.clone() };
-                    // Профиль пересылают: имена листов и подписи, похожие на данные, — в журнал (маской).
-                    let files: Vec<(PathBuf, Vec<Rule>)> = self.docs.iter().map(|d| (d.path.clone(), d.profile.rules.clone())).collect();
-                    let risks = finboard_anon::anon::profile_risks(&pr, &files, self.key_in.as_deref()).unwrap_or_default();
-                    self.log.extend(risks.iter().map(|w| format!("Внимание: {w}")));
-                    match pr.save(&p) {
-                        Ok(()) if !risks.is_empty() => self.set_status(format!("Профиль сохранён: {} — в нём есть похожее на данные, см. журнал", p.display()), true),
-                        Ok(()) => self.set_status(format!("Профиль сохранён: {}", p.display()), false),
-                        Err(e) => self.set_status(format!("{e:#}"), true),
-                    }
+                    self.save_profile_as(p, ui.ctx());
                 }
             }
             ui.separator();
@@ -1934,6 +1997,7 @@ impl App {
         // Не пересчитываем, пока кнопка мыши зажата (тянут поле со строками) — файлы читаются целиком.
         // Правка во время подсчёта — пересчёт сразу после него.
         self.poll_preview();
+        self.poll_profile_check();
         if self.preview_dirty && self.preview_job.is_none() && !ctx.input(|i| i.pointer.any_down()) {
             self.start_preview(ctx);
         }
@@ -2761,5 +2825,126 @@ mod tests {
         let panel = panel_rect(&s, "sheets");
         assert!((panel.width() - LEFT_MIN_W).abs() < 1.0, "минимум левой панели — {}, а не {LEFT_MIN_W}", panel.width());
         assert_fits(&shapes, panel, "левая панель на минимуме");
+    }
+
+    #[path = "../../tests/common/mod.rs"]
+    mod common;
+
+    /// Книга: лист «Л», шапка и `rows` строк по `cols` колонок разных значений.
+    fn big_book(path: &std::path::Path, rows: u32, cols: u32) {
+        use common::{s, Book};
+        let mut b = Book::default();
+        let sh = b.sheet("Л");
+        for c in 0..cols {
+            sh.push((1, c, s(&format!("Колонка {c}"))));
+        }
+        for r in 2..rows + 2 {
+            for c in 0..cols {
+                sh.push((r, c, s(&format!("Значение {r} {c}"))));
+            }
+        }
+        common::write_xlsx(path, &b);
+    }
+
+    /// Ждёт фоновую проверку сохранённого профиля.
+    fn wait_profile_check(app: &mut App) {
+        let t0 = Instant::now();
+        while app.profile_job.is_some() {
+            app.poll_profile_check();
+            assert!(t0.elapsed() < Duration::from_secs(120), "проверка профиля не закончилась: {}", app.status);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A6-7. «Сохранить профиль…» проверял профиль в потоке окна, читая заново все открытые файлы (до 20 000 строк
+    /// каждого): на пяти больших файлах окно «не отвечало» 7–10 с. Теперь профиль сохраняется сразу, а проверка,
+    /// если предпросмотр устарел, идёт в фоне — окно отвечает; итог приходит в журнал и строку состояния.
+    #[test]
+    fn a6_7_save_profile_does_not_block_window() {
+        let d = temp_dir("save_bg");
+        let files: Vec<PathBuf> = (0..3).map(|i| d.join(format!("f{i}.xlsx"))).collect();
+        for f in &files {
+            big_book(f, 20_000, 10);
+        }
+        let mut app = App::blank();
+        app.open_files(files.clone(), true);
+        app.cur = 0;
+        assert_eq!(app.docs.len(), 3, "{}", app.status);
+        for doc in &mut app.docs {
+            doc.profile.rules = (0..10).map(|c| Rule::new("Л", c, 2, None, Kind::FullName)).collect();
+        }
+        // Лист, названный по сотруднику, — предупреждение без чтения файлов.
+        app.docs[0].profile.rules.push(Rule::new("Иванов Иван", 0, 2, None, Kind::FullName));
+        app.preview_dirty = true;
+        let out = d.join("профиль.json");
+        let t0 = Instant::now();
+        app.save_profile_as(out.clone(), &egui::Context::default());
+        let took = t0.elapsed();
+        assert!(out.exists(), "профиль записан сразу");
+        assert!(app.profile_job.is_some(), "проверка — в фоне");
+        assert!(app.status.contains("проверяю"), "{}", app.status);
+        assert!(took < Duration::from_millis(500), "окно ждало проверку {took:?}");
+        // Пока проверка идёт, окно рисует кадры.
+        let mut s = Screen::new();
+        s.frame(&mut app, vec![]);
+        wait_profile_check(&mut app);
+        assert!(app.log.iter().any(|l| l.starts_with("Внимание: в профиле имя листа «И*** И***»")), "{:?}", app.log);
+        assert!(app.status_err && app.status.contains("похожее на данные"), "{}", app.status);
+        assert!(!app.log.iter().any(|l| l.contains("Иванов")), "{:?}", app.log);
+    }
+
+    /// A6-7. Предпросмотр посчитан по нынешним правилам — проверка профиля берётся из него, файлы не читаются:
+    /// итог сразу, без фоновой работы.
+    #[test]
+    fn a6_7_save_profile_uses_fresh_preview() {
+        let d = temp_dir("save_pv");
+        let f = d.join("a.xlsx");
+        big_book(&f, 50, 3);
+        let mut app = App::blank();
+        app.open_files(vec![f], true);
+        app.docs[0].profile.rules = vec![Rule::new("Л", 0, 2, None, Kind::FullName), Rule::new("Иванов Иван", 0, 2, None, Kind::FullName)];
+        let mut s = Screen::new();
+        wait_preview(&mut s, &mut app, vec2(1500.0, 920.0));
+        assert!(app.preview_fresh());
+        app.save_profile_as(d.join("п.json"), &egui::Context::default());
+        assert!(app.profile_job.is_none(), "предпросмотр свежий — фоновая проверка не нужна");
+        assert_eq!(app.log.iter().filter(|l| l.contains("в профиле имя листа «И*** И***»")).count(), 1, "{:?}", app.log);
+        assert!(app.status_err, "{}", app.status);
+        // Правило поменялось — предпросмотр устарел: проверка снова идёт по файлам.
+        app.docs[0].profile.rules.pop();
+        assert!(!app.preview_fresh());
+    }
+
+    /// A6-3. Открытый файл с тех пор пропал с диска (или не читается ключ): раньше проверка возвращала ошибку,
+    /// окно молча сохраняло профиль без предупреждений. Теперь файл пропускается со строкой в журнале, остальное
+    /// проверяется, в строке состояния — что проверка неполная.
+    #[test]
+    fn a6_3_save_profile_with_missing_file_still_warns() {
+        let d = temp_dir("save_missing");
+        let (a, b) = (d.join("a.xlsx"), d.join("b.xlsx"));
+        big_book(&a, 10, 2);
+        big_book(&b, 10, 2);
+        let mut app = App::blank();
+        app.open_files(vec![a, b.clone()], true);
+        app.cur = 0;
+        app.docs[0].profile.rules = vec![Rule::new("Иванов Иван", 0, 2, None, Kind::FullName)];
+        app.docs[1].profile.rules = vec![Rule::new("Л", 0, 2, None, Kind::FullName)];
+        std::fs::remove_file(&b).unwrap();
+        app.preview_dirty = true;
+        app.save_profile_as(d.join("п.json"), &egui::Context::default());
+        wait_profile_check(&mut app);
+        assert!(app.log.iter().any(|l| l.contains("в профиле имя листа «И*** И***»")), "{:?}", app.log);
+        assert!(app.log.iter().any(|l| l.contains("файл b.xlsx не прочитан")), "{:?}", app.log);
+        assert!(app.status_err, "{}", app.status);
+
+        // Предупреждений нет, но сверка неполная — это в строке состояния, а не «Профиль сохранён» без оговорок.
+        app.log.clear();
+        app.docs[0].profile.rules = vec![Rule::new("Л", 0, 2, None, Kind::FullName)];
+        app.key_in = Some(d.join("ключ.csv"));
+        app.save_profile_as(d.join("п2.json"), &egui::Context::default());
+        wait_profile_check(&mut app);
+        assert!(app.status_err && app.status.contains("проверен не со всеми файлами"), "{}", app.status);
+        assert!(app.status.contains("и ещё 1"), "файл и ключ: {}", app.status);
+        assert!(app.log.iter().any(|l| l.contains("ключ ключ.csv не прочитан")), "{:?}", app.log);
     }
 }

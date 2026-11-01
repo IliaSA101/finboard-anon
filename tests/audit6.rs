@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use common::*;
-use finboard_anon::anon::{preview, profile_risks, run, Job, Report};
+use finboard_anon::anon::{preview, preview_batch, preview_risks, profile_check, profile_risks, run, Job, Report};
 use finboard_anon::fake::{norm_text, Faker, KeyEntry};
 use finboard_anon::profile::{Kind, Profile, Rule, Settings};
 
@@ -53,7 +53,6 @@ fn card_rules() -> Vec<Rule> {
 /// и телефон с подписью. `looks_personal` их не узнаёт, сверять не с чем — ФИО/email/телефон остаются
 /// «названием колонки» в журнале (строки отчёта и предупреждение о разных типах).
 #[test]
-#[ignore = "находка A6-1: guard_heads пропускает ФИО/email/телефон в обычной записи карточки"]
 fn a01_card_head_with_prefix_leaks_to_journal() {
     let d = tmp("a01");
     let input = d.join("in.xlsx");
@@ -81,7 +80,6 @@ fn a01_card_head_with_prefix_leaks_to_journal() {
 /// A6-2 (P2). Предупреждение о листе, названном по сотруднику, маскирует имя листа («К***»), а в том же
 /// журнале строки отчёта по правилам и предупреждение «Правило …!… кончается на строке» пишут его как есть.
 #[test]
-#[ignore = "находка A6-2: имя листа маскируется в одном предупреждении, но открыто в строках отчёта того же журнала"]
 fn a02_sheet_name_masked_in_warning_but_plain_in_summary() {
     let d = tmp("a02");
     let input = d.join("in.xlsx");
@@ -105,7 +103,6 @@ fn a02_sheet_name_masked_in_warning_but_plain_in_summary() {
 /// файл не читается (перемещён, удалён, ключ испорчен), проверка возвращает ошибку и окно молча сохраняет
 /// профиль без предупреждений — даже о листе «Иванов Иван», для которого файлы не нужны вовсе.
 #[test]
-#[ignore = "находка A6-3: ошибка чтения любого файла отменяет все предупреждения о профиле"]
 fn a03_profile_risks_lost_on_unreadable_file() {
     let d = tmp("a03");
     let input = d.join("in.xlsx");
@@ -284,18 +281,20 @@ fn a10_people_invariants_with_key() {
     assert_eq!(a, second(&key), "тот же ключ — другие фейки");
 }
 
-/// A6-7 (P2). `profile_risks` вызывается прямо в потоке окна при «Сохранить профиль…» и читает до 20 000 строк
+/// A6-7 (P2). `profile_risks` вызывался прямо в потоке окна при «Сохранить профиль…» и читал до 20 000 строк
 /// каждого открытого файла: пять файлов по 20 000 строк × 20 колонок — 7–10 секунд (около 2 с на файл),
-/// окно «не отвечает». Печатает время; падает, если дольше 3 секунд на сборке с оптимизацией.
+/// окно «не отвечает». Теперь окно берёт проверку из готового предпросмотра (`preview_risks`, файлы не читаются),
+/// а при устаревшем — проверяет в фоне (тесты окна `a6_7_*` в main.rs). Здесь: проверка из предпросмотра
+/// мгновенна и даёт то же, что полная проверка по файлам (лист пятого файла назван как значение первого).
 #[test]
-#[ignore = "находка A6-7: «Сохранить профиль…» замораживает окно на секунды"]
 fn a11_profile_risks_time_in_ui_thread() {
     let d = tmp("a11");
     let mut files: Vec<(PathBuf, Vec<Rule>)> = Vec::new();
     for fi in 0..5 {
         let p = d.join(format!("f{fi}.xlsx"));
         let mut b = Book::default();
-        let sh = b.sheet("Л");
+        let sheet = if fi == 4 { "Значение 0 2 0" } else { "Л" };
+        let sh = b.sheet(sheet);
         for c in 0..20u32 {
             sh.push((1, c, s(&format!("Колонка {c}"))));
         }
@@ -305,13 +304,19 @@ fn a11_profile_risks_time_in_ui_thread() {
             }
         }
         write_xlsx(&p, &b);
-        files.push((p, (0..20).map(|c| Rule::new("Л", c, 2, None, if c % 2 == 0 { Kind::FullName } else { Kind::Text })).collect()));
+        files.push((p, (0..20).map(|c| Rule::new(sheet, c, 2, None, if c % 2 == 0 { Kind::FullName } else { Kind::Text })).collect()));
     }
+    // Предпросмотр считается в фоне при каждой правке правил — к сохранению профиля он уже готов.
+    let pv = preview_batch(&files, &settings(), None).unwrap();
     let t = Instant::now();
-    let r = profile_risks(&profile(files[0].1.clone()), &files, None).unwrap();
+    let r = preview_risks(&pv[4]);
     let took = t.elapsed();
-    eprintln!("profile_risks: 5 файлов × 20 000 строк × 20 колонок — {took:?}, предупреждений {}", r.len());
-    if !cfg!(debug_assertions) {
-        assert!(took.as_secs_f64() < 3.0, "окно замирает на {took:?}");
-    }
+    eprintln!("проверка профиля из предпросмотра: 5 файлов × 20 000 строк × 20 колонок — {took:?}, предупреждений {}", r.len());
+    assert!(took.as_secs_f64() < 0.2, "окно замирает на {took:?}");
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(r[0].contains("имя листа «З*** *** *** ***»") && r[0].contains("колонка A, f0.xlsx"), "{r:?}");
+    let full = profile_check(&profile(files[4].1.clone()), &files, None);
+    assert_eq!(full.risks, r, "из предпросмотра — то же, что по файлам");
+    assert!(full.skipped.is_empty());
+    assert_eq!(profile_risks(&profile(files[4].1.clone()), &files, None).unwrap(), r);
 }

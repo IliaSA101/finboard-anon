@@ -15,7 +15,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use crate::fake::Faker;
-use crate::profile::{parse_kind_key, split_link, Kind, Outside, Profile, Rule, Settings};
+use crate::profile::{parse_kind_key, split_link, Kind, Outside, Profile, Rule, RuleRisk, Settings};
 use crate::xlsx::{attr, open_zip, parse_range, part_reader, pivot_caches, resolve_value, scan_cells_where, PivotCache, Workbook, Zip};
 use crate::keyfile;
 
@@ -58,6 +58,8 @@ pub struct Report {
     /// Двоичные части, которые программа не обезличивала и не проверяла (модель данных, запросы Power Query,
     /// внедрённые объекты, макросы, рисунки): проверка результата о них ничего сказать не может.
     pub unchecked: Vec<String>,
+    /// Имена листов, похожие на данные (попали в предупреждение о профиле): в строках журнала — маской.
+    pub masked_sheets: Vec<String>,
 }
 
 /// Общий ключ папки: все файлы одной папки получают одни и те же фейки для одних и тех же людей,
@@ -124,6 +126,15 @@ pub fn batch_outputs(inputs: &[PathBuf], dir: Option<&Path>) -> Vec<PathBuf> {
 
 impl Report {
     pub fn summary(&self, profile: &Profile) -> Vec<String> {
+        let mut l = self.summary_lines(profile);
+        // Пути (результат, ключ) — как есть: по ним файлы ищут; остальное — с листами маской.
+        for x in l.iter_mut().skip(1).filter(|x| !x.starts_with("Ключ (НЕ передавать")) {
+            *x = mask_names(x, &self.masked_sheets);
+        }
+        l
+    }
+
+    fn summary_lines(&self, profile: &Profile) -> Vec<String> {
         let mut l = vec![format!("Готово: {}", self.output.display())];
         for (i, r) in profile.rules.iter().enumerate() {
             let n = self.rule_cells.get(i).copied().unwrap_or(0);
@@ -527,6 +538,9 @@ fn run_batch_inner(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Rep
     // Имена листов и подписи шаблонов профиля, похожие на данные: профиль пересылают. В генераторе с ключом —
     // и значения прогона (они сверяются раньше и называют свою колонку), и записи ключа.
     let risks = plan_risks(&plans, &rules, &paths, if batch.key_in.is_some() { &faker.entries } else { &[] });
+    // Листы из предупреждений о профиле — маской во всех строках журнала (листы всех файлов: предупреждение
+    // о разных типах называет и листы соседних файлов).
+    let masked = risky_sheets(rules.iter().flat_map(|rs| rs.iter()), risks.iter().flatten());
 
     // Папки результатов — до записи: сбой на середине пакета оставил бы часть файлов без ключа.
     for f in &batch.files {
@@ -554,7 +568,7 @@ fn run_batch_inner(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Rep
         let (maps, scan_extra) = build_maps(&faker, &plans, &rules, wb.date1904, batch.settings.inner_search());
         let mut report = write_book(zip, wb, &f.rules, &faker, &maps, &batch.settings, &f.output, &tmps[fi], log)?;
         report.warnings.splice(0..0, plans[fi].warnings.iter().cloned());
-        for w in risks[fi].iter().flatten() {
+        for w in risks[fi].iter().flat_map(|r| &r.lines) {
             if !report.warnings.contains(w) {
                 report.warnings.push(w.clone());
             }
@@ -612,6 +626,11 @@ fn run_batch_inner(batch: &Batch, log: &mut dyn FnMut(String)) -> Result<Vec<Rep
                     .into(),
             );
         }
+    }
+
+    for r in &mut reports {
+        r.warnings = r.warnings.iter().map(|w| mask_names(w, &masked)).collect();
+        r.masked_sheets = masked.clone();
     }
 
     // 5. На место — ключ и результаты.
@@ -1544,18 +1563,29 @@ pub fn plan_batch(
 /// Через сколько ячеек при сборе значений и значений при выборе фейков проверяется отмена.
 const CANCEL_EVERY: usize = 1024;
 
+/// Самое длинное название колонки, которое пишется в журнал: знаков и слов. Длиннее — колонка буквой.
+const HEAD_MAX_CHARS: usize = 40;
+const HEAD_MAX_WORDS: usize = 5;
+
+/// Можно ли показывать текст шапки как название колонки: не длинный и ни в какой части не похож на данные.
+pub fn plain_head(t: &str) -> bool {
+    t.chars().count() <= HEAD_MAX_CHARS && t.split_whitespace().count() <= HEAD_MAX_WORDS && crate::profile::looks_personal(t).is_none()
+}
+
 /// Шапка листа — строка, где больше всего текста среди первых строк. Над таблицей бывает строка-карточка
 /// («Иванов Иван Иванович | Менеджер | Отдел продаж»), не попавшая под правила, — тогда «названием колонки»
 /// стало бы ФИО, а оно идёт в журнал (его пересылают), в предупреждения и на карточку правила.
 /// Название убирается (колонка называется буквой), если оно совпадает со значением под любым правилом прогона
 /// (все файлы) или в ключе прошлых запусков — любого типа — либо само похоже на ФИО, номер, email,
-/// организацию (`looks_personal`). Обычные заголовки («Ответственный», «Покупатель группа») остаются.
+/// организацию в любой своей части (`looks_personal`: «Ответственный: Сидоров С.С.», «Тел. +7 916 …»), либо
+/// длинное (`plain_head`): название колонки короткое, длинный текст — скорее строка-карточка, и узнать в ней
+/// всё нельзя. Обычные заголовки («Ответственный», «Покупатель группа», «Сумма, руб.») остаются.
 fn guard_heads(plans: &mut [FilePlan], rules: &[&[Rule]], faker: &Faker) {
     let mut at: Vec<(usize, usize)> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
     for (fi, p) in plans.iter_mut().enumerate() {
         for (ri, h) in p.rule_heads.iter_mut().enumerate() {
-            if h.as_deref().is_some_and(|t| crate::profile::looks_personal(t).is_some()) {
+            if h.as_deref().is_some_and(|t| !plain_head(t)) {
                 *h = None;
             }
             if let Some(t) = h {
@@ -1586,14 +1616,14 @@ fn guard_heads(plans: &mut [FilePlan], rules: &[&[Rule]], faker: &Faker) {
 
 /// Имена листов и подписи шаблонов, похожие на данные (`profile::rule_risks`), по каждому правилу каждого файла.
 /// Сверяются со значениями под правилами всех файлов прогона и с ключом (`key` — его записи, пусто — без ключа).
-fn plan_risks(plans: &[FilePlan], rules: &[&[Rule]], files: &[&Path], key: &[crate::fake::KeyEntry]) -> Vec<Vec<Vec<String>>> {
+fn plan_risks(plans: &[FilePlan], rules: &[&[Rule]], files: &[&Path], key: &[crate::fake::KeyEntry]) -> Vec<Vec<RuleRisk>> {
     let all: Vec<Rule> = rules.iter().flat_map(|rs| rs.iter().cloned()).collect();
     let mut flat = risks_against(&all, plans, rules, files, key).into_iter();
     rules.iter().map(|rs| flat.by_ref().take(rs.len()).collect()).collect()
 }
 
 /// `profile::rule_risks` для правил `check` против значений прогона (`plans`) и ключа.
-fn risks_against(check: &[Rule], plans: &[FilePlan], rules: &[&[Rule]], files: &[&Path], key: &[crate::fake::KeyEntry]) -> Vec<Vec<String>> {
+fn risks_against(check: &[Rule], plans: &[FilePlan], rules: &[&[Rule]], files: &[&Path], key: &[crate::fake::KeyEntry]) -> Vec<RuleRisk> {
     let places: Vec<Vec<String>> =
         rules.iter().zip(files).map(|(rs, f)| rs.iter().map(|r| format!("колонка {}, {}", crate::xlsx::col_name(r.col), file_name(f))).collect()).collect();
     let values = plans
@@ -1602,32 +1632,103 @@ fn risks_against(check: &[Rule], plans: &[FilePlan], rules: &[&[Rule]], files: &
         .zip(&places)
         .flat_map(|((p, rs), pl)| p.items.iter().map(move |(ri, v, _)| (v.as_str(), pl[*ri].as_str(), Some(rs[*ri].kind))))
         .chain(key.iter().map(|e| (e.real.as_str(), "ключ прошлых запусков", parse_kind_key(&e.kind_key).map(|(k, _, _)| k))));
-    crate::profile::rule_risks(check, values)
+    crate::profile::rule_risks_detail(check, values)
+}
+
+/// Имена листов, которые в журнале пишутся маской: попавшие в предупреждение о профиле (похожи на данные или
+/// совпали со значением). Иначе маска в одном предупреждении («К***») раскрывалась бы соседними строками
+/// отчёта («Кузнецов!A2:A2 — …»).
+fn risky_sheets<'a>(rules: impl IntoIterator<Item = &'a Rule>, risks: impl IntoIterator<Item = &'a RuleRisk>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (r, k) in rules.into_iter().zip(risks) {
+        if k.sheet && !r.sheet.trim().is_empty() && !out.contains(&r.sheet) {
+            out.push(r.sheet.clone());
+        }
+    }
+    // Длинные — первыми: «Иванов Иван» маскируется целиком, а не по частям, если есть и лист «Иванов».
+    out.sort_by_key(|s| std::cmp::Reverse(s.chars().count()));
+    out
+}
+
+/// Строка журнала с именами листов `names` маской (`mask_sample`).
+pub fn mask_names(line: &str, names: &[String]) -> String {
+    let mut l = line.to_string();
+    for n in names {
+        if l.contains(n.as_str()) {
+            l = l.replace(n.as_str(), &mask_sample(n));
+        }
+    }
+    l
+}
+
+/// Итог проверки профиля перед сохранением (`profile_check`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProfileCheck {
+    /// Предупреждения о профиле (имена листов, подписи шаблонов), значения только маской.
+    pub risks: Vec<String>,
+    /// Файлы и ключ, которые не прочитались: с их значениями профиль не сверен. Строки для журнала.
+    pub skipped: Vec<String>,
 }
 
 /// Проверка профиля перед сохранением в окне («Сохранить профиль…»): имена листов и подписи шаблонов,
 /// похожие на данные. Значения — под правилами открытых файлов (`files`, первые `PREVIEW_ROWS` строк листов,
 /// как в предпросмотре) и в ключе. Строки — для журнала, значения в них только маской.
-pub fn profile_risks(profile: &Profile, files: &[(PathBuf, Vec<Rule>)], key_in: Option<&Path>) -> Result<Vec<String>> {
+/// Файл или ключ, который не читается (перемещён, удалён, повреждён), пропускается со строкой в `skipped`;
+/// с остальными сверка идёт, а форма имён листов и подписей («Иванов Иван», «7707083893») проверяется всегда.
+pub fn profile_check(profile: &Profile, files: &[(PathBuf, Vec<Rule>)], key_in: Option<&Path>) -> ProfileCheck {
     let mut plans = Vec::new();
-    for (input, rules) in files {
-        let mut zip = open_zip(input)?;
-        let wb = Workbook::from_zip(&mut zip)?;
-        plans.push(collect(&mut zip, &wb, rules, Some(PREVIEW_ROWS))?);
-    }
-    let key = match key_in {
-        Some(k) => keyfile::read(k)?,
-        None => Vec::new(),
-    };
-    let rules: Vec<&[Rule]> = files.iter().map(|(_, r)| r.as_slice()).collect();
-    let paths: Vec<&Path> = files.iter().map(|(p, _)| p.as_path()).collect();
-    let mut out: Vec<String> = Vec::new();
-    for w in risks_against(&profile.rules, &plans, &rules, &paths, &key).into_iter().flatten() {
-        if !out.contains(&w) {
-            out.push(w);
+    let mut read: Vec<&(PathBuf, Vec<Rule>)> = Vec::new();
+    let mut skipped = Vec::new();
+    for f in files {
+        let (input, rules) = f;
+        let plan = (|| -> Result<FilePlan> {
+            let mut zip = open_zip(input)?;
+            let wb = Workbook::from_zip(&mut zip)?;
+            collect(&mut zip, &wb, rules, Some(PREVIEW_ROWS))
+        })();
+        match plan.map_err(crate::xlsx::plain_error) {
+            Ok(p) => {
+                plans.push(p);
+                read.push(f);
+            }
+            Err(e) => skipped.push(format!("файл {} не прочитан — профиль не сверен с его значениями ({e:#})", file_name(input))),
         }
     }
-    Ok(out)
+    let key = match key_in.map(|k| (k, keyfile::read(k).map_err(crate::xlsx::plain_error))) {
+        Some((_, Ok(entries))) => entries,
+        Some((k, Err(e))) => {
+            skipped.push(format!("ключ {} не прочитан — профиль не сверен с ним ({e:#})", file_name(k)));
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    let rules: Vec<&[Rule]> = read.iter().map(|(_, r)| r.as_slice()).collect();
+    let paths: Vec<&Path> = read.iter().map(|(p, _)| p.as_path()).collect();
+    let mut risks: Vec<String> = Vec::new();
+    for w in risks_against(&profile.rules, &plans, &rules, &paths, &key).into_iter().flat_map(|r| r.lines) {
+        if !risks.contains(&w) {
+            risks.push(w);
+        }
+    }
+    ProfileCheck { risks, skipped }
+}
+
+/// Предупреждения `profile_check` без пропущенных файлов (они там же, в `skipped`). Ошибки не бывает:
+/// нечитаемый файл не отменяет проверку остальных.
+pub fn profile_risks(profile: &Profile, files: &[(PathBuf, Vec<Rule>)], key_in: Option<&Path>) -> Result<Vec<String>> {
+    Ok(profile_check(profile, files, key_in).risks)
+}
+
+/// Предупреждения о профиле из готового предпросмотра его правил (`RulePreview::risks`): предпросмотр уже сверил
+/// имена листов и подписи со значениями всех файлов и ключом — файлы заново не читаются.
+pub fn preview_risks(previews: &[RulePreview]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in previews.iter().flat_map(|p| &p.risks) {
+        if !out.contains(w) {
+            out.push(w.clone());
+        }
+    }
+    out
 }
 
 /// Номера, получившие фейк длиннее настоящего: свободных номеров той же длины не хватило (короткие номера,
@@ -1867,7 +1968,7 @@ fn preview_batch_inner(files: &[(PathBuf, Vec<Rule>)], settings: &Settings, key_
                 .zip(&p.rule_below)
                 .zip(&p.rule_heads)
                 .zip(risks)
-                .map(|(((((&cells, values), rule), &below), head), risks)| RulePreview {
+                .map(|(((((&cells, values), rule), &below), head), risk)| RulePreview {
                     cells,
                     below,
                     samples: values
@@ -1875,7 +1976,7 @@ fn preview_batch_inner(files: &[(PathBuf, Vec<Rule>)], settings: &Settings, key_
                         .filter_map(|v| faker.get(&rule.kind_key(), v).map(|f| (v.clone(), f.to_string())))
                         .collect(),
                     head: head.clone(),
-                    risks,
+                    risks: risk.lines,
                 })
                 .collect()
         })
